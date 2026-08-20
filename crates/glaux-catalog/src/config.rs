@@ -236,7 +236,10 @@ impl GlauxConfig {
                 });
             }
             if let Some(a) = file.athena {
-                merge_opt(&mut config.athena.output_location, a.output_location.map(Some));
+                merge_opt(
+                    &mut config.athena.output_location,
+                    a.output_location.map(Some),
+                );
                 merge(&mut config.athena.workgroup, a.workgroup);
             }
             if let Some(f) = file.firehose {
@@ -248,7 +251,10 @@ impl GlauxConfig {
 
         // 2. Environment.
         merge_opt(&mut config.s3_endpoint, env("GLAUX_S3_ENDPOINT").map(Some));
-        merge_opt(&mut config.glue_endpoint, env("GLAUX_GLUE_ENDPOINT").map(Some));
+        merge_opt(
+            &mut config.glue_endpoint,
+            env("GLAUX_GLUE_ENDPOINT").map(Some),
+        );
         merge(&mut config.region, env("GLAUX_REGION"));
         merge(&mut config.account_id, env("GLAUX_ACCOUNT_ID"));
         match (env("GLAUX_ACCESS_KEY_ID"), env("GLAUX_SECRET_ACCESS_KEY")) {
@@ -294,7 +300,10 @@ impl GlauxConfig {
         );
 
         // 3. CLI overrides.
-        merge_opt(&mut config.s3_endpoint, overrides.s3_endpoint.clone().map(Some));
+        merge_opt(
+            &mut config.s3_endpoint,
+            overrides.s3_endpoint.clone().map(Some),
+        );
         merge_opt(
             &mut config.glue_endpoint,
             overrides.glue_endpoint.clone().map(Some),
@@ -354,7 +363,10 @@ impl GlauxConfig {
         }
         for (name, value) in [
             ("firehose.max_record_kib", self.firehose.max_record_kib),
-            ("firehose.max_batch_records", self.firehose.max_batch_records),
+            (
+                "firehose.max_batch_records",
+                self.firehose.max_batch_records,
+            ),
             ("firehose.max_batch_mib", self.firehose.max_batch_mib),
         ] {
             if value == 0 {
@@ -455,7 +467,10 @@ mod tests {
         let creds = config.credentials.expect("credentials");
         assert_eq!(creds.access_key_id, "AKIDFILE");
         assert_eq!(creds.session_token, None);
-        assert_eq!(config.athena.output_location.as_deref(), Some("s3://results/"));
+        assert_eq!(
+            config.athena.output_location.as_deref(),
+            Some("s3://results/")
+        );
         assert_eq!(config.athena.workgroup, "analytics");
         assert_eq!(config.firehose.max_record_kib, 512);
         // Untouched limits keep defaults.
@@ -555,8 +570,8 @@ mod tests {
             glue_endpoint: Some("127.0.0.1:4566".to_string()),
             ..Default::default()
         };
-        let err = GlauxConfig::resolve(None, &no_env, &overrides)
-            .expect_err("bare host:port must fail");
+        let err =
+            GlauxConfig::resolve(None, &no_env, &overrides).expect_err("bare host:port must fail");
         assert!(err.to_string().contains("glue_endpoint"), "got: {err}");
     }
 

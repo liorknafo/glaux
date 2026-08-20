@@ -25,10 +25,10 @@ use glaux_catalog::{
     AwsCredentials, CatalogError, ConfigOverrides, GlauxConfig, GlueApi, NetworkGlueApi,
     NetworkStorageBackend, StorageBackend,
 };
+use parquet::arrow::ArrowWriter;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch};
-use parquet::arrow::ArrowWriter;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use serde_json::json;
@@ -108,7 +108,10 @@ fn download_fakecloud() -> Option<PathBuf> {
     match tar {
         Ok(status) if status.success() && binary.is_file() => Some(binary),
         Ok(_) | Err(_) => {
-            eprintln!("failed to extract fakecloud archive into {}", cache_dir.display());
+            eprintln!(
+                "failed to extract fakecloud archive into {}",
+                cache_dir.display()
+            );
             None
         }
     }
@@ -350,7 +353,9 @@ async fn fakecloud_s3_and_glue_end_to_end() {
     );
     let file_size = parquet_bytes.len() as u64;
     assert!(
-        observed.iter().all(|r| r.end <= file_size && r.start < r.end),
+        observed
+            .iter()
+            .all(|r| r.end <= file_size && r.start < r.end),
         "every read must be a proper sub-range: {observed:?}"
     );
     assert!(
@@ -365,9 +370,12 @@ async fn fakecloud_s3_and_glue_end_to_end() {
     // ---- Glue: provision fixtures, then exercise the read surface ----
 
     let glue = NetworkGlueApi::new(&config);
-    glue.invoke("CreateDatabase", json!({ "DatabaseInput": { "Name": "events" } }))
-        .await
-        .expect("CreateDatabase");
+    glue.invoke(
+        "CreateDatabase",
+        json!({ "DatabaseInput": { "Name": "events" } }),
+    )
+    .await
+    .expect("CreateDatabase");
     glue.invoke(
         "CreateTable",
         json!({
@@ -427,9 +435,15 @@ async fn fakecloud_s3_and_glue_end_to_end() {
     assert_eq!(table.partition_keys.len(), 1);
     assert_eq!(table.partition_keys[0].name, "dt");
     let sd = table.storage_descriptor.expect("storage descriptor");
-    assert_eq!(sd.location.as_deref(), Some(format!("s3://{bucket}/data/").as_str()));
     assert_eq!(
-        sd.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+        sd.location.as_deref(),
+        Some(format!("s3://{bucket}/data/").as_str())
+    );
+    assert_eq!(
+        sd.columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["id", "name"]
     );
     assert_eq!(
@@ -446,8 +460,14 @@ async fn fakecloud_s3_and_glue_end_to_end() {
         .expect("get_partitions");
     partitions.sort_by(|a, b| a.values.cmp(&b.values));
     assert_eq!(
-        partitions.iter().map(|p| p.values.clone()).collect::<Vec<_>>(),
-        vec![vec!["2026-08-01".to_string()], vec!["2026-08-02".to_string()]]
+        partitions
+            .iter()
+            .map(|p| p.values.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            vec!["2026-08-01".to_string()],
+            vec!["2026-08-02".to_string()]
+        ]
     );
 
     // A missing table errors explicitly — never an empty fabricated result.

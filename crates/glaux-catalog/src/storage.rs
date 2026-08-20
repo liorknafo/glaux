@@ -144,7 +144,7 @@ impl NetworkStorageBackend {
                     .build()
                     .map_err(|source| CatalogError::StorageClient {
                         bucket: bucket.to_string(),
-                        source,
+                        source: Box::new(source),
                     })?,
             );
         self.stores
@@ -166,7 +166,7 @@ fn storage_error(
         operation,
         bucket,
         key,
-        source,
+        source: Box::new(source),
     }
 }
 

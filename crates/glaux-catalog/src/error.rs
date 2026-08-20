@@ -51,9 +51,9 @@ pub enum CatalogError {
         bucket: String,
         /// Target key (empty for bucket-level operations such as list).
         key: String,
-        /// Underlying object_store error.
+        /// Underlying object_store error (boxed: it is a large type).
         #[source]
-        source: object_store::Error,
+        source: Box<object_store::Error>,
     },
 
     /// Constructing the object store client for a bucket failed.
@@ -61,9 +61,9 @@ pub enum CatalogError {
     StorageClient {
         /// Bucket the client was being built for.
         bucket: String,
-        /// Underlying object_store error.
+        /// Underlying object_store error (boxed: it is a large type).
         #[source]
-        source: object_store::Error,
+        source: Box<object_store::Error>,
     },
 
     /// The Glue endpoint returned an entity-not-found error

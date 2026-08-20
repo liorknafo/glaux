@@ -259,13 +259,15 @@ impl NetworkGlueApi {
                 endpoint: self.endpoint.clone(),
                 source,
             })?;
-        let response = self.client.execute(reqwest_request).await.map_err(|source| {
-            CatalogError::GlueTransport {
+        let response = self
+            .client
+            .execute(reqwest_request)
+            .await
+            .map_err(|source| CatalogError::GlueTransport {
                 action,
                 endpoint: self.endpoint.clone(),
                 source,
-            }
-        })?;
+            })?;
 
         let status = response.status();
         let bytes = response
@@ -413,7 +415,10 @@ impl GlueApi for NetworkGlueApi {
 
     async fn get_table(&self, database: &str, table: &str) -> Result<GlueTable> {
         let mut response = self
-            .invoke("GetTable", json!({ "DatabaseName": database, "Name": table }))
+            .invoke(
+                "GetTable",
+                json!({ "DatabaseName": database, "Name": table }),
+            )
             .await?;
         let table_value = response.get_mut("Table").map(Value::take).ok_or_else(|| {
             CatalogError::GlueResponseParse {

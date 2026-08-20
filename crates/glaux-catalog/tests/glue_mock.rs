@@ -166,7 +166,10 @@ async fn get_databases_follows_pagination_and_signs_requests() {
 
     let databases = glue.get_databases().await.expect("get_databases");
     assert_eq!(
-        databases.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+        databases
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
         vec!["db_page_one", "db_page_two"],
         "both pages must be merged in order"
     );
@@ -184,7 +187,8 @@ async fn get_databases_follows_pagination_and_signs_requests() {
             req.authorization
         );
         assert!(
-            req.authorization.contains("/eu-central-1/glue/aws4_request"),
+            req.authorization
+                .contains("/eu-central-1/glue/aws4_request"),
             "got: {}",
             req.authorization
         );
@@ -212,7 +216,10 @@ async fn get_table_parses_the_full_table_shape() {
     assert_eq!(table.table_type.as_deref(), Some("EXTERNAL_TABLE"));
     assert_eq!(table.partition_keys.len(), 1);
     assert_eq!(table.partition_keys[0].name, "dt");
-    assert_eq!(table.partition_keys[0].column_type.as_deref(), Some("string"));
+    assert_eq!(
+        table.partition_keys[0].column_type.as_deref(),
+        Some("string")
+    );
     let sd = table.storage_descriptor.expect("storage descriptor");
     assert_eq!(sd.location.as_deref(), Some("s3://data/events/"));
     assert_eq!(
@@ -272,7 +279,10 @@ async fn entity_not_found_maps_to_the_dedicated_variant() {
         .expect_err("missing table must error");
     match err {
         CatalogError::GlueEntityNotFound { message } => {
-            assert!(message.contains("Table missing not found"), "got: {message}");
+            assert!(
+                message.contains("Table missing not found"),
+                "got: {message}"
+            );
         }
         other => panic!("expected GlueEntityNotFound, got: {other}"),
     }
