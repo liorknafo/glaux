@@ -112,6 +112,52 @@ pub enum CatalogError {
         /// Signer diagnostic.
         message: String,
     },
+
+    /// A Glue/Hive column type string could not be mapped to an Arrow type.
+    #[error("unsupported Hive type {type_string:?} for column {column}: {message}")]
+    UnsupportedHiveType {
+        /// Name of the column carrying the type.
+        column: String,
+        /// The full Hive type string as stored in Glue.
+        type_string: String,
+        /// What exactly was not understood.
+        message: String,
+    },
+
+    /// The table's SerDe / storage format has no glaux reader mapping.
+    #[error("unsupported storage format for table {database}.{table}: {message}")]
+    UnsupportedSerDe {
+        /// Owning database.
+        database: String,
+        /// Table name.
+        table: String,
+        /// The SerDe class (or missing piece) that is not supported.
+        message: String,
+    },
+
+    /// The Glue table (or one of its partitions) is missing metadata glaux
+    /// needs, or carries metadata glaux cannot honor.
+    #[error("invalid metadata for table {database}.{table}: {message}")]
+    TableMetadata {
+        /// Owning database.
+        database: String,
+        /// Table name.
+        table: String,
+        /// The exact metadata problem.
+        message: String,
+    },
+
+    /// The table's partition-projection configuration is invalid or uses a
+    /// projection feature glaux does not support.
+    #[error("partition projection error for table {database}.{table}: {message}")]
+    PartitionProjection {
+        /// Owning database.
+        database: String,
+        /// Table name.
+        table: String,
+        /// The exact projection problem, naming the offending property.
+        message: String,
+    },
 }
 
 /// Convenience alias used throughout the crate.
