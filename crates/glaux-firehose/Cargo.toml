@@ -1,0 +1,18 @@
+[package]
+name = "glaux-firehose"
+description = "Firehose-compatible API and real delivery engine: buffering, S3 prefix semantics, and JSON-to-Parquet format conversion"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+async-trait = { workspace = true }
+object_store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

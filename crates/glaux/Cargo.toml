@@ -1,0 +1,17 @@
+[package]
+name = "glaux"
+description = "All-in-one glaux binary: fakecloud control plane plus real Athena and Firehose data plane on one port"
+license = "AGPL-3.0-only"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+glaux-athena = { workspace = true }
+glaux-catalog = { workspace = true }
+glaux-firehose = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
