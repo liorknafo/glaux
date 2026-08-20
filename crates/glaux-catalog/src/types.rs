@@ -78,7 +78,11 @@ impl Parser<'_> {
             Err(format!(
                 "expected {c:?} at offset {}, found {:?}",
                 self.pos,
-                self.rest().chars().next().map(String::from).unwrap_or_default()
+                self.rest()
+                    .chars()
+                    .next()
+                    .map(String::from)
+                    .unwrap_or_default()
             ))
         }
     }
@@ -304,8 +308,14 @@ mod tests {
     #[test]
     fn errors_name_the_construct() {
         let err = parse_err("uniontype<int,string>");
-        assert!(err.contains("uniontype"), "error should name the type: {err}");
-        assert!(err.contains("column c"), "error should name the column: {err}");
+        assert!(
+            err.contains("uniontype"),
+            "error should name the type: {err}"
+        );
+        assert!(
+            err.contains("column c"),
+            "error should name the column: {err}"
+        );
 
         let err = parse_err("array<int");
         assert!(err.contains("expected '>'"), "unclosed array: {err}");

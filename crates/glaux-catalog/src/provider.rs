@@ -75,10 +75,7 @@ impl GlueCatalogProvider {
     /// Build a catalog provider, snapshotting the Glue database and table
     /// listings. Call again (or [`Self::try_new`] a fresh instance) to pick
     /// up newly created databases or tables.
-    pub async fn try_new(
-        glue: Arc<dyn GlueApi>,
-        storage: Arc<dyn StorageBackend>,
-    ) -> Result<Self> {
+    pub async fn try_new(glue: Arc<dyn GlueApi>, storage: Arc<dyn StorageBackend>) -> Result<Self> {
         let mut schemas = HashMap::new();
         for database in glue.get_databases().await? {
             let tables = glue.get_tables(&database.name).await?;
@@ -251,18 +248,20 @@ impl GlueTableProvider {
         }
         let mut file_fields = Vec::with_capacity(sd.columns.len());
         for column in &sd.columns {
-            let type_string = column.column_type.as_deref().ok_or_else(|| {
-                metadata_err(format!("column {} has no type", column.name))
-            })?;
+            let type_string = column
+                .column_type
+                .as_deref()
+                .ok_or_else(|| metadata_err(format!("column {} has no type", column.name)))?;
             let data_type = hive_type_to_arrow(&column.name, type_string)?;
             file_fields.push(Field::new(&column.name, data_type, true));
         }
 
         let mut partition_fields: Vec<FieldRef> = Vec::with_capacity(table.partition_keys.len());
         for key in &table.partition_keys {
-            let type_string = key.column_type.as_deref().ok_or_else(|| {
-                metadata_err(format!("partition key {} has no type", key.name))
-            })?;
+            let type_string = key
+                .column_type
+                .as_deref()
+                .ok_or_else(|| metadata_err(format!("partition key {} has no type", key.name)))?;
             let data_type = hive_type_to_arrow(&key.name, type_string)?;
             // Partition columns are non-nullable, matching DataFusion's
             // ListingTable convention (null partitions are rejected below).
@@ -351,8 +350,7 @@ impl GlueTableProvider {
     /// Turn a partition data location into a key prefix, requiring it to
     /// live in the table's bucket (multi-bucket tables are unsupported).
     fn partition_prefix(&self, location: &str) -> Result<String> {
-        let (bucket, prefix) =
-            parse_s3_location(location).map_err(|m| self.metadata_err(m))?;
+        let (bucket, prefix) = parse_s3_location(location).map_err(|m| self.metadata_err(m))?;
         if bucket != self.bucket {
             return Err(self.metadata_err(format!(
                 "partition location {location:?} is in bucket {bucket:?}, but the table \
@@ -454,11 +452,7 @@ impl GlueTableProvider {
 
         // One row per candidate partition, one column per partition key.
         let arrays = (0..self.partition_fields.len())
-            .map(|i| {
-                ScalarValue::iter_to_array(
-                    candidates.iter().map(|c| c.values[i].clone()),
-                )
-            })
+            .map(|i| ScalarValue::iter_to_array(candidates.iter().map(|c| c.values[i].clone())))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let schema = Arc::new(Schema::new(
             self.partition_fields
@@ -487,12 +481,15 @@ impl GlueTableProvider {
                 }
             };
             let values = physical.evaluate(&batch)?.into_array(batch.num_rows())?;
-            let booleans = values.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-                DataFusionError::Internal(format!(
-                    "partition-pruning filter {filter} evaluated to non-boolean type {}",
-                    values.data_type()
-                ))
-            })?;
+            let booleans = values
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Internal(format!(
+                        "partition-pruning filter {filter} evaluated to non-boolean type {}",
+                        values.data_type()
+                    ))
+                })?;
             for (i, keep_flag) in keep.iter_mut().enumerate() {
                 // A NULL filter result excludes the row, so the partition
                 // can be pruned unless the result is definitively true.
@@ -569,7 +566,11 @@ impl TableProvider for GlueTableProvider {
 
         let mut files = Vec::new();
         for candidate in &candidates {
-            files.extend(self.list_partition_files(candidate).await.map_err(external)?);
+            files.extend(
+                self.list_partition_files(candidate)
+                    .await
+                    .map_err(external)?,
+            );
         }
 
         if files.is_empty() {
@@ -613,9 +614,7 @@ fn parse_s3_location(location: &str) -> std::result::Result<(String, String), St
     let rest = ["s3://", "s3a://", "s3n://"]
         .iter()
         .find_map(|scheme| location.strip_prefix(scheme))
-        .ok_or_else(|| {
-            format!("location {location:?} is not an s3://, s3a://, or s3n:// URI")
-        })?;
+        .ok_or_else(|| format!("location {location:?} is not an s3://, s3a://, or s3n:// URI"))?;
     let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
     if bucket.is_empty() {
         return Err(format!("location {location:?} has an empty bucket"));

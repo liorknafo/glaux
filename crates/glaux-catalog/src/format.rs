@@ -208,7 +208,6 @@ fn single_byte(name: &str, value: &str) -> std::result::Result<u8, String> {
 mod tests {
     use super::*;
     use crate::glue::GlueSerDeInfo;
-    use datafusion::datasource::file_format::FileFormat as _;
 
     fn table_with(sd: GlueStorageDescriptor) -> GlueTable {
         GlueTable {

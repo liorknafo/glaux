@@ -8,6 +8,7 @@
 //! `date` projection types; anything else (including `injected`) errors
 //! explicitly naming the property.
 
+use chrono::format::{Parsed, StrftimeItems, parse};
 use chrono::{Days, Months, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Utc};
 use std::collections::HashMap;
 
@@ -100,7 +101,7 @@ impl DateUnit {
             }
             Self::Weeks => Self::Days.add_to(t, amount.checked_mul(7)?),
             Self::Days => {
-                let days = u64::try_from(amount.unsigned_abs()).ok()?;
+                let days = amount.unsigned_abs();
                 if amount >= 0 {
                     t.checked_add_days(Days::new(days))
                 } else {
@@ -251,9 +252,8 @@ fn parse_column(params: &HashMap<String, String>, col: &str) -> ProjResult<Colum
         .ok_or_else(|| format!("missing projection.{col}.type for partition column {col}"))?;
     match projection_type.to_ascii_lowercase().as_str() {
         "enum" => {
-            let values = get("values").ok_or_else(|| {
-                format!("enum projection requires projection.{col}.values")
-            })?;
+            let values = get("values")
+                .ok_or_else(|| format!("enum projection requires projection.{col}.values"))?;
             let values: Vec<String> = values
                 .split(',')
                 .map(|v| v.trim().to_string())
@@ -265,9 +265,8 @@ fn parse_column(params: &HashMap<String, String>, col: &str) -> ProjResult<Colum
             Ok(ColumnProjection::Enum { values })
         }
         "integer" => {
-            let range = get("range").ok_or_else(|| {
-                format!("integer projection requires projection.{col}.range")
-            })?;
+            let range = get("range")
+                .ok_or_else(|| format!("integer projection requires projection.{col}.range"))?;
             let (min, max) = split_range(col, range)?;
             let min: i64 = min
                 .trim()
@@ -298,9 +297,8 @@ fn parse_column(params: &HashMap<String, String>, col: &str) -> ProjResult<Colum
             })
         }
         "date" => {
-            let range = get("range").ok_or_else(|| {
-                format!("date projection requires projection.{col}.range")
-            })?;
+            let range = get("range")
+                .ok_or_else(|| format!("date projection requires projection.{col}.range"))?;
             let java_format = get("format").map(String::as_str).unwrap_or("yyyy-MM-dd");
             let (format, has_time) = java_date_format_to_chrono(java_format)
                 .map_err(|m| format!("projection.{col}.format: {m}"))?;
@@ -343,9 +341,9 @@ fn parse_column(params: &HashMap<String, String>, col: &str) -> ProjResult<Colum
 }
 
 fn split_range<'a>(col: &str, range: &'a str) -> ProjResult<(&'a str, &'a str)> {
-    range.split_once(',').ok_or_else(|| {
-        format!("projection.{col}.range {range:?} must be \"<start>,<end>\"")
-    })
+    range
+        .split_once(',')
+        .ok_or_else(|| format!("projection.{col}.range {range:?} must be \"<start>,<end>\""))
 }
 
 fn parse_interval(value: Option<&String>, col: &str) -> ProjResult<i64> {
@@ -406,14 +404,28 @@ fn parse_date_bound(
 }
 
 fn parse_datetime(value: &str, chrono_format: &str, has_time: bool) -> ProjResult<NaiveDateTime> {
-    if has_time {
-        NaiveDateTime::parse_from_str(value, chrono_format)
-            .map_err(|e| format!("does not match format {chrono_format:?}: {e}"))
-    } else {
-        NaiveDate::parse_from_str(value, chrono_format)
+    let mismatch = |e: chrono::ParseError| format!("does not match format {chrono_format:?}: {e}");
+    if !has_time {
+        return NaiveDate::parse_from_str(value, chrono_format)
             .map(|d| d.and_time(NaiveTime::MIN))
-            .map_err(|e| format!("does not match format {chrono_format:?}: {e}"))
+            .map_err(mismatch);
     }
+    // Time-of-day formats may carry only some components (`yyyy/MM/dd/HH`
+    // is the common hourly layout); chrono's `parse_from_str` insists on
+    // minutes, so parse into `Parsed` and default the missing fields to 0,
+    // exactly as Java's SimpleDateFormat does.
+    let mut parsed = Parsed::new();
+    parse(&mut parsed, value, StrftimeItems::new(chrono_format)).map_err(mismatch)?;
+    if parsed.hour_div_12().is_none() && parsed.hour_mod_12().is_none() {
+        parsed.set_hour(0).map_err(mismatch)?;
+    }
+    if parsed.minute().is_none() {
+        parsed.set_minute(0).map_err(mismatch)?;
+    }
+    if parsed.second().is_none() {
+        parsed.set_second(0).map_err(mismatch)?;
+    }
+    parsed.to_naive_datetime_with_offset(0).map_err(mismatch)
 }
 
 fn enumerate_column(
@@ -663,7 +675,10 @@ mod tests {
         let partitions = config.enumerate("s3://b/t").unwrap();
         assert_eq!(partitions.len(), 3);
         let today = Utc::now().naive_utc().date();
-        assert_eq!(partitions[2].values[0], today.format("%Y-%m-%d").to_string());
+        assert_eq!(
+            partitions[2].values[0],
+            today.format("%Y-%m-%d").to_string()
+        );
     }
 
     #[test]
@@ -688,10 +703,7 @@ mod tests {
             &[
                 ("projection.region.type", "enum"),
                 ("projection.region.values", "us-east-1, eu-west-1"),
-                (
-                    "storage.location.template",
-                    "s3://bucket/data/${region}/v1",
-                ),
+                ("storage.location.template", "s3://bucket/data/${region}/v1"),
             ],
             &["region"],
         );
@@ -725,24 +737,25 @@ mod tests {
         let partitions = config.enumerate("s3://b/t").unwrap();
         assert_eq!(partitions.len(), 4);
         assert_eq!(partitions[0].values, vec!["2024-01-01", "a"]);
-        assert_eq!(
-            partitions[0].location,
-            "s3://b/t/day=2024-01-01/kind=a"
-        );
+        assert_eq!(partitions[0].location, "s3://b/t/day=2024-01-01/kind=a");
         assert_eq!(partitions[3].values, vec!["2024-01-02", "b"]);
     }
 
     #[test]
     fn injected_projection_errors_explicitly() {
         let table = projected_table(&[("projection.user.type", "injected")], &["user"]);
-        let err = ProjectionConfig::from_table("db", &table).unwrap().unwrap_err();
+        let err = ProjectionConfig::from_table("db", &table)
+            .unwrap()
+            .unwrap_err();
         assert!(err.to_string().contains("injected"), "{err}");
     }
 
     #[test]
     fn missing_type_errors_naming_the_column() {
         let table = projected_table(&[], &["day"]);
-        let err = ProjectionConfig::from_table("db", &table).unwrap().unwrap_err();
+        let err = ProjectionConfig::from_table("db", &table)
+            .unwrap()
+            .unwrap_err();
         assert!(err.to_string().contains("projection.day.type"), "{err}");
     }
 
@@ -756,7 +769,9 @@ mod tests {
             ],
             &["day"],
         );
-        let err = ProjectionConfig::from_table("db", &table).unwrap().unwrap_err();
+        let err = ProjectionConfig::from_table("db", &table)
+            .unwrap()
+            .unwrap_err();
         assert!(err.to_string().contains("date format token"), "{err}");
     }
 
@@ -784,7 +799,9 @@ mod tests {
             ],
             &["day"],
         );
-        let err = ProjectionConfig::from_table("db", &table).unwrap().unwrap_err();
+        let err = ProjectionConfig::from_table("db", &table)
+            .unwrap()
+            .unwrap_err();
         assert!(err.to_string().contains("${day}"), "{err}");
     }
 }
