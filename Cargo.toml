@@ -35,9 +35,26 @@ arrow = "59.2"
 object_store = "0.13"
 sqlparser = "0.62"
 
+# AWS request signing (SigV4 for the lightweight Glue client; the full
+# aws-sdk-glue stack is deliberately avoided — see glaux-catalog docs)
+aws-credential-types = "1"
+aws-sigv4 = "1"
+aws-smithy-runtime-api = "1"
+
+# HTTP client (rustls only, matching object_store's TLS stack)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+http = "1"
+
 # Utilities
 async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
 thiserror = "2"
+toml = "0.9"
+
+# Test-only helpers (referenced from crate dev-dependencies)
+parquet = "59.2"
+tempfile = "3"
 
 # Observability
 tracing = "0.1"
