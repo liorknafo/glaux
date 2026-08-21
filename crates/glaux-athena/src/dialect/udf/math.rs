@@ -149,9 +149,22 @@ impl TrinoMath {
     }
 }
 
-/// Java's `Math.pow(10, n)`: the correctly rounded double for `10ⁿ`
-/// (`0` on underflow, infinity on overflow), which Rust's decimal parser
-/// also produces. `f64::powi` rounds at every step and can differ.
+/// Java's `Math.pow(10, n)`, the `factor` in Trino's `round`: the
+/// correctly rounded double for `10ⁿ` (`0` on underflow, infinity on
+/// overflow). Going through Rust's decimal parser rather than `f64::powi`
+/// is what makes it correctly rounded — `powi` rounds at every
+/// multiplication and drifts.
+///
+/// For `0 <= n <= 22`, `10ⁿ` is exactly representable and `Math.pow` is
+/// specified to return it exactly ("if both arguments are integers, then
+/// the result is exactly equal to the mathematical result … if that result
+/// can in fact be represented exactly as a double"), so we provably agree.
+/// Outside that range Java only promises to be within 1 ulp, so a JVM
+/// could in principle hand Trino a `factor` one ulp off the correctly
+/// rounded one we use. Such an `n` rounds a double at a decimal place it
+/// has no significant digits in, where the result is the input back or a
+/// zero either way, which is why this is a documented tolerance and not a
+/// refusal.
 fn pow10_f64(n: i64) -> f64 {
     format!("1e{n}").parse::<f64>().unwrap_or(f64::INFINITY)
 }
