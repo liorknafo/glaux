@@ -258,10 +258,19 @@ fn round_half_away(value: i256, divisor: i256) -> i256 {
 fn decimal_result(op: MathOp, p: u8, s: i8, decimals: Option<i64>) -> DataType {
     let integral_precision =
         (u32::from(p) - s as u32 + u32::from(s > 0)).min(u32::from(MAX_PRECISION)) as u8;
+    // Trino's one-argument `truncate` declares `decimal(max(1, p - s), 0)`
+    // (`MathFunctions.Truncate`'s `@Constraint(variable = "rp", expression =
+    // "max(1, p - s)")`), one digit narrower than `ceiling` / `floor`'s
+    // `p - s + min(s, 1)` whenever the argument has a scale: `truncate(1.98)`
+    // is `decimal(1,0)`, not `decimal(2,0)`.
+    let truncated_precision = u32::from(p)
+        .saturating_sub(s.max(0) as u32)
+        .clamp(1, u32::from(MAX_PRECISION)) as u8;
     match (op, decimals) {
         (MathOp::Sign, _) => DataType::Decimal128(1, 0),
         (MathOp::Round, Some(_)) => DataType::Decimal128((p + 1).min(MAX_PRECISION), s),
         (MathOp::Truncate, Some(_)) => DataType::Decimal128(p, s),
+        (MathOp::Truncate, None) => DataType::Decimal128(truncated_precision, 0),
         _ => DataType::Decimal128(integral_precision, 0),
     }
 }

@@ -1092,7 +1092,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "truncate(x[, n])",
         "Math",
         Rewrite,
-        "Rust UDF `trino_truncate`: integers keep their type; a `decimal(p, s)` becomes `decimal(p - s + min(s, 1), 0)` with one argument and keeps `decimal(p, s)` with two (`truncate(2.789, 2)` is `2.780`); single-argument `truncate(double)` is `signum(x) · floor(|x|)`. `truncate(double, n)` is refused by name: the two-argument overload exists only for DECIMAL — neither Trino (Athena engine v3) nor Presto 0.217 (engine v2) declares one for DOUBLE / REAL, so Athena answers it with a function-resolution error, and DataFusion's own two-argument trunc would silently return a value Athena never would.",
+        "Rust UDF `trino_truncate`: integers keep their type; a `decimal(p, s)` becomes `decimal(max(1, p - s), 0)` with one argument (Trino's `@Constraint(variable = \"rp\", expression = \"max(1, p - s)\")`, one digit narrower than `ceiling` / `floor`'s `p - s + min(s, 1)`, so `truncate(1.98)` is `decimal(1,0)`) and keeps `decimal(p, s)` with two (`truncate(2.789, 2)` is `2.780`); single-argument `truncate(double)` is `signum(x) · floor(|x|)`. `truncate(double, n)` is refused by name: the two-argument overload exists only for DECIMAL — neither Trino (Athena engine v3) nor Presto 0.217 (engine v2) declares one for DOUBLE / REAL, so Athena answers it with a function-resolution error, and DataFusion's own two-argument trunc would silently return a value Athena never would.",
         ["trino_truncate"]
     ),
     // --- Array -------------------------------------------------------------
