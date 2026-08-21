@@ -1149,7 +1149,11 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             let Value::Number(text, _) = &v.value else {
                 unreachable!()
             };
-            *expr = cast_to(str_lit(text), double());
+            // The same `trino_double` shim a written-out `CAST(... AS
+            // DOUBLE)` becomes, so the plan never carries a bare
+            // `CAST(<varchar literal> AS DOUBLE)` that glaux cannot tell
+            // apart from one DataFusion's own coercion inserted.
+            *expr = func("trino_double", vec![str_lit(text)]);
             Ok(())
         }
         // An integer literal beyond bigint is a DECIMAL in Trino; DataFusion
@@ -2444,7 +2448,7 @@ mod tests {
         // DataFusion's decimal parsing.
         assert_eq!(
             rewrite("SELECT 1e2 AS a, 1.5 AS b, 10 AS c").unwrap(),
-            "SELECT CAST('1e2' AS DOUBLE) AS a, 1.5 AS b, 10 AS c"
+            "SELECT trino_double('1e2') AS a, 1.5 AS b, 10 AS c"
         );
     }
 
@@ -2588,7 +2592,7 @@ mod tests {
         assert_eq!(
             rewrite("SELECT -9223372036854775808 AS a, -1 AS b, -(1) AS c, 3 -1 AS d, -1.5 AS e, -1e2 AS f, -x AS g FROM t")
                 .unwrap(),
-            "SELECT -9223372036854775808 AS a, -1 AS b, -(1) AS c, 3 - 1 AS d, -1.5 AS e, -CAST('1e2' AS DOUBLE) AS f, -x AS g FROM t"
+            "SELECT -9223372036854775808 AS a, -1 AS b, -(1) AS c, 3 - 1 AS d, -1.5 AS e, -trino_double('1e2') AS f, -x AS g FROM t"
         );
         // Beyond bigint either way: a decimal with the digit count of the
         // magnitude.

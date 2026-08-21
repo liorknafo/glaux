@@ -294,6 +294,23 @@ fn classify(err: DataFusionError) -> EngineError {
                     trino_type_tokens(rest)
                 ));
             }
+            // And for a `VALUES` row list whose columns it will not unify
+            // ("Inconsistent data type across values list at row 1 column
+            // 0. Was Date32 but found Utf8"), which is Trino's `Values rows
+            // have mismatched types`. The pairs DataFusion *does* unify are
+            // caught by the strict checker instead.
+            if let Some(rest) = root_message.strip_prefix(
+                "Error during planning: Inconsistent data type across \
+                     values list at row ",
+            ) && let Some((_, types)) = rest.split_once(". Was ")
+                && let Some((was, found)) = types.split_once(" but found ")
+            {
+                return EngineError::TypeMismatch(format!(
+                    "Values rows have mismatched types: row({}) vs row({})",
+                    trino_type_tokens(was),
+                    trino_type_tokens(found.trim_end_matches('.'))
+                ));
+            }
             EngineError::Plan(err.to_string())
         }
         DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {

@@ -1459,7 +1459,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "VALUES",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "Inline tables, also as a `FROM` source with column aliases; anonymous columns are `_col0`, `_col1`, … as on Athena. Bare (unparenthesised) row expressions — `VALUES 1, 2`, valid Trino — are wrapped for sqlparser at the token level.",
+        notes: "Inline tables, also as a `FROM` source with column aliases; anonymous columns are `_col0`, `_col1`, … as on Athena. Bare (unparenthesised) row expressions — `VALUES 1, 2`, valid Trino — are wrapped for sqlparser at the token level. The rows must share a type, as on Trino: `(VALUES (1), ('2'))` is `TYPE_MISMATCH: Values rows have mismatched types: row(bigint) vs row(varchar)` (DataFusion alone coerced it into a bigint column with the rows `1, 2`), and the pairs DataFusion refuses itself carry the same diagnostic instead of its `Inconsistent data type across values list` text. Column types follow Trino: `(VALUES (1), (2))` is `integer`, `(VALUES (1), (1.5))` is `decimal(11,1)`, and a column mixing a double with an exact number is `double` (DataFusion alone would report `decimal(30,15)`).",
         corpus_marker: "VALUES",
     },
     Construct {
@@ -1508,7 +1508,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "ARRAY[...] literals and 1-based subscripts",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "`arr[1]` is the first element; `arr[0]`, negative, and out-of-range subscripts are errors, as in Trino (use `element_at` for NULL instead). The bare `[1, 2]` form is refused as non-Trino syntax.",
+        notes: "`arr[1]` is the first element; `arr[0]`, negative, and out-of-range subscripts are errors, as in Trino (use `element_at` for NULL instead). The bare `[1, 2]` form is refused as non-Trino syntax. The elements must share a type, like every other operand list: `ARRAY[1, '2']` is `TYPE_MISMATCH: All ARRAY elements must be the same type or coercible to a common type` at planning (DataFusion alone answered `[1, 2]`, or failed at run time with an Arrow cast error for `ARRAY[1, 'a']`). The element type follows Trino too: a double mixed with an exact number is a `double` array, where DataFusion would unify on `decimal(38,15)`.",
         corpus_marker: "ARRAY[",
     },
     Construct {
@@ -1529,7 +1529,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Numeric literals",
         category: "Semantics",
         status: ConstructStatus::Supported,
-        notes: "`1` is `INTEGER` (when it fits in 32 bits, else `BIGINT`), `1.5` and `DECIMAL '1.5'` are `DECIMAL(2,1)`, `1e2` is `DOUBLE`, and an integer literal beyond bigint is a `DECIMAL(p, 0)`, as in Trino, so `0.1 + 0.2` is exactly `0.3` and `SELECT 1` reports `integer`. A unary minus directly on an integer literal is part of the literal, as in Trino's grammar: `-9223372036854775808` is a `bigint` (not a `decimal(19,0)`) and `-9223372036854775808 - 1` overflows. Decimal arithmetic follows Trino's result types and rounding: `+ - *` use Trino's precision/scale with `Decimal overflow` errors past 38 digits, and `/` rounds HALF_UP to `max(s1, s2)` places (`1.5 / 2` is `0.8`, `10.00 / 3` is `3.33`). A double mixed with an exact number (`least(1.5, 2e0)`) is a double. Literals above 38 digits are refused.",
+        notes: "`1` is `INTEGER` (when it fits in 32 bits, else `BIGINT`), `1.5` and `DECIMAL '1.5'` are `DECIMAL(2,1)`, `1e2` is `DOUBLE`, and an integer literal beyond bigint is a `DECIMAL(p, 0)`, as in Trino, so `0.1 + 0.2` is exactly `0.3` and `SELECT 1` reports `integer`. A unary minus directly on an integer literal is part of the literal, as in Trino's grammar: `-9223372036854775808` is a `bigint` (not a `decimal(19,0)`) and `-9223372036854775808 - 1` overflows. Decimal arithmetic follows Trino's result types and rounding: `+ - *` use Trino's precision/scale with `Decimal overflow` errors past 38 digits, and `/` rounds HALF_UP to `max(s1, s2)` places (`1.5 / 2` is `0.8`, `10.00 / 3` is `3.33`). A double mixed with an exact number (`least(1.5, 2e0)`) is a double — in `coalesce` / `CASE` / `greatest` / `least`, in `ARRAY[...]`, in a `VALUES` column, and across set operations alike. Literals above 38 digits are refused.",
         corpus_marker: "0.5",
     },
     Construct {

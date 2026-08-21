@@ -32,7 +32,7 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, Operator};
 
 use super::error::GlauxSqlError;
-use super::udf::arithmetic::input_schema;
+use super::udf::arithmetic::{input_schema, values_row_expr};
 use super::udf::casts::trino_type_name;
 
 /// Coarse type classes; Trino only mixes classes in the cases listed in
@@ -418,6 +418,15 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
                     let args: Vec<&Expr> = call.args.iter().collect();
                     check_common_type(&format!("{} operands", name.to_uppercase()), &args, schema)
                 }
+                // `ARRAY[...]` plans as DataFusion's `make_array`, which
+                // casts every element to one common type and would answer
+                // `ARRAY[1, '2']` with `[1, 2]` (or fail at run time with
+                // an Arrow cast error for `ARRAY[1, 'a']`). Trino refuses
+                // the mix at analysis time, like every other operand list.
+                "make_array" => {
+                    let args: Vec<&Expr> = call.args.iter().collect();
+                    check_common_type("ARRAY elements", &args, schema)
+                }
                 _ => {
                     if let Some(index) = date_argument(name)
                         && let Some(arg) = call.args.get(index)
@@ -494,8 +503,55 @@ fn check_plan_node(node: &LogicalPlan, schema: &DFSchema) -> Result<(), GlauxSql
             }
             Ok(())
         }
+        // A multi-row `VALUES` is an operand list like the others: Trino
+        // requires the rows to share a type and reports `Values rows have
+        // mismatched types` otherwise, where DataFusion's planner coerces
+        // `(VALUES (1), ('2'))` into a bigint column with the rows `1, 2`.
+        // The row expressions are read through
+        // [`values_row_expr`] so the planner's own coercion casts do not
+        // hide the type the user wrote.
+        LogicalPlan::Values(values) => {
+            let row_types: Vec<Vec<Option<DataType>>> = values
+                .values
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|e| values_row_expr(e).get_type(schema).ok())
+                        .collect()
+                })
+                .collect();
+            let Some(first) = row_types.first() else {
+                return Ok(());
+            };
+            for other in row_types.iter().skip(1) {
+                let clash = first.iter().zip(other).any(|(a, b)| match (a, b) {
+                    (Some(a), Some(b)) => !comparable(a, b),
+                    _ => false,
+                });
+                if clash {
+                    return Err(GlauxSqlError::type_mismatch(format!(
+                        "Values rows have mismatched types: {} vs {}",
+                        row_type_text(first),
+                        row_type_text(other)
+                    )));
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
+}
+
+/// Trino's `row(integer, varchar(1))` rendering of a `VALUES` row's types.
+fn row_type_text(types: &[Option<DataType>]) -> String {
+    let names: Vec<String> = types
+        .iter()
+        .map(|t| match t {
+            Some(t) => trino_type_name(t),
+            None => "unknown".to_string(),
+        })
+        .collect();
+    format!("row({})", names.join(", "))
 }
 
 /// `IN (subquery)` / `EXISTS` used as a *value* (in the select list, a sort

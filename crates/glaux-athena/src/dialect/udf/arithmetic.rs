@@ -827,6 +827,18 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     ))));
                 }
             }
+            // `ARRAY[...]` (DataFusion's `make_array`) unifies its
+            // elements the same way: a double mixed with a decimal is a
+            // double array on Trino, where DataFusion's element coercion
+            // lands on `decimal(38,15)` and prints `1.000000000000000`.
+            Expr::ScalarFunction(call) if call.func.name() == "make_array" => {
+                let arg_refs: Vec<&Expr> = call.args.iter().collect();
+                if let Some(widened) = widen_exact_to_double(&arg_refs, schema) {
+                    let mut replacement = call.clone();
+                    replacement.args = widened;
+                    return Ok(Transformed::yes(Expr::ScalarFunction(replacement)));
+                }
+            }
             // Trino's common supertype of double and an exact number is
             // double; DataFusion widens both into a decimal. `nullif` and
             // `greatest` additionally need IEEE / NaN-smallest semantics
@@ -1069,6 +1081,40 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     })
 }
 
+/// A `VALUES` row expression with DataFusion's own coercion cast peeled
+/// off, so both the strict checker and the row rebuilder below see the type
+/// the user wrote rather than the column type the planner unified on.
+///
+/// Every user-written `CAST` reaches the plan as a `trino_*` UDF call, or —
+/// for integer targets only — as `CAST(trino_round_for_cast(x) AS ...)`, so
+/// a plain `Expr::Cast` to a varchar or numeric type is always the
+/// planner's. `TRY_CAST` is user syntax and never stripped.
+pub(crate) fn values_row_expr(expr: &Expr) -> &Expr {
+    let Expr::Cast(cast) = expr else {
+        return expr;
+    };
+    let coercion_target = matches!(
+        cast.field.data_type(),
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Decimal128(..)
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+    );
+    let user_cast = matches!(cast.expr.as_ref(), Expr::ScalarFunction(call)
+        if call.func.name() == "trino_round_for_cast");
+    if coercion_target && !user_cast {
+        values_row_expr(&cast.expr)
+    } else {
+        expr
+    }
+}
+
 /// The rows of a `VALUES` after the literal narrowing, ready to be
 /// re-planned: the name-preserving aliases are stripped (the builder would
 /// otherwise cast the aliased literal), the planner's own casts of integer
@@ -1078,7 +1124,7 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
 /// cast carries a `trino_` wrapper and is kept), and a column whose values
 /// are all `integer` or typed NULLs gets `integer` NULLs.
 fn narrow_values(rows: &[Vec<Expr>]) -> Vec<Vec<Expr>> {
-    // A numeric literal, or the `CAST('1e2' AS DOUBLE)` an exponent literal
+    // A numeric literal, or the `trino_double('1e2')` an exponent literal
     // arrives as.
     let is_numeric_literal = |e: &Expr| match e {
         Expr::Literal(
@@ -1088,11 +1134,7 @@ fn narrow_values(rows: &[Vec<Expr>]) -> Vec<Vec<Expr>> {
             | ScalarValue::Float64(_),
             _,
         ) => true,
-        Expr::Cast(cast) => {
-            cast.field.data_type() == &DataType::Float64
-                && matches!(cast.expr.as_ref(), Expr::Literal(ScalarValue::Utf8(_), _))
-        }
-        _ => false,
+        _ => is_double_literal(e),
     };
     let strip_planner_cast = |e: Expr| match e {
         Expr::Cast(cast)
@@ -1140,7 +1182,7 @@ fn narrow_values(rows: &[Vec<Expr>]) -> Vec<Vec<Expr>> {
                         | ScalarValue::Float64(Some(_)),
                     _
                 ) | Expr::Cast(_)
-            )
+            ) || is_double_literal(&row[column])
         });
         if any_numeric_value {
             for row in &mut rows {
@@ -1149,28 +1191,38 @@ fn narrow_values(rows: &[Vec<Expr>]) -> Vec<Vec<Expr>> {
                 }
             }
         }
-        // A column mixing doubles and exact numbers is double on Trino.
-        let literal_type = |e: &Expr| match e {
-            Expr::Literal(v, _) => Some(v.data_type()),
-            // `1e2` arrives as `CAST('1e2' AS DOUBLE)`.
-            Expr::Cast(cast) if matches!(cast.expr.as_ref(), Expr::Literal(..)) => {
-                Some(cast.field.data_type().clone())
-            }
-            _ => None,
-        };
+        // A column mixing doubles and exact numbers is double on Trino,
+        // whatever the rows are: literals, `CAST(1 AS DOUBLE)`, or any
+        // other expression. DataFusion would unify the column into a wide
+        // decimal instead (`decimal(30,15)`), which prints differently.
+        let empty = DFSchema::empty();
+        let cell_type = |e: &Expr| values_row_expr(e).get_type(&empty).ok();
         let types: Vec<DataType> = rows
             .iter()
-            .filter_map(|row| literal_type(&row[column]))
+            .filter_map(|row| cell_type(&row[column]))
             .collect();
         if types.iter().any(is_float) && types.iter().any(is_exact_numeric) {
             for row in &mut rows {
-                if literal_type(&row[column]).is_some_and(|t| is_exact_numeric(&t)) {
-                    row[column] = to_double(&row[column]);
-                }
+                // Drop DataFusion's coercion cast first: casting the
+                // already-widened decimal back to double would round-trip
+                // the value through `decimal(30,15)` and lose magnitude.
+                let cell = values_row_expr(&row[column]).clone();
+                row[column] = if cell_type(&cell).is_some_and(|t| is_exact_numeric(&t)) {
+                    to_double(&cell)
+                } else {
+                    cell
+                };
             }
         }
     }
     rows
+}
+
+/// The `trino_double('1e2')` shim an exponent literal is rewritten to.
+fn is_double_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::ScalarFunction(call)
+        if call.func.name() == "trino_double"
+            && matches!(call.args.as_slice(), [Expr::Literal(ScalarValue::Utf8(_), _)]))
 }
 
 /// Trino's common supertype of a double and an exact number is double, also
