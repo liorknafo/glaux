@@ -27,6 +27,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 aws-credential-types = { workspace = true }
 aws-sdk-athena = { workspace = true }
+csv = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true, features = ["arrow"] }
