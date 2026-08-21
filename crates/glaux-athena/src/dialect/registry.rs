@@ -1543,7 +1543,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Operator type checking",
         category: "Semantics",
         status: ConstructStatus::Supported,
-        notes: "Comparisons, arithmetic, `||`, `IN` (lists and subqueries), `BETWEEN`, join keys, simple `CASE` operands, `CASE` / `if` / `nullif` / `coalesce` / `greatest` / `least` results, and set-operation columns between types Trino does not combine (`varchar = integer`, `'a' || 1`, `date = varchar`) are refused with `TYPE_MISMATCH` instead of being coerced, and the date-part functions (`year`, `date_trunc`, `date_format`, `to_unixtime`, `EXTRACT`) refuse varchar arguments. Numeric types compare with each other and `date` with `timestamp`, as in Trino.",
+        notes: "Comparisons, arithmetic (`1 + '2'`), `||`, `LIKE` over non-varchar operands (`1 LIKE '1'`, refused with Trino's \"must evaluate to a varchar\" diagnostic), `IN` (lists and subqueries), `BETWEEN`, join keys, simple `CASE` operands, `CASE` / `if` / `nullif` / `coalesce` / `greatest` / `least` results, and set-operation columns between types Trino does not combine (`varchar = integer`, `'a' || 1`, `date = varchar`) are refused with `TYPE_MISMATCH` instead of being coerced, and the date-part functions (`year`, `date_trunc`, `date_format`, `to_unixtime`, `EXTRACT`) refuse varchar arguments. Numeric types compare with each other and `date` with `timestamp`, as in Trino.",
         corpus_marker: "'1' = 1",
     },
     Construct {

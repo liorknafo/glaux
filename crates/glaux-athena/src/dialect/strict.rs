@@ -6,7 +6,8 @@
 //! query that works on glaux but fails on Athena (or, worse, matches
 //! different rows) would be silently wrong. [`check`] walks the logical
 //! plan DataFusion produced *before* its type-coercion pass and rejects
-//! comparisons, arithmetic, concatenation, `IN` lists and subqueries,
+//! comparisons, arithmetic, concatenation, `LIKE` over non-varchar
+//! operands, `IN` lists and subqueries,
 //! `BETWEEN`, join conditions (`ON` and `USING`), simple `CASE` operands
 //! and `CASE` / `if` results, `nullif` / `coalesce` / `greatest` / `least`
 //! arguments, set-operation columns, and varchar arguments to the
@@ -323,6 +324,29 @@ fn check_cast(source: &Expr, target: &DataType, schema: &DFSchema) -> Result<(),
 fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
     match expr {
         Expr::BinaryExpr(binary) => check_operands(&binary.left, binary.op, &binary.right, schema),
+        // Trino types both sides of `LIKE` as varchar; DataFusion's
+        // type-coercion pass would fail later with its own planner text
+        // ("There isn't a common type to coerce Int32 and Utf8 in LIKE
+        // expression"), so refuse here with Trino's diagnostic.
+        Expr::Like(like) | Expr::SimilarTo(like) => {
+            if let Ok(t) = like.expr.get_type(schema)
+                && !matches!(class(&t), Class::String | Class::Null)
+            {
+                return Err(GlauxSqlError::type_mismatch(format!(
+                    "Left side of LIKE expression must evaluate to a varchar (actual: {})",
+                    trino_type_name(&t)
+                )));
+            }
+            if let Ok(t) = like.pattern.get_type(schema)
+                && !matches!(class(&t), Class::String | Class::Null)
+            {
+                return Err(GlauxSqlError::type_mismatch(format!(
+                    "Pattern for LIKE expression must evaluate to a varchar (actual: {})",
+                    trino_type_name(&t)
+                )));
+            }
+            Ok(())
+        }
         Expr::InList(in_list) => {
             for item in &in_list.list {
                 check_operands(&in_list.expr, Operator::Eq, item, schema)?;

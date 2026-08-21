@@ -1529,11 +1529,13 @@ fn check_interval(interval: &sqlparser::ast::Interval) -> Result<(), GlauxSqlErr
 
 /// `LIKE` patterns: Trino has no default escape character, so `\` is a
 /// literal backslash unless an `ESCAPE` clause names it; DataFusion (and
-/// Arrow) always treat `\` as the escape. The pattern is rewritten so
+/// Arrow) always treat `\` as the escape. A literal pattern is rewritten so
 /// DataFusion's backslash-escaped form means what Trino's pattern meant:
 /// every backslash is doubled, and with an `ESCAPE` clause the escape
 /// sequences (`#%`, `#_`, `##`) become `\%`, `\_`, `#`; any other use of
-/// the escape character is an error, as in Trino.
+/// the escape character is an error, as in Trino. Computed patterns get the
+/// same backslash doubling from the `TrinoSemantics` analyzer, once their
+/// type is known.
 fn rewrite_like_pattern(
     pattern: &mut Expr,
     escape: Option<sqlparser::ast::ValueWithSpan>,
@@ -1573,9 +1575,11 @@ fn rewrite_like_pattern(
             *pattern = str_lit(&translate_like_pattern(&text, escape)?);
         }
         (None, None) => {
-            // A computed pattern: double every backslash at run time.
-            let source = take(pattern);
-            *pattern = func("replace", vec![source, str_lit("\\"), str_lit("\\\\")]);
+            // A computed pattern (or a non-varchar literal) is left for the
+            // plan-level passes, where its type is known: the strict
+            // checker refuses non-varchar patterns with Trino's diagnostic,
+            // and the `TrinoSemantics` analyzer doubles the backslashes of
+            // varchar patterns at run time.
         }
         (None, Some(_)) => {
             return Err(GlauxSqlError::unsupported(

@@ -780,6 +780,29 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     return Ok(Transformed::yes(replacement));
                 }
             }
+            // A computed `LIKE` pattern: Trino has no default escape
+            // character (`\` is a literal backslash), where DataFusion
+            // always treats `\` as the escape. Literal patterns were
+            // translated during the AST rewrite; a computed varchar pattern
+            // doubles its backslashes at run time. (Non-varchar patterns
+            // never get here: the strict checker refused them before the
+            // analyzer ran.)
+            Expr::Like(like) if !matches!(like.pattern.as_ref(), Expr::Literal(..)) => {
+                if let Ok(t) = like.pattern.get_type(schema)
+                    && matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
+                {
+                    let mut replacement = like.clone();
+                    replacement.pattern = Box::new(Expr::ScalarFunction(ScalarFunction::new_udf(
+                        datafusion::functions::string::replace(),
+                        vec![
+                            like.pattern.as_ref().clone(),
+                            Expr::Literal(ScalarValue::from("\\"), None),
+                            Expr::Literal(ScalarValue::from("\\\\"), None),
+                        ],
+                    )));
+                    return Ok(Transformed::yes(Expr::Like(replacement)));
+                }
+            }
             Expr::AggregateFunction(agg) if matches!(agg.func.name(), "sum" | "avg" | "max") => {
                 if let [arg] = agg.params.args.as_slice()
                     && let Ok(t) = arg.get_type(schema)

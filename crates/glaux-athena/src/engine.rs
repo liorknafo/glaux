@@ -281,6 +281,19 @@ fn classify(err: DataFusionError) -> EngineError {
                     trino_type_tokens(rest)
                 ));
             }
+            // Same for its arithmetic coercion failure ("Cannot coerce
+            // arithmetic expression Int64 + Utf8 to valid types"), which
+            // DataFusion raises while typing the projection — before the
+            // strict operand checker ever sees the plan.
+            if let Some(rest) = root_message
+                .strip_prefix("Error during planning: Cannot coerce arithmetic expression ")
+                .and_then(|text| text.strip_suffix(" to valid types"))
+            {
+                return EngineError::TypeMismatch(format!(
+                    "Cannot apply operator: {}",
+                    trino_type_tokens(rest)
+                ));
+            }
             EngineError::Plan(err.to_string())
         }
         DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
