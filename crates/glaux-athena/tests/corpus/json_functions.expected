@@ -1,3 +1,4 @@
+types: bigint, varchar, varchar, integer, varchar, varchar, varchar, varchar, varchar, varchar, varchar, varchar, varchar, bigint, bigint, bigint, bigint, bigint
 +----+------------+----------+-----+--------+-------+--------------+----------------+-----------------+------------------------------+-------------+------------+-------------------------+----------+--------------+--------+-----------+-------------+
 | id | plan       | age_text | age | city   | zip   | second_score | object_is_null | missing_is_null | address_json                 | scores_json | via_parse  | formatted               | n_scores | not_an_array | n_keys | n_scores2 | scalar_size |
 +----+------------+----------+-----+--------+-------+--------------+----------------+-----------------+------------------------------+-------------+------------+-------------------------+----------+--------------+--------+-----------+-------------+

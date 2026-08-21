@@ -668,6 +668,98 @@ async fn trino_dialect_runs_and_unsupported_constructs_fail_by_name() {
 }
 
 #[tokio::test]
+async fn trino_semantics_survive_the_result_encoder() {
+    let h = start().await;
+
+    // Ranking window functions and approx_distinct are UInt64 in DataFusion,
+    // which Athena cannot carry; the dialect layer casts them to bigint.
+    // Casts round HALF_UP, anonymous columns are `_colN`, doubles print as
+    // Java does, and timestamps cast to varchar in Athena's text form.
+    let id = start_query(
+        &h,
+        "SELECT id, row_number() OVER (ORDER BY id DESC) AS rn, rank() OVER (ORDER BY active) AS rnk, \
+                ntile(2) OVER (ORDER BY id) AS bucket, \
+                CAST(score AS BIGINT) AS rounded, score * 2, CAST(seen_at AS VARCHAR) AS seen_text, \
+                (SELECT approx_distinct(id) FROM people) AS distinct_ids \
+         FROM people WHERE id IN (1, 3) ORDER BY id",
+    )
+    .await;
+    let qe = wait_terminal(&h, &id).await;
+    assert_eq!(
+        qe.status().unwrap().state(),
+        Some(&QueryExecutionState::Succeeded),
+        "{qe:?}"
+    );
+    let (rows, columns) = all_rows(&h, &id, 10).await;
+    assert_eq!(
+        columns,
+        [
+            ("id", "bigint"),
+            ("rn", "bigint"),
+            ("rnk", "bigint"),
+            ("bucket", "bigint"),
+            ("rounded", "bigint"),
+            ("_col5", "double"),
+            ("seen_text", "varchar"),
+            ("distinct_ids", "bigint"),
+        ]
+        .map(|(n, t)| (n.to_string(), t.to_string()))
+    );
+    let s = |v: &str| Some(v.to_string());
+    // id 1: score 1.5 → 2 (HALF_UP); id 3: score 3.25 → 3. Both rows are
+    // active, so both rank 1.
+    assert_eq!(
+        rows[1],
+        vec![
+            s("1"),
+            s("2"),
+            s("1"),
+            s("1"),
+            s("2"),
+            s("3.0"),
+            s("2024-01-31 12:34:56.789"),
+            s("5")
+        ]
+    );
+    assert_eq!(
+        rows[2],
+        vec![
+            s("3"),
+            s("1"),
+            s("1"),
+            s("2"),
+            s("3"),
+            s("6.5"),
+            s("1970-01-01 00:00:00.000"),
+            s("5")
+        ]
+    );
+
+    // Data errors at runtime are user errors (category 2) with Trino's
+    // error code, not GENERIC_INTERNAL_ERROR.
+    for (sql, code) in [
+        (
+            "SELECT CAST(name AS INTEGER) FROM people",
+            "INVALID_CAST_ARGUMENT",
+        ),
+        (
+            "SELECT id * 10000000000 * 10000000000 FROM people",
+            "NUMERIC_VALUE_OUT_OF_RANGE",
+        ),
+        ("SELECT id FROM people WHERE name = 1", "TYPE_MISMATCH"),
+    ] {
+        let id = start_query(&h, sql).await;
+        let qe = wait_terminal(&h, &id).await;
+        let status = qe.status().unwrap();
+        assert_eq!(status.state(), Some(&QueryExecutionState::Failed), "{sql}");
+        let err = status.athena_error().expect("AthenaError details");
+        assert_eq!(err.error_category(), Some(2), "{sql}: user error");
+        let message = err.error_message().unwrap();
+        assert!(message.contains(code), "{sql}: {message}");
+    }
+}
+
+#[tokio::test]
 async fn result_write_failure_fails_the_query() {
     let h = start().await;
     let id = h

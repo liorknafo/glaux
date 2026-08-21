@@ -9,9 +9,11 @@
 //! SELECT ...
 //! ```
 //!
-//! Positive cases compare the pretty-printed result against the sibling
-//! `<name>.expected` file. Set `GLAUX_REGEN_CORPUS=1` to (re)write the
-//! expected files after checking the output by hand against Trino
+//! Positive cases run the result through the Athena result encoder (so a
+//! result type Athena cannot carry, such as `UInt64`, fails the case) and
+//! compare the Athena column types plus the pretty-printed rows against the
+//! sibling `<name>.expected` file. Set `GLAUX_REGEN_CORPUS=1` to (re)write
+//! the expected files after checking the output by hand against Trino
 //! semantics.
 
 use std::fs;
@@ -27,7 +29,7 @@ use arrow::util::pretty::pretty_format_batches;
 use chrono::NaiveDate;
 use datafusion::catalog::MemTable;
 use datafusion::prelude::SessionContext;
-use glaux_athena::{EngineError, QueryEngine, QueryRequest, TrinoEngine};
+use glaux_athena::{EngineError, QueryEngine, QueryRequest, TrinoEngine, encode_result_set};
 
 fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus")
@@ -275,12 +277,28 @@ async fn run(engine: &TrinoEngine, sql: &str) -> Result<String, EngineError> {
             database: None,
         })
         .await?;
+    // Every positive result must be encodable for the Athena API; the
+    // encoder refuses Arrow types Athena has no name for.
+    let encoded = encode_result_set(&out.schema, &out.batches)
+        .map_err(|e| EngineError::Execution(format!("result encoding failed: {e}")))?;
+    let types = encoded
+        .columns
+        .iter()
+        .map(|c| match c.type_name.as_str() {
+            "decimal" => format!("{}({},{})", c.type_name, c.precision, c.scale),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let batches = if out.batches.is_empty() {
         vec![RecordBatch::new_empty(out.schema)]
     } else {
         out.batches
     };
-    Ok(pretty_format_batches(&batches).unwrap().to_string())
+    Ok(format!(
+        "types: {types}\n{}",
+        pretty_format_batches(&batches).unwrap()
+    ))
 }
 
 #[tokio::test]

@@ -1,3 +1,4 @@
+types: varchar, bigint, double
 +-------+----------+-------------+
 | name  | n_orders | grand_total |
 +-------+----------+-------------+

@@ -1,3 +1,4 @@
+types: varchar, varchar, double
 +---------+-----------+--------+
 | country | status    | total  |
 +---------+-----------+--------+

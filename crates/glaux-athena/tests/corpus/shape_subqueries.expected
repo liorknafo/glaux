@@ -1,3 +1,4 @@
+types: bigint, varchar, double
 +----+-------+------------+
 | id | name  | max_amount |
 +----+-------+------------+

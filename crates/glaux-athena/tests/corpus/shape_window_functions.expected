@@ -1,3 +1,4 @@
+types: bigint, bigint, double, bigint, bigint, bigint, double, bigint, double, bigint, bigint, bigint, bigint, double, double, bigint
 +-----+-------------+--------+----+-----+------+-------------+---------+---------+----------+---------+-----------+--------+------+-------+---------------+
 | id  | customer_id | amount | rn | rnk | drnk | prev_amount | next_id | running | first_id | last_id | second_id | bucket | pr   | cd    | rush_in_group |
 +-----+-------------+--------+----+-----+------+-------------+---------+---------+----------+---------+-----------+--------+------+-------+---------------+

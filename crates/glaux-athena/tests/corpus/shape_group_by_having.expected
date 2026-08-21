@@ -1,3 +1,4 @@
+types: varchar, bigint, bigint, double, double, double, double, bigint, boolean, boolean, boolean, array, varchar
 +---------+---+-----------+-------+---------+-------+-------+--------+----------+----------+-------------+----------------------+------------+
 | status  | n | customers | total | mean    | lo    | hi    | rushed | all_rush | any_rush | all_over_10 | ids                  | any_status |
 +---------+---+-----------+-------+---------+-------+-------+--------+----------+----------+-------------+----------------------+------------+

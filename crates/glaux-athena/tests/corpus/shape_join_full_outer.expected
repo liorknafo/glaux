@@ -1,3 +1,4 @@
+types: bigint, bigint
 +-------------+----------+
 | customer_id | order_id |
 +-------------+----------+

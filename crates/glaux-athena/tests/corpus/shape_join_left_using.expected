@@ -1,3 +1,4 @@
+types: bigint, varchar, bigint, double
 +----+-------+----------+--------+
 | id | name  | order_id | amount |
 +----+-------+----------+--------+

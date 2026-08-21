@@ -74,7 +74,7 @@ fn every_translation_target_exists_in_datafusion() {
 
 #[test]
 fn every_supported_function_and_construct_is_exercised_by_the_corpus() {
-    let (positive, _) = corpus_text();
+    let (positive, negative) = corpus_text();
     let mut missing = Vec::new();
     for shim in FUNCTIONS.iter().filter(|s| s.kind != ShimKind::Unsupported) {
         let upper = shim.name.to_uppercase();
@@ -95,7 +95,10 @@ fn every_supported_function_and_construct_is_exercised_by_the_corpus() {
             "{} needs a corpus marker",
             construct.name
         );
-        if !positive.contains(&construct.corpus_marker.to_uppercase()) {
+        // Constructs whose observable behaviour is an error (type checking,
+        // overflow) are exercised by negative cases.
+        let marker = construct.corpus_marker.to_uppercase();
+        if !positive.contains(&marker) && !negative.contains(&marker) {
             missing.push(format!(
                 "construct {} (marker {:?})",
                 construct.name, construct.corpus_marker
