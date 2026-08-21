@@ -6,7 +6,7 @@ use chrono::Utc;
 
 use crate::corpus::{Case, Compare};
 use crate::glaux::GlauxAthena;
-use crate::snapshot::{Outcome, Provenance, Snapshot, diff};
+use crate::snapshot::{Outcome, Provenance, Snapshot, Verdict, diff};
 use crate::{HarnessError, Result};
 
 /// How one case fared in a replay.
@@ -14,6 +14,15 @@ use crate::{HarnessError, Result};
 pub enum CaseResult {
     /// glaux agrees with the snapshot.
     Match,
+    /// Both sides failed with messages that carry no comparable error code
+    /// and the case has no `-- error:` needle: the failures could not be
+    /// verified against each other. Counts as a failure of the run.
+    MatchUnverifiedError {
+        /// The recorded (Athena) message.
+        recorded: String,
+        /// glaux's message.
+        actual: String,
+    },
     /// glaux disagrees; the listed differences.
     Mismatch(Vec<String>),
     /// No snapshot exists for the case.
@@ -31,6 +40,19 @@ pub struct CaseReport {
     pub provenance: Option<Provenance>,
     /// The verdict.
     pub result: CaseResult,
+}
+
+impl CaseResult {
+    /// Lift the diff verdict into a case result.
+    pub fn from_verdict(verdict: Verdict) -> Self {
+        match verdict {
+            Verdict::Match => CaseResult::Match,
+            Verdict::MatchUnverifiedError { recorded, actual } => {
+                CaseResult::MatchUnverifiedError { recorded, actual }
+            }
+            Verdict::Mismatch(differences) => CaseResult::Mismatch(differences),
+        }
+    }
 }
 
 impl CaseReport {
@@ -55,18 +77,13 @@ pub async fn replay(cases: &[Case], snapshot_dir: &Path) -> Result<Vec<CaseRepor
         let (provenance, result) = match snapshot {
             None => (None, CaseResult::MissingSnapshot),
             Some(snap) => {
-                let differences = diff(
+                let verdict = diff(
                     &snap.outcome,
                     &actual,
                     effective_compare(case, snap.compare),
                     case.expect_error.as_deref(),
                 );
-                let result = if differences.is_empty() {
-                    CaseResult::Match
-                } else {
-                    CaseResult::Mismatch(differences)
-                };
-                (Some(snap.provenance), result)
+                (Some(snap.provenance), CaseResult::from_verdict(verdict))
             }
         };
         reports.push(CaseReport {

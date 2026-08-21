@@ -44,6 +44,9 @@ fn result_cell(result: &CaseResult) -> String {
     match result {
         CaseResult::Match => "match".to_string(),
         CaseResult::MissingSnapshot => "**no snapshot**".to_string(),
+        CaseResult::MatchUnverifiedError { .. } => {
+            "**UNVERIFIED ERROR** (both failed, messages not comparable)".to_string()
+        }
         CaseResult::Mismatch(d) => format!("**MISMATCH** ({} difference(s))", d.len()),
     }
 }

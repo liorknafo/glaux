@@ -423,25 +423,84 @@ fn show(cell: &Option<String>) -> String {
     }
 }
 
-/// Compare `actual` (glaux) against `expected` (the snapshot). Returns the
-/// differences, empty when they agree. `expect_error` is the corpus
-/// needle for negative cases: a failure must name it on the glaux side,
-/// whatever Athena's own wording was.
+/// The outcome of comparing a glaux result with its snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// The two sides agree.
+    Match,
+    /// Both sides failed, the case has no `-- error:` needle, and neither
+    /// message carries a recognizable error code, so the failures could not
+    /// be compared. This is reported distinctly — never as a plain match —
+    /// because two unrelated failures must not count as fidelity.
+    MatchUnverifiedError {
+        /// The recorded (Athena) message.
+        recorded: String,
+        /// glaux's message.
+        actual: String,
+    },
+    /// The sides disagree; the listed differences.
+    Mismatch(Vec<String>),
+}
+
+impl Verdict {
+    fn from_differences(differences: Vec<String>) -> Self {
+        if differences.is_empty() {
+            Verdict::Match
+        } else {
+            Verdict::Mismatch(differences)
+        }
+    }
+}
+
+/// The Trino/Athena error code an error message leads with
+/// (`TYPE_MISMATCH: ...`, `COLUMN_NOT_FOUND: line 1:8: ...`), when it has one.
+pub fn error_code(message: &str) -> Option<&str> {
+    let trimmed = message.trim_start();
+    let (code, rest) = trimmed.split_once(':')?;
+    let looks_like_code = code.len() >= 3
+        && code.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && code
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    (looks_like_code && !rest.is_empty()).then_some(code)
+}
+
+/// Compare `actual` (glaux) against `expected` (the snapshot). `expect_error`
+/// is the corpus needle for negative cases: a failure must name it on the
+/// glaux side, whatever Athena's own wording was. Without a needle, two
+/// failures are compared by their leading error code; when neither side has
+/// one the pair is [`Verdict::MatchUnverifiedError`], never a plain match.
 pub fn diff(
     expected: &Outcome,
     actual: &Outcome,
     compare: Compare,
     expect_error: Option<&str>,
-) -> Vec<String> {
+) -> Verdict {
     let mut out = Vec::new();
     match (expected, actual) {
         (Outcome::Failed { message: want }, Outcome::Failed { message: got }) => {
-            if let Some(needle) = expect_error
-                && !got.contains(needle)
-            {
-                out.push(format!(
-                    "glaux error does not name {needle:?}: {got}\n  (recorded error: {want})"
-                ));
+            match expect_error {
+                Some(needle) => {
+                    if !got.contains(needle) {
+                        out.push(format!(
+                            "glaux error does not name {needle:?}: {got}\n  (recorded error: {want})"
+                        ));
+                    }
+                }
+                None => match (error_code(want), error_code(got)) {
+                    (Some(w), Some(g)) if w == g => {}
+                    (None, None) => {
+                        return Verdict::MatchUnverifiedError {
+                            recorded: want.clone(),
+                            actual: got.clone(),
+                        };
+                    }
+                    (w, g) => out.push(format!(
+                        "both sides FAILED but the error codes differ: recorded {} ({want}), glaux {} ({got})",
+                        w.unwrap_or("<no code>"),
+                        g.unwrap_or("<no code>")
+                    )),
+                },
             }
         }
         (Outcome::Failed { message }, Outcome::Succeeded { rows, .. }) => out.push(format!(
@@ -474,7 +533,7 @@ pub fn diff(
                     render(want_cols),
                     render(got_cols)
                 ));
-                return out;
+                return Verdict::Mismatch(out);
             }
             if want_rows.len() != got_rows.len() {
                 out.push(format!(
@@ -507,7 +566,7 @@ pub fn diff(
             }
         }
     }
-    out
+    Verdict::from_differences(out)
 }
 
 fn sorted(columns: &[Column], rows: &[Vec<Option<String>>]) -> Vec<Vec<Option<String>>> {
@@ -531,6 +590,18 @@ fn sorted(columns: &[Column], rows: &[Vec<Option<String>>]) -> Vec<Vec<Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Verdict {
+        fn is_mismatch(&self) -> bool {
+            matches!(self, Verdict::Mismatch(_))
+        }
+        fn first(&self) -> &str {
+            match self {
+                Verdict::Mismatch(d) => &d[0],
+                other => panic!("expected a mismatch, got {other:?}"),
+            }
+        }
+    }
 
     fn col(name: &str, ty: &str) -> Column {
         Column {
@@ -647,13 +718,16 @@ mod tests {
             columns: cols.clone(),
             rows: rows(&[&[Some("2"), Some("2.5")], &[Some("1"), Some("1.5")]]),
         };
-        assert!(diff(&expected, &actual, Compare::Unordered, None).is_empty());
-        assert!(!diff(&expected, &actual, Compare::Ordered, None).is_empty());
+        assert_eq!(
+            diff(&expected, &actual, Compare::Unordered, None),
+            Verdict::Match
+        );
+        assert!(diff(&expected, &actual, Compare::Ordered, None).is_mismatch());
         let dup = Outcome::Succeeded {
             columns: cols,
             rows: rows(&[&[Some("1"), Some("1.5")], &[Some("1"), Some("1.5")]]),
         };
-        assert!(!diff(&expected, &dup, Compare::Unordered, None).is_empty());
+        assert!(diff(&expected, &dup, Compare::Unordered, None).is_mismatch());
     }
 
     #[test]
@@ -666,17 +740,84 @@ mod tests {
             columns: vec![col("a", "integer")],
             rows: rows(&[&[Some("1")]]),
         };
-        assert!(diff(&ok, &other_type, Compare::Ordered, None)[0].contains("columns differ"));
+        assert!(
+            diff(&ok, &other_type, Compare::Ordered, None)
+                .first()
+                .contains("columns differ")
+        );
         let failed = Outcome::Failed {
             message: "TYPE_MISMATCH: x".into(),
         };
-        assert!(diff(&ok, &failed, Compare::Ordered, None)[0].contains("glaux FAILED"));
-        assert!(diff(&failed, &ok, Compare::Ordered, None)[0].contains("glaux SUCCEEDED"));
+        assert!(
+            diff(&ok, &failed, Compare::Ordered, None)
+                .first()
+                .contains("glaux FAILED")
+        );
+        assert!(
+            diff(&failed, &ok, Compare::Ordered, None)
+                .first()
+                .contains("glaux SUCCEEDED")
+        );
         // Both failed: glaux must name the corpus needle, Athena's wording is free.
         let glaux_err = Outcome::Failed {
             message: "COLUMN_NOT_FOUND: nope".into(),
         };
-        assert!(diff(&failed, &glaux_err, Compare::Ordered, Some("nope")).is_empty());
-        assert!(!diff(&failed, &glaux_err, Compare::Ordered, Some("other")).is_empty());
+        assert_eq!(
+            diff(&failed, &glaux_err, Compare::Ordered, Some("nope")),
+            Verdict::Match
+        );
+        assert!(diff(&failed, &glaux_err, Compare::Ordered, Some("other")).is_mismatch());
+    }
+
+    #[test]
+    fn failed_pair_without_needle_is_never_a_plain_match() {
+        let failed = |m: &str| Outcome::Failed { message: m.into() };
+        // Same leading error code: a match by category.
+        assert_eq!(
+            diff(
+                &failed("TYPE_MISMATCH: line 1:8: Cannot apply operator: varchar = integer"),
+                &failed("TYPE_MISMATCH: Cannot apply operator: varchar = integer"),
+                Compare::Ordered,
+                None
+            ),
+            Verdict::Match
+        );
+        // Different codes: a mismatch, even though both sides failed.
+        let v = diff(
+            &failed("COLUMN_NOT_FOUND: line 1:8: Column 'x' cannot be resolved"),
+            &failed("TYPE_MISMATCH: Cannot apply operator"),
+            Compare::Ordered,
+            None,
+        );
+        assert!(v.first().contains("error codes differ"), "{v:?}");
+        // A code on one side only is also a mismatch.
+        assert!(
+            diff(
+                &failed("SYNTAX_ERROR: mismatched input"),
+                &failed("something went wrong"),
+                Compare::Ordered,
+                None
+            )
+            .is_mismatch()
+        );
+        // No code on either side: unverifiable, reported distinctly.
+        assert_eq!(
+            diff(
+                &failed("InvalidRequestException: bad statement"),
+                &failed("bad statement"),
+                Compare::Ordered,
+                None
+            ),
+            Verdict::MatchUnverifiedError {
+                recorded: "InvalidRequestException: bad statement".into(),
+                actual: "bad statement".into(),
+            }
+        );
+        assert_eq!(
+            error_code("  NUMERIC_VALUE_OUT_OF_RANGE: overflow"),
+            Some("NUMERIC_VALUE_OUT_OF_RANGE")
+        );
+        assert_eq!(error_code("Error: x"), None);
+        assert_eq!(error_code("TYPE_MISMATCH"), None);
     }
 }

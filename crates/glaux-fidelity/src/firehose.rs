@@ -435,13 +435,8 @@ pub async fn replay(snapshot_dir: &Path) -> Result<Vec<ArtifactReport>> {
         let (provenance, result) = match Snapshot::read(snapshot_dir, name)? {
             None => (None, CaseResult::MissingSnapshot),
             Some(snap) => {
-                let differences = diff(&snap.outcome, &actual, Compare::Ordered, None);
-                let result = if differences.is_empty() {
-                    CaseResult::Match
-                } else {
-                    CaseResult::Mismatch(differences)
-                };
-                (Some(snap.provenance), result)
+                let verdict = diff(&snap.outcome, &actual, Compare::Ordered, None);
+                (Some(snap.provenance), CaseResult::from_verdict(verdict))
             }
         };
         reports.push(ArtifactReport {

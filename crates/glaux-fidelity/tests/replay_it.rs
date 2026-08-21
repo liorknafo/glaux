@@ -25,6 +25,10 @@ async fn every_corpus_case_matches_its_snapshot() {
                 report.case.name,
                 differences.join("\n    ")
             )),
+            CaseResult::MatchUnverifiedError { recorded, actual } => failures.push(format!(
+                "{}: both FAILED but the errors could not be compared (no needle, no error code)\n    recorded: {recorded}\n    glaux:    {actual}",
+                report.case.name
+            )),
         }
     }
     for orphan in suite::orphans(&cases, &snapshot_dir()).unwrap() {
@@ -59,6 +63,10 @@ async fn firehose_artifacts_match_their_snapshots() {
             CaseResult::Match => None,
             CaseResult::MissingSnapshot => Some(format!("{}: no snapshot", r.name)),
             CaseResult::Mismatch(d) => Some(format!("{}:\n    {}", r.name, d.join("\n    "))),
+            CaseResult::MatchUnverifiedError { recorded, actual } => Some(format!(
+                "{}: unverified error pair\n    recorded: {recorded}\n    glaux: {actual}",
+                r.name
+            )),
         })
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
