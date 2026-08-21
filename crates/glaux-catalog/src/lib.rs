@@ -39,6 +39,7 @@ mod format;
 pub mod glue;
 mod projection;
 pub mod provider;
+mod schema_adapt;
 pub mod storage;
 pub mod types;
 

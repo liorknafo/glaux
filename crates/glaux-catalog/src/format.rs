@@ -40,13 +40,34 @@ const LAZY_SIMPLE_SERDE: &str = "org.apache.hadoop.hive.serde2.lazy.LazySimpleSe
 /// delimited text.
 const NO_QUOTING: u8 = 0x00;
 
+/// Which reader family a table resolved to, plus the SerDe options that
+/// change how file columns are matched to Glue columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FormatKind {
+    /// Parquet: columns are matched to Glue columns **by name,
+    /// case-insensitively** (Athena's `ParquetHiveSerDe` default).
+    Parquet,
+    /// NDJSON: keys are matched to Glue columns by name, case-insensitively
+    /// unless the SerDe sets `case.insensitive = false`.
+    Json { case_insensitive: bool },
+    /// Delimited text: columns are matched **by position**.
+    Csv,
+}
+
+/// The resolved reader for a Glue table.
+#[derive(Debug)]
+pub(crate) struct TableFormat {
+    pub(crate) format: Arc<dyn FileFormat>,
+    pub(crate) kind: FormatKind,
+}
+
 /// Resolve the DataFusion [`FileFormat`] for a Glue table from its SerDe
 /// configuration. Errors name the unsupported class or the missing piece.
 pub(crate) fn file_format_for_table(
     database: &str,
     table: &GlueTable,
     sd: &GlueStorageDescriptor,
-) -> Result<Arc<dyn FileFormat>> {
+) -> Result<TableFormat> {
     let unsupported = |message: String| CatalogError::UnsupportedSerDe {
         database: database.to_string(),
         table: table.name.clone(),
@@ -58,21 +79,32 @@ pub(crate) fn file_format_for_table(
         .as_ref()
         .and_then(|s| s.serialization_library.as_deref());
 
+    let empty = HashMap::new();
+    let serde_params = sd
+        .serde_info
+        .as_ref()
+        .map(|s| &s.parameters)
+        .unwrap_or(&empty);
+
     match serde_library {
-        Some(PARQUET_SERDE) => Ok(Arc::new(ParquetFormat::default())),
+        Some(PARQUET_SERDE) => Ok(TableFormat {
+            format: Arc::new(ParquetFormat::default()),
+            kind: FormatKind::Parquet,
+        }),
         Some(OPENX_JSON_SERDE) | Some(HIVE_JSON_SERDE) => {
             require_uncompressed(database, table, sd, "JSON")?;
-            Ok(Arc::new(JsonFormat::default()))
+            let case_insensitive = json_case_insensitive(serde_params).map_err(&unsupported)?;
+            Ok(TableFormat {
+                format: Arc::new(JsonFormat::default()),
+                kind: FormatKind::Json { case_insensitive },
+            })
         }
         Some(LAZY_SIMPLE_SERDE) => {
             require_uncompressed(database, table, sd, "CSV")?;
-            let empty = HashMap::new();
-            let serde_params = sd
-                .serde_info
-                .as_ref()
-                .map(|s| &s.parameters)
-                .unwrap_or(&empty);
-            csv_format(database, table, sd, serde_params).map(|f| Arc::new(f) as _)
+            Ok(TableFormat {
+                format: Arc::new(csv_format(database, table, sd, serde_params)?),
+                kind: FormatKind::Csv,
+            })
         }
         Some(other) => Err(unsupported(format!(
             "SerDe class {other:?} has no glaux reader mapping \
@@ -82,7 +114,10 @@ pub(crate) fn file_format_for_table(
             // Some Parquet tables omit SerDe info but carry the Parquet
             // input format — accept that; anything else is ambiguous.
             if sd.input_format.as_deref() == Some(PARQUET_INPUT_FORMAT) {
-                Ok(Arc::new(ParquetFormat::default()))
+                Ok(TableFormat {
+                    format: Arc::new(ParquetFormat::default()),
+                    kind: FormatKind::Parquet,
+                })
             } else {
                 Err(unsupported(
                     "storage descriptor has no SerDe serialization library, \
@@ -113,6 +148,33 @@ fn require_uncompressed(
         });
     }
     Ok(())
+}
+
+/// Resolve the OpenX JSON SerDe's column-matching options.
+///
+/// `case.insensitive` (default `true`) lowercases every JSON key before
+/// matching it to a column. `mapping.<col> = <key>` renames are not
+/// supported in v0.1 and error explicitly rather than leaving the column
+/// silently NULL.
+fn json_case_insensitive(
+    serde_params: &HashMap<String, String>,
+) -> std::result::Result<bool, String> {
+    if let Some(mapping) = serde_params.keys().find(|k| k.starts_with("mapping.")) {
+        return Err(format!(
+            "OpenX JsonSerDe column mapping ({mapping:?}) is not supported in v0.1"
+        ));
+    }
+    match serde_params
+        .get("case.insensitive")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(format!(
+            "case.insensitive = {other:?} is not a boolean (expected true or false)"
+        )),
+    }
 }
 
 fn csv_format(
@@ -238,8 +300,8 @@ mod tests {
     fn parquet_serde_maps_to_parquet() {
         let descriptor = sd(Some(PARQUET_SERDE), &[]);
         let table = table_with(descriptor.clone());
-        let format = file_format_for_table("db", &table, &descriptor).unwrap();
-        assert_eq!(format.get_ext(), "parquet");
+        let resolved = file_format_for_table("db", &table, &descriptor).unwrap();
+        assert_eq!(resolved.format.get_ext(), "parquet");
     }
 
     #[test]
@@ -249,24 +311,47 @@ mod tests {
             ..Default::default()
         };
         let table = table_with(descriptor.clone());
-        let format = file_format_for_table("db", &table, &descriptor).unwrap();
-        assert_eq!(format.get_ext(), "parquet");
+        let resolved = file_format_for_table("db", &table, &descriptor).unwrap();
+        assert_eq!(resolved.format.get_ext(), "parquet");
     }
 
     #[test]
     fn openx_json_maps_to_json() {
         let descriptor = sd(Some(OPENX_JSON_SERDE), &[]);
         let table = table_with(descriptor.clone());
-        let format = file_format_for_table("db", &table, &descriptor).unwrap();
-        assert_eq!(format.get_ext(), "json");
+        let resolved = file_format_for_table("db", &table, &descriptor).unwrap();
+        assert_eq!(resolved.format.get_ext(), "json");
+    }
+
+    #[test]
+    fn json_case_sensitivity_and_mapping_options() {
+        let descriptor = sd(Some(OPENX_JSON_SERDE), &[("case.insensitive", "FALSE")]);
+        let table = table_with(descriptor.clone());
+        let resolved = file_format_for_table("db", &table, &descriptor).unwrap();
+        assert_eq!(
+            resolved.kind,
+            FormatKind::Json {
+                case_insensitive: false
+            }
+        );
+
+        let descriptor = sd(Some(OPENX_JSON_SERDE), &[("mapping.userid", "userId")]);
+        let table = table_with(descriptor.clone());
+        let err = file_format_for_table("db", &table, &descriptor).unwrap_err();
+        assert!(err.to_string().contains("mapping.userid"), "{err}");
+
+        let descriptor = sd(Some(OPENX_JSON_SERDE), &[("case.insensitive", "maybe")]);
+        let table = table_with(descriptor.clone());
+        let err = file_format_for_table("db", &table, &descriptor).unwrap_err();
+        assert!(err.to_string().contains("case.insensitive"), "{err}");
     }
 
     #[test]
     fn lazy_simple_maps_to_csv() {
         let descriptor = sd(Some(LAZY_SIMPLE_SERDE), &[("field.delim", "|")]);
         let table = table_with(descriptor.clone());
-        let format = file_format_for_table("db", &table, &descriptor).unwrap();
-        assert_eq!(format.get_ext(), "csv");
+        let resolved = file_format_for_table("db", &table, &descriptor).unwrap();
+        assert_eq!(resolved.format.get_ext(), "csv");
     }
 
     #[test]

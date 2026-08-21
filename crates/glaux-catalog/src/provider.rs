@@ -30,17 +30,19 @@ use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::listing::helpers::expr_applicable_for_cols;
 use datafusion::datasource::physical_plan::FileGroup;
-use datafusion::datasource::physical_plan::FileScanConfigBuilder;
+use datafusion::datasource::physical_plan::{FileScanConfigBuilder, FileSource};
 use datafusion::datasource::table_schema::TableSchemaBuilder;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 
 use crate::error::{CatalogError, Result};
-use crate::format::file_format_for_table;
+use crate::format::{FormatKind, TableFormat, file_format_for_table};
 use crate::glue::{GlueApi, GlueTable};
 use crate::projection::ProjectionConfig;
+use crate::schema_adapt::{GlueExprAdapterFactory, GlueJsonSource};
 use crate::storage::StorageBackend;
 use crate::types::hive_type_to_arrow;
 
@@ -190,6 +192,8 @@ pub struct GlueTableProvider {
     /// Partition-key fields, in Glue partition order.
     partition_fields: Vec<FieldRef>,
     format: Arc<dyn FileFormat>,
+    /// Reader family and its column-matching options.
+    format_kind: FormatKind,
     /// SerDe class of the table, for rejecting partitions that override it.
     serde_library: Option<String>,
     /// Bucket every data location must live in.
@@ -268,7 +272,10 @@ impl GlueTableProvider {
             partition_fields.push(Arc::new(Field::new(&key.name, data_type, false)));
         }
 
-        let format = file_format_for_table(database, &table, sd)?;
+        let TableFormat {
+            format,
+            kind: format_kind,
+        } = file_format_for_table(database, &table, sd)?;
         let serde_library = sd
             .serde_info
             .as_ref()
@@ -299,6 +306,7 @@ impl GlueTableProvider {
             table_schema,
             partition_fields,
             format,
+            format_kind,
             serde_library,
             bucket,
             prefix,
@@ -597,11 +605,32 @@ impl TableProvider for GlueTableProvider {
         let table_schema = TableSchemaBuilder::new(Arc::clone(&self.file_schema))
             .with_table_partition_cols(self.partition_fields.clone())
             .build();
-        let file_source = self.format.file_source(table_schema);
+        // Column matching follows Athena's SerDe semantics rather than
+        // DataFusion's case-sensitive defaults (see `schema_adapt`):
+        // Parquet and OpenX JSON match by name case-insensitively; CSV is
+        // positional and needs no adaptation.
+        let file_source = match self.format_kind {
+            FormatKind::Json {
+                case_insensitive: true,
+            } => Arc::new(GlueJsonSource::new(
+                &self.database,
+                &self.table_name,
+                table_schema,
+            )) as Arc<dyn FileSource>,
+            _ => self.format.file_source(table_schema),
+        };
+        let expr_adapter = match self.format_kind {
+            FormatKind::Parquet => Some(Arc::new(GlueExprAdapterFactory::new(
+                &self.database,
+                &self.table_name,
+            )) as Arc<dyn PhysicalExprAdapterFactory>),
+            _ => None,
+        };
         let scan_config = FileScanConfigBuilder::new(object_store_url, file_source)
             .with_file_groups(file_groups)
             .with_projection_indices(projection.cloned())?
             .with_limit(limit)
+            .with_expr_adapter(expr_adapter)
             .build();
 
         self.format.create_physical_plan(state, scan_config).await

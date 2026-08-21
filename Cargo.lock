@@ -1857,6 +1857,7 @@ dependencies = [
  "bytes",
  "chrono",
  "datafusion",
+ "datafusion-datasource",
  "futures",
  "http 1.5.0",
  "object_store",

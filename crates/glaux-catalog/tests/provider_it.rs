@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{
-    Array, ArrayRef, Float64Array, Int32Array, Int64Array, StringArray, TimestampMillisecondArray,
+    Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+    TimestampMillisecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -1151,4 +1152,331 @@ async fn unsupported_constructs_error_explicitly() {
     // A table that does not exist is the planner's own not-found error.
     let err = query_err(&ctx, "SELECT * FROM glue.lake.nope").await;
     assert!(err.contains("nope"), "{err}");
+}
+
+// ---------------------------------------------------------------------------
+// File schema vs Glue schema
+// ---------------------------------------------------------------------------
+
+/// Parquet bytes for a one-row-group file with the given schema and columns.
+fn parquet_with(fields: Vec<Field>, columns: Vec<ArrayRef>) -> Bytes {
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+    let mut buf = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    Bytes::from(buf)
+}
+
+fn parquet_table(name: &str, columns: Vec<GlueColumn>) -> GlueTable {
+    table(
+        name,
+        storage_descriptor(
+            columns,
+            &format!("s3://{BUCKET}/{name}/"),
+            PARQUET_SERDE,
+            &[],
+        ),
+        Vec::new(),
+        &[],
+    )
+}
+
+/// Parquet columns are matched to Glue columns by name, case-insensitively
+/// (Athena's `ParquetHiveSerDe` default), in projections and predicates.
+#[tokio::test]
+async fn parquet_columns_match_glue_columns_case_insensitively() {
+    let storage = Arc::new(MemoryStorage::new());
+    storage
+        .put(
+            "cm/part-0.parquet",
+            parquet_with(
+                vec![
+                    Field::new("ID", DataType::Int64, false),
+                    Field::new("UserName", DataType::Utf8, true),
+                ],
+                vec![
+                    Arc::new(Int64Array::from(vec![7, 8])),
+                    Arc::new(StringArray::from(vec!["ada", "linus"])),
+                ],
+            ),
+        )
+        .await;
+    let glue = Arc::new(FakeGlue::default().with_database("lake").with_table(
+        "lake",
+        parquet_table(
+            "cm",
+            vec![column("id", "bigint"), column("username", "string")],
+        ),
+    ));
+    let ctx = context(glue, storage).await;
+
+    let batches = query(&ctx, "SELECT id, username FROM glue.lake.cm ORDER BY id").await;
+    assert_eq!(batches[0].schema().field(0).name(), "id");
+    assert_eq!(batches[0].schema().field(1).name(), "username");
+    assert_eq!(int64_column(&batches, 0), vec![7, 8]);
+    assert_eq!(string_column(&batches, 1), vec!["ada", "linus"]);
+
+    let batches = query(&ctx, "SELECT * FROM glue.lake.cm WHERE id = 8").await;
+    assert_eq!(int64_column(&batches, 0), vec![8]);
+    assert_eq!(string_column(&batches, 1), vec!["linus"]);
+
+    let batches = query(
+        &ctx,
+        "SELECT count(*) FROM glue.lake.cm WHERE username = 'ada'",
+    )
+    .await;
+    assert_eq!(int64_column(&batches, 0), vec![1]);
+}
+
+/// A Glue column absent from a Parquet file reads as NULL (Athena's
+/// schema-evolution semantics for Parquet); a Parquet type that widens into
+/// the Glue type is cast; a narrower or unrelated type, or two file columns
+/// that differ only by case, error naming the column and both types.
+#[tokio::test]
+async fn parquet_file_schema_differences_are_null_widened_or_rejected() {
+    let storage = Arc::new(MemoryStorage::new());
+    // Glue: id bigint, amount double, note string. File: id as Int32 (widens),
+    // amount as Float32 (widens), no `note` column (NULL).
+    storage
+        .put(
+            "evolved/part-0.parquet",
+            parquet_with(
+                vec![
+                    Field::new("id", DataType::Int32, false),
+                    Field::new("amount", DataType::Float32, false),
+                ],
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                    Arc::new(Float32Array::from(vec![1.5, 2.5])),
+                ],
+            ),
+        )
+        .await;
+    // Glue: id int. File: id Int64 — narrowing, rejected.
+    storage
+        .put(
+            "narrow/part-0.parquet",
+            parquet_with(
+                vec![Field::new("id", DataType::Int64, false)],
+                vec![Arc::new(Int64Array::from(vec![1]))],
+            ),
+        )
+        .await;
+    // Glue: id bigint. File: id string — unrelated, rejected.
+    storage
+        .put(
+            "mistyped/part-0.parquet",
+            parquet_with(
+                vec![Field::new("id", DataType::Utf8, false)],
+                vec![Arc::new(StringArray::from(vec!["1"]))],
+            ),
+        )
+        .await;
+    // Glue: id bigint. File: both `id` and `ID` — ambiguous under
+    // case-insensitive matching when neither spelling is exact... here `id`
+    // is exact so it wins; `Id`/`ID` without an exact match is ambiguous.
+    storage
+        .put(
+            "ambiguous/part-0.parquet",
+            parquet_with(
+                vec![
+                    Field::new("Id", DataType::Int64, false),
+                    Field::new("ID", DataType::Int64, false),
+                ],
+                vec![
+                    Arc::new(Int64Array::from(vec![1])),
+                    Arc::new(Int64Array::from(vec![2])),
+                ],
+            ),
+        )
+        .await;
+
+    let glue = Arc::new(
+        FakeGlue::default()
+            .with_database("lake")
+            .with_table(
+                "lake",
+                parquet_table(
+                    "evolved",
+                    vec![
+                        column("id", "bigint"),
+                        column("amount", "double"),
+                        column("note", "string"),
+                    ],
+                ),
+            )
+            .with_table("lake", parquet_table("narrow", vec![column("id", "int")]))
+            .with_table(
+                "lake",
+                parquet_table("mistyped", vec![column("id", "bigint")]),
+            )
+            .with_table(
+                "lake",
+                parquet_table("ambiguous", vec![column("id", "bigint")]),
+            ),
+    );
+    let ctx = context(glue, storage).await;
+
+    let batches = query(
+        &ctx,
+        "SELECT id, amount, note FROM glue.lake.evolved ORDER BY id",
+    )
+    .await;
+    assert_eq!(batches[0].schema().field(0).data_type(), &DataType::Int64);
+    assert_eq!(batches[0].schema().field(1).data_type(), &DataType::Float64);
+    assert_eq!(int64_column(&batches, 0), vec![1, 2]);
+    let amounts = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(amounts.values(), &[1.5, 2.5]);
+    assert_eq!(
+        batches[0].column(2).null_count(),
+        2,
+        "missing column is NULL"
+    );
+    let batches = query(
+        &ctx,
+        "SELECT count(*) FROM glue.lake.evolved WHERE note IS NULL AND id > 1",
+    )
+    .await;
+    assert_eq!(int64_column(&batches, 0), vec![1]);
+
+    let err = query_err(&ctx, "SELECT id FROM glue.lake.narrow").await;
+    assert!(
+        err.contains("\"id\"")
+            && err.contains("Int64")
+            && err.contains("Int32")
+            && err.contains("HIVE_BAD_DATA"),
+        "must name the column and both types: {err}"
+    );
+
+    let err = query_err(&ctx, "SELECT id FROM glue.lake.mistyped").await;
+    assert!(
+        err.contains("\"id\"") && err.contains("Utf8") && err.contains("Int64"),
+        "must name the column and both types: {err}"
+    );
+
+    let err = query_err(&ctx, "SELECT id FROM glue.lake.ambiguous").await;
+    assert!(
+        err.contains("\"id\"") && err.contains("differ only by case") && err.contains("\"Id\""),
+        "must name the column and the clashing file columns: {err}"
+    );
+}
+
+/// OpenX JSON keys are matched to Glue columns case-insensitively at every
+/// struct level (the SerDe's `case.insensitive = true` default); missing
+/// keys are NULL, unknown keys are ignored, and keys that differ only by
+/// case within one record are rejected.
+#[tokio::test]
+async fn json_keys_match_glue_columns_case_insensitively() {
+    let storage = Arc::new(MemoryStorage::new());
+    storage
+        .put(
+            "users/part-0.json",
+            concat!(
+                r#"{"userId":1,"Profile":{"FirstName":"ada","Tags":["x","y"]},"extra":true}"#,
+                "\n",
+                r#"{"USERID":2,"profile":{"firstname":"linus"}}"#,
+                "\n",
+                r#"{"userid":3}"#,
+                "\n",
+            ),
+        )
+        .await;
+    storage
+        .put(
+            "clash/part-0.json",
+            concat!(r#"{"userId":1,"USERID":2}"#, "\n"),
+        )
+        .await;
+    storage
+        .put(
+            "exact/part-0.json",
+            concat!(r#"{"userId":1}"#, "\n", r#"{"userid":2}"#, "\n"),
+        )
+        .await;
+
+    let users_columns = || {
+        vec![
+            column("userid", "bigint"),
+            column("profile", "struct<firstname:string,tags:array<string>>"),
+        ]
+    };
+    let json_table = |name: &str, serde_params: &[(&str, &str)]| {
+        table(
+            name,
+            storage_descriptor(
+                users_columns(),
+                &format!("s3://{BUCKET}/{name}/"),
+                OPENX_JSON_SERDE,
+                serde_params,
+            ),
+            Vec::new(),
+            &[],
+        )
+    };
+    let glue = Arc::new(
+        FakeGlue::default()
+            .with_database("lake")
+            .with_table("lake", json_table("users", &[]))
+            .with_table("lake", json_table("clash", &[]))
+            .with_table(
+                "lake",
+                json_table("exact", &[("case.insensitive", "false")]),
+            ),
+    );
+    let ctx = context(glue, storage).await;
+
+    let batches = query(
+        &ctx,
+        "SELECT userid, profile['firstname'] AS firstname, cardinality(profile['tags']) AS n \
+         FROM glue.lake.users ORDER BY userid",
+    )
+    .await;
+    assert_eq!(int64_column(&batches, 0), vec![1, 2, 3]);
+    let names = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "ada");
+    assert_eq!(names.value(1), "linus");
+    assert!(names.is_null(2), "missing key reads as NULL");
+    let n = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .unwrap();
+    assert_eq!(n.value(0), 2);
+    assert!(n.is_null(1));
+
+    let batches = query(
+        &ctx,
+        "SELECT count(*) FROM glue.lake.users WHERE profile['firstname'] = 'ada'",
+    )
+    .await;
+    assert_eq!(int64_column(&batches, 0), vec![1]);
+
+    let err = query_err(&ctx, "SELECT userid FROM glue.lake.clash").await;
+    assert!(
+        err.contains("userid") && err.contains("line 1") && err.contains("clash/part-0.json"),
+        "must name the column, line, and object: {err}"
+    );
+
+    // `case.insensitive = false`: exact matching, as the SerDe would do.
+    let batches = query(&ctx, "SELECT userid FROM glue.lake.exact").await;
+    let ids = batches
+        .iter()
+        .flat_map(|b| {
+            let a = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..a.len())
+                .map(|i| a.is_valid(i).then(|| a.value(i)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![None, Some(2)]);
 }
