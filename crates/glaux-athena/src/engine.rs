@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::datasource::source::DataSourceExec;
@@ -80,7 +81,22 @@ pub enum EngineError {
         /// What was wrong.
         message: String,
     },
-    /// Execution failed after planning (I/O, type errors at runtime, ...).
+    /// An operator was applied to operand types Athena rejects (`varchar =
+    /// integer`). A user error.
+    #[error("TYPE_MISMATCH: {0}")]
+    TypeMismatch(String),
+    /// A value failed at runtime for a reason that is the query's fault:
+    /// an invalid cast, bigint overflow, division by zero, an unparsable
+    /// date. `code` is the Trino error name. A user error.
+    #[error("{code}: {message}")]
+    Data {
+        /// Trino's error code name (`INVALID_CAST_ARGUMENT`, ...).
+        code: String,
+        /// The engine's diagnostic.
+        message: String,
+    },
+    /// Execution failed for reasons outside the query's control (I/O,
+    /// resources, engine internals).
     #[error("GENERIC_INTERNAL_ERROR: {0}")]
     Execution(String),
 }
@@ -89,7 +105,11 @@ impl EngineError {
     /// Athena `ErrorCategory`: `2` for user errors, `1` for system errors.
     pub fn category(&self) -> i32 {
         match self {
-            Self::Plan(_) | Self::Unsupported { .. } | Self::InvalidArgument { .. } => 2,
+            Self::Plan(_)
+            | Self::Unsupported { .. }
+            | Self::InvalidArgument { .. }
+            | Self::TypeMismatch(_)
+            | Self::Data { .. } => 2,
             Self::Execution(_) => 1,
         }
     }
@@ -100,7 +120,10 @@ impl EngineError {
     /// unsupported constructs, and `1` for engine failures.
     pub fn error_type(&self) -> i32 {
         match self {
-            Self::Plan(_) | Self::InvalidArgument { .. } => 1001,
+            Self::Plan(_)
+            | Self::InvalidArgument { .. }
+            | Self::TypeMismatch(_)
+            | Self::Data { .. } => 1001,
             Self::Unsupported { .. } => 1003,
             Self::Execution(_) => 1,
         }
@@ -221,23 +244,52 @@ fn glaux_error(err: &DataFusionError) -> Option<EngineError> {
     }
 }
 
-pub(crate) fn execution_error(err: DataFusionError) -> EngineError {
-    glaux_error(&err).unwrap_or_else(|| EngineError::Execution(err.to_string()))
-}
-
-pub(crate) fn plan_error(err: DataFusionError) -> EngineError {
+/// Classify a failure the way Athena does: anything the query's own text or
+/// data caused is a user error (category 2) with a Trino error code;
+/// only I/O, resource, and engine-internal failures are system errors.
+///
+/// Arrow reports data problems as typed `ArrowError`s (cast, parse,
+/// overflow, divide-by-zero), so the classification keys on those. Errors
+/// arrive wrapped in `Context` / `Diagnostic` layers (the optimizer's
+/// constant folder adds one, for instance), so the root cause decides.
+fn classify(err: DataFusionError) -> EngineError {
     if let Some(user) = glaux_error(&err) {
         return user;
     }
-    // Planning errors arrive wrapped in `Context`/`Diagnostic` layers;
-    // classify on the root cause.
+    let data = |code: &str| EngineError::Data {
+        code: code.to_string(),
+        message: err.to_string(),
+    };
     match err.find_root() {
         DataFusionError::SQL(..)
         | DataFusionError::Plan(..)
         | DataFusionError::SchemaError(..)
         | DataFusionError::NotImplemented(..) => EngineError::Plan(err.to_string()),
+        DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
+            ArrowError::CastError(_) => data("INVALID_CAST_ARGUMENT"),
+            ArrowError::ParseError(_) => data("INVALID_FUNCTION_ARGUMENT"),
+            ArrowError::DivideByZero => data("DIVISION_BY_ZERO"),
+            ArrowError::ArithmeticOverflow(_) => data("NUMERIC_VALUE_OUT_OF_RANGE"),
+            ArrowError::ComputeError(_)
+            | ArrowError::InvalidArgumentError(_)
+            | ArrowError::NotYetImplemented(_)
+            | ArrowError::SchemaError(_) => data("GENERIC_USER_ERROR"),
+            _ => EngineError::Execution(err.to_string()),
+        },
+        // DataFusion raises `Execution` for data problems its kernels
+        // detect themselves (format-string parse failures, bad function
+        // arguments at runtime). Engine-internal failures use `Internal`.
+        DataFusionError::Execution(_) => data("GENERIC_USER_ERROR"),
         _ => EngineError::Execution(err.to_string()),
     }
+}
+
+pub(crate) fn execution_error(err: DataFusionError) -> EngineError {
+    classify(err)
+}
+
+pub(crate) fn plan_error(err: DataFusionError) -> EngineError {
+    classify(err)
 }
 
 /// Sums the bytes a physical plan read from files: the Parquet reader's

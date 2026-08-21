@@ -52,6 +52,27 @@ pub enum GlauxSqlError {
         /// What was wrong with the call.
         message: String,
     },
+
+    /// An operator was applied to operand types Trino does not accept
+    /// (`varchar = integer`, `'a' || 1`, ...). DataFusion would coerce and
+    /// produce rows; Athena refuses the query, so glaux does too.
+    #[error("TYPE_MISMATCH: {message}")]
+    TypeMismatch {
+        /// Trino's diagnostic, e.g. `Cannot apply operator: varchar = integer`.
+        message: String,
+    },
+
+    /// A value failed at runtime for a reason that is the query's fault
+    /// (bigint overflow, an out-of-range array subscript, an invalid cast).
+    /// `code` is the Trino error name (`NUMERIC_VALUE_OUT_OF_RANGE`,
+    /// `INVALID_CAST_ARGUMENT`, ...).
+    #[error("{code}: {message}")]
+    Runtime {
+        /// Trino's error code name.
+        code: String,
+        /// What went wrong, naming the function or operator.
+        message: String,
+    },
 }
 
 impl GlauxSqlError {
@@ -71,11 +92,26 @@ impl GlauxSqlError {
         }
     }
 
+    /// Build a [`GlauxSqlError::TypeMismatch`].
+    pub fn type_mismatch(message: impl Into<String>) -> Self {
+        Self::TypeMismatch {
+            message: message.into(),
+        }
+    }
+
+    /// Build a [`GlauxSqlError::Runtime`].
+    pub fn runtime(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Runtime {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
     /// The construct this error names: the function or syntax element the
     /// client should look for in the coverage table.
     pub fn construct(&self) -> Option<&str> {
         match self {
-            Self::Parse { .. } => None,
+            Self::Parse { .. } | Self::TypeMismatch { .. } | Self::Runtime { .. } => None,
             Self::Unsupported { construct, .. } => Some(construct),
             Self::UnknownFunction { name } => Some(name),
             Self::InvalidArguments { function, .. } => Some(function),
@@ -98,6 +134,8 @@ impl From<GlauxSqlError> for EngineError {
             GlauxSqlError::InvalidArguments { function, message } => {
                 EngineError::InvalidArgument { function, message }
             }
+            GlauxSqlError::TypeMismatch { message } => EngineError::TypeMismatch(message),
+            GlauxSqlError::Runtime { code, message } => EngineError::Data { code, message },
         }
     }
 }
@@ -137,5 +175,21 @@ mod tests {
             unknown,
             EngineError::Unsupported { construct, .. } if construct == "function frobnicate"
         ));
+
+        let mismatch: EngineError =
+            GlauxSqlError::type_mismatch("Cannot apply operator: varchar = integer").into();
+        assert_eq!(mismatch.category(), 2);
+        assert_eq!(
+            mismatch.to_string(),
+            "TYPE_MISMATCH: Cannot apply operator: varchar = integer"
+        );
+
+        let runtime: EngineError =
+            GlauxSqlError::runtime("NUMERIC_VALUE_OUT_OF_RANGE", "bigint addition overflow").into();
+        assert_eq!(runtime.category(), 2);
+        assert_eq!(
+            runtime.to_string(),
+            "NUMERIC_VALUE_OUT_OF_RANGE: bigint addition overflow"
+        );
     }
 }
