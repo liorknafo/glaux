@@ -350,20 +350,27 @@ impl AthenaService {
         })?;
         let (bucket, prefix) = parse_output_location(&output_location)?;
 
-        // Idempotency: the same token replays the same id; a different
-        // query under a reused token is a client bug Athena rejects.
+        // Idempotency: the same token replays the same id; a reused token
+        // with different parameters is a client bug Athena rejects.
         if let Some(token) = &input.client_request_token
-            && let Some(existing_id) = state.tokens.get(token)
+            && let Some(existing) = state
+                .tokens
+                .get(token)
+                .and_then(|existing_id| state.queries.get(existing_id))
         {
-            let existing = &state.queries[existing_id];
-            if existing.execution.query == sql {
+            let execution = &existing.execution;
+            let same = execution.query == sql
+                && execution.work_group == workgroup_name
+                && execution.result_configuration.output_location.as_deref()
+                    == Some(output_location.as_str());
+            if same {
                 return Ok(StartQueryExecutionOutput {
-                    query_execution_id: existing_id.clone(),
+                    query_execution_id: execution.query_execution_id.clone(),
                 });
             }
             return Err(AthenaError::invalid_request(
                 "Idempotent parameters do not match: the ClientRequestToken was already used \
-                 for a different QueryString",
+                 with a different QueryString, WorkGroup, or OutputLocation",
             ));
         }
 
@@ -397,13 +404,8 @@ impl AthenaService {
             catalog: context.catalog,
             database: context.database,
         };
-        let service = Arc::clone(self);
-        let task_id = id.clone();
-        let key = format!("{prefix}{id}.csv");
-        let handle = tokio::spawn(async move {
-            service.run_query(task_id, request, bucket, key).await;
-        });
-
+        // Register the record before spawning so the task always finds it,
+        // regardless of when the lock is released relative to its first poll.
         state.queries.insert(
             id.clone(),
             QueryRecord {
@@ -411,13 +413,23 @@ impl AthenaService {
                 submitted_at: Instant::now(),
                 started_at: None,
                 results: None,
-                abort: Some(handle.abort_handle()),
+                abort: None,
                 client_request_token: input.client_request_token.clone(),
             },
         );
         state.order.push(id.clone());
         if let Some(token) = input.client_request_token {
             state.tokens.insert(token, id.clone());
+        }
+
+        let service = Arc::clone(self);
+        let task_id = id.clone();
+        let key = format!("{prefix}{id}.csv");
+        let handle = tokio::spawn(async move {
+            service.run_query(task_id, request, bucket, key).await;
+        });
+        if let Some(record) = state.queries.get_mut(&id) {
+            record.abort = Some(handle.abort_handle());
         }
         Ok(StartQueryExecutionOutput {
             query_execution_id: id,
