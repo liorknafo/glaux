@@ -43,7 +43,61 @@ pub fn all() -> Vec<ScalarUDF> {
     ]
     .into_iter()
     .map(|op| ScalarUDF::new_from_impl(TrinoMath::new(op)))
+    .chain(std::iter::once(ScalarUDF::new_from_impl(TrinoSqrt::new())))
     .collect()
+}
+
+/// `trino_sqrt(x)`: Java's `Math.sqrt` — `NaN` for a negative argument
+/// (DataFusion raises "cannot take square root of a negative number").
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoSqrt {
+    signature: Signature,
+}
+
+impl Default for TrinoSqrt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoSqrt {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoSqrt {
+    fn name(&self) -> &str {
+        "trino_sqrt"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        match &arg_types[0] {
+            t if is_integer(t) => Ok(DataType::Float64),
+            DataType::Float32 | DataType::Float64 | DataType::Decimal128(..) | DataType::Null => {
+                Ok(DataType::Float64)
+            }
+            other => Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function sqrt. Expected: sqrt(double)",
+                trino_type_name(other)
+            ))),
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let input = args.args[0].to_array(args.number_rows)?;
+        let doubles = cast(&input, &DataType::Float64)?;
+        let out: PrimitiveArray<Float64Type> =
+            doubles.as_primitive::<Float64Type>().unary(f64::sqrt);
+        Ok(ColumnarValue::Array(Arc::new(out)))
+    }
 }
 
 /// Which function.

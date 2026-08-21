@@ -490,9 +490,9 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "ltrim",
         "ltrim(varchar)",
         "String",
-        Passthrough,
-        "DataFusion `ltrim`",
-        ["ltrim"]
+        Rewrite,
+        "Rust UDF `trino_ltrim`: strips every Java whitespace code point (tab, LF, CR, VT, FF, `U+001C`–`U+001F`, the Unicode space separators, `U+2028`, `U+2029`; not NBSP), as Trino does, where DataFusion's `ltrim` strips only the ASCII space. `ltrim(x, chars)` is refused (not a Trino signature); use `TRIM(LEADING chars FROM x)`.",
+        ["trino_ltrim"]
     ),
     shim!(
         "replace",
@@ -522,9 +522,9 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "rtrim",
         "rtrim(varchar)",
         "String",
-        Passthrough,
-        "DataFusion `rtrim`",
-        ["rtrim"]
+        Rewrite,
+        "Rust UDF `trino_rtrim`: strips every Java whitespace code point, like `ltrim`. `rtrim(x, chars)` is refused (not a Trino signature); use `TRIM(TRAILING chars FROM x)`.",
+        ["trino_rtrim"]
     ),
     shim!(
         "split",
@@ -586,9 +586,9 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "trim",
         "trim(varchar)",
         "String",
-        Passthrough,
-        "DataFusion `trim` (also the `TRIM(BOTH ... FROM ...)` syntax)",
-        ["trim"]
+        Rewrite,
+        "Rust UDF `trino_trim`: strips every Java whitespace code point, like `ltrim`. The `TRIM([BOTH | LEADING | TRAILING] [chars] FROM x)` syntax strips any code point of `chars` (Trino's set semantics); the two-argument call `trim(x, chars)` is refused.",
+        ["trino_trim"]
     ),
     shim!(
         "upper",
@@ -604,7 +604,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "regexp_extract(varchar, pattern[, group]) → varchar",
         "Regular expression",
         Rewrite,
-        "Rust UDF `trino_regexp_extract`: `group` must be a literal and is checked against the pattern's capture groups (`Pattern has 1 groups. Cannot access group 2`, as in Trino). Patterns use Rust `regex` syntax (a close superset of Java's for common patterns; look-around and back-references are `INVALID_FUNCTION_ARGUMENT` errors).",
+        "Rust UDF `trino_regexp_extract`: `group` must be a literal and is checked against the pattern's capture groups (`Pattern has 1 groups. Cannot access group 2`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b` are ASCII-only and `$` also matches before a final newline, as in Trino's engine (Rust's Unicode-aware defaults would differ); look-around, back-references, `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors.",
         ["trino_regexp_extract"]
     ),
     shim!(
@@ -620,7 +620,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "regexp_like(varchar, pattern) → boolean",
         "Regular expression",
         Rewrite,
-        "Rust UDF `trino_regexp_like` (Rust `regex` syntax, a close superset of Java's for common patterns; an invalid pattern is an `INVALID_FUNCTION_ARGUMENT` error).",
+        "Rust UDF `trino_regexp_like`. Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b` are ASCII-only and `$` also matches before a final newline, as in Trino's engine (Rust's Unicode-aware defaults would differ); look-around, back-references, `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors.",
         ["trino_regexp_like"]
     ),
     shim!(
@@ -628,7 +628,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "regexp_replace(varchar, pattern[, replacement]) → varchar",
         "Regular expression",
         Rewrite,
-        "Rust UDF `trino_regexp_replace`: every match is replaced, the replacement uses Java syntax (`$1x` is group 1 then `x`, `${name}` a named group, `\\$` a literal dollar) and every group reference is validated against the pattern (`No group 2`, `No group with name {y}`, as in Trino). Patterns use Rust `regex` syntax, which lacks look-around and back-references (an `INVALID_FUNCTION_ARGUMENT` error). The lambda form is refused.",
+        "Rust UDF `trino_regexp_replace`: every match is replaced, the replacement uses Java syntax (`$1x` is group 1 then `x`, `${name}` a named group, `\\$` a literal dollar) and every group reference is validated against the pattern (`No group 2`, `No group with name {y}`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b` are ASCII-only and `$` also matches before a final newline, as in Trino's engine (Rust's Unicode-aware defaults would differ); look-around, back-references, `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors. The lambda form is refused.",
         ["trino_regexp_replace"]
     ),
     shim!(
@@ -794,10 +794,10 @@ pub static FUNCTIONS: &[FunctionShim] = &[
     ),
     shim!(
         "from_unixtime",
-        "from_unixtime(double) → timestamp",
+        "from_unixtime(double) → timestamp(3) with time zone",
         "Date and time",
         Rewrite,
-        "`arrow_cast(CAST(round(x * 1000) AS BIGINT), 'Timestamp(Millisecond, None)')` (rounded to the millisecond, like Athena: `from_unixtime(1.9999)` is `…:02.000`). The zone-argument forms are refused.",
+        "`arrow_cast(CAST(round(x * 1000) AS BIGINT), 'Timestamp(Millisecond, Some(\"UTC\"))')`: a `timestamp(3) with time zone` at UTC (Athena prints `1970-01-01 00:00:00.000 UTC`), rounded to the millisecond like Athena (`from_unixtime(1.9999)` is `…:02.000`). The zone-argument forms are refused.",
         ["arrow_cast", "round"]
     ),
     shim!(
@@ -1078,9 +1078,9 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "sqrt",
         "sqrt(x) → double",
         "Math",
-        Passthrough,
-        "DataFusion `sqrt`",
-        ["sqrt"]
+        Rewrite,
+        "Rust UDF `trino_sqrt`: `NaN` for a negative argument, as Java's `Math.sqrt` (DataFusion raises an error).",
+        ["trino_sqrt"]
     ),
     shim!(
         "truncate",
@@ -1338,7 +1338,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "json_array_length(json) → bigint",
         "JSON",
         Udf,
-        "Rust UDF (NULL when the value is not an array)",
+        "Rust UDF: NULL when the value is not an array, and NULL for text that is not valid JSON (Trino's varchar overload; only `json_parse` raises).",
         ["json_array_length"]
     ),
     shim!(
@@ -1346,7 +1346,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "json_extract(json, json_path) → json",
         "JSON",
         Udf,
-        "Rust UDF; the JSON type is represented as its text. JSONPath subset: `$`, `.key`, `[\"key\"]`, `[n]` — wildcards, recursive descent, slices and filters are refused. A duplicate key resolves to its first occurrence, as in Trino; the matched value is re-serialised compactly in document order with non-integer numbers in Java double text (`2.50` becomes `2.5`).",
+        "Rust UDF; the JSON type is represented as its text. JSONPath subset: `$`, `.key`, `[\"key\"]`, `[n]` — wildcards, recursive descent, slices and filters are refused. Text that is not valid JSON gives NULL (Trino's varchar overload). A duplicate key resolves to its first occurrence, as in Trino; the matched value is re-serialised compactly in document order with non-integer numbers in Java double text (`2.50` becomes `2.5`).",
         ["json_extract"]
     ),
     shim!(
@@ -1354,7 +1354,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "json_extract_scalar(json, json_path) → varchar",
         "JSON",
         Udf,
-        "Rust UDF; same JSONPath subset. NULL for missing paths, JSON nulls, objects and arrays. Numbers are returned as written (`1.50`, `1e2`, a 30-digit integer), and a duplicate key resolves to its first occurrence, as in Trino.",
+        "Rust UDF; same JSONPath subset. NULL for missing paths, JSON nulls, objects and arrays, and for text that is not valid JSON (Trino's varchar overload; only `json_parse` raises). Numbers are returned as written (`1.50`, `1e2`, a 30-digit integer), and a duplicate key resolves to its first occurrence, as in Trino.",
         ["json_extract_scalar"]
     ),
     shim!(
@@ -1378,7 +1378,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "json_size(json, json_path) → bigint",
         "JSON",
         Udf,
-        "Rust UDF: member count of the object/array at the path, 0 for scalars",
+        "Rust UDF: member count of the object/array at the path, 0 for scalars, NULL for text that is not valid JSON.",
         ["json_size"]
     ),
     // --- Misc --------------------------------------------------------------

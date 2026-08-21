@@ -3,8 +3,10 @@
 //! `split` of an empty string or by an empty delimiter, `lpad` / `rpad`
 //! with an empty pad string (an error in Trino) or a size below the length
 //! (truncation), `codepoint` of more than one character (a type error in
-//! Trino), and `upper` / `lower`, which Trino maps per code point (`ß` stays
-//! `ß`) where Rust applies the full Unicode mapping.
+//! Trino), `upper` / `lower`, which Trino maps per code point (`ß` stays
+//! `ß`) where Rust applies the full Unicode mapping, and `trim` / `ltrim` /
+//! `rtrim`, which strip every Java whitespace code point (tab, newline,
+//! `U+2028`, ...) where DataFusion strips only the ASCII space.
 
 use std::sync::Arc;
 
@@ -30,6 +32,9 @@ pub fn all() -> Vec<ScalarUDF> {
         ScalarUDF::new_from_impl(TrinoStringOp::new(StringOp::Codepoint)),
         ScalarUDF::new_from_impl(TrinoStringOp::new(StringOp::Upper)),
         ScalarUDF::new_from_impl(TrinoStringOp::new(StringOp::Lower)),
+        ScalarUDF::new_from_impl(TrinoTrim::new(TrimSide::Both)),
+        ScalarUDF::new_from_impl(TrinoTrim::new(TrimSide::Leading)),
+        ScalarUDF::new_from_impl(TrinoTrim::new(TrimSide::Trailing)),
     ]
 }
 
@@ -553,5 +558,157 @@ mod tests {
         assert_eq!(lower("İstanbul"), "istanbul");
         assert_eq!(lower("ΟΔΥΣΣΕΥΣ"), "οδυσσευσ");
         assert_eq!(lower("ÀB"), "àb");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// trim / ltrim / rtrim
+// ---------------------------------------------------------------------------
+
+/// Java's `Character.isWhitespace`, which Trino's `trim` family strips:
+/// the Unicode space separators except the non-breaking ones (`U+00A0`,
+/// `U+2007`, `U+202F`), the line and paragraph separators, `U+0009`–`U+000D`,
+/// and `U+001C`–`U+001F`. DataFusion's `trim` strips only `U+0020`.
+pub fn is_java_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0009}'..='\u{000D}'
+            | '\u{001C}'..='\u{001F}'
+            | ' '
+            | '\u{1680}'
+            | '\u{2000}'..='\u{2006}'
+            | '\u{2008}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{205F}'
+            | '\u{3000}'
+    )
+}
+
+/// Which side `trim` strips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrimSide {
+    Both,
+    Leading,
+    Trailing,
+}
+
+impl TrimSide {
+    fn trino_name(self) -> &'static str {
+        match self {
+            Self::Both => "trim",
+            Self::Leading => "ltrim",
+            Self::Trailing => "rtrim",
+        }
+    }
+}
+
+/// Trino's `trim` / `ltrim` / `rtrim`: strips Java whitespace, or any code
+/// point of `chars` when given (`TRIM(LEADING 'xy' FROM s)`).
+pub fn trino_trim(s: &str, side: TrimSide, chars: Option<&str>) -> String {
+    let strip = |c: char| match chars {
+        Some(set) => set.contains(c),
+        None => is_java_whitespace(c),
+    };
+    match side {
+        TrimSide::Both => s.trim_matches(strip),
+        TrimSide::Leading => s.trim_start_matches(strip),
+        TrimSide::Trailing => s.trim_end_matches(strip),
+    }
+    .to_string()
+}
+
+/// `trino_trim(s[, chars])` / `trino_ltrim` / `trino_rtrim`: see
+/// [`trino_trim`].
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoTrim {
+    signature: Signature,
+    side: TrimSide,
+}
+
+impl TrinoTrim {
+    /// New instance.
+    pub fn new(side: TrimSide) -> Self {
+        Self {
+            signature: Signature::one_of(
+                vec![TypeSignature::Any(1), TypeSignature::Any(2)],
+                Volatility::Immutable,
+            ),
+            side,
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoTrim {
+    fn name(&self) -> &str {
+        match self.side {
+            TrimSide::Both => "trino_trim",
+            TrimSide::Leading => "trino_ltrim",
+            TrimSide::Trailing => "trino_rtrim",
+        }
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        if !arg_types.iter().all(is_string_or_null) {
+            return Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function {}. Expected varchar arguments",
+                arg_types
+                    .iter()
+                    .map(trino_type_name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.side.trino_name()
+            )));
+        }
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let function = self.side.trino_name();
+        let rows = args.number_rows;
+        let strings = string_array(function, &args.args[0], rows)?;
+        let chars = match args.args.get(1) {
+            Some(c) => Some(string_array(function, c, rows)?),
+            None => None,
+        };
+        let mut out = StringBuilder::new();
+        for i in 0..rows {
+            let chars_null = chars.as_ref().is_some_and(|c| c.is_null(i));
+            if strings.is_null(i) || chars_null {
+                out.append_null();
+                continue;
+            }
+            let set = chars.as_ref().map(|c| c.value(i));
+            out.append_value(trino_trim(strings.value(i), self.side, set));
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    #[test]
+    fn trim_strips_java_whitespace_only() {
+        assert_eq!(trino_trim("\t a \n", TrimSide::Both, None), "a");
+        assert_eq!(trino_trim("\ta", TrimSide::Leading, None), "a");
+        assert_eq!(trino_trim("a\r", TrimSide::Trailing, None), "a");
+        assert_eq!(trino_trim("\u{2028}a\u{3000}", TrimSide::Both, None), "a");
+        assert_eq!(trino_trim("\u{001C}a\u{001F}", TrimSide::Both, None), "a");
+        // Non-breaking spaces are not whitespace to Java.
+        assert_eq!(
+            trino_trim("\u{00A0}a\u{202F}", TrimSide::Both, None),
+            "\u{00A0}a\u{202F}"
+        );
+        assert_eq!(trino_trim("\u{2007}a", TrimSide::Both, None), "\u{2007}a");
+        assert_eq!(trino_trim("xyaxy", TrimSide::Both, Some("yx")), "a");
+        assert_eq!(trino_trim("xax", TrimSide::Leading, Some("x")), "ax");
+        assert_eq!(trino_trim("xax", TrimSide::Trailing, Some("x")), "xa");
+        assert_eq!(trino_trim(" a ", TrimSide::Both, Some("x")), " a ");
     }
 }

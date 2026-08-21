@@ -45,7 +45,165 @@ pub fn all() -> Vec<ScalarUDF> {
         ScalarUDF::new_from_impl(TrinoVarchar::new(true)),
         ScalarUDF::new_from_impl(TrinoBoolean::new(false)),
         ScalarUDF::new_from_impl(TrinoBoolean::new(true)),
+        ScalarUDF::new_from_impl(TrinoFloat::new(false, false)),
+        ScalarUDF::new_from_impl(TrinoFloat::new(false, true)),
+        ScalarUDF::new_from_impl(TrinoFloat::new(true, false)),
+        ScalarUDF::new_from_impl(TrinoFloat::new(true, true)),
     ]
+}
+
+/// Java's `Double.parseDouble` / `Float.parseFloat` grammar, which Trino's
+/// varchar → `DOUBLE` / `REAL` casts use: surrounding ASCII control
+/// characters and spaces are trimmed, the special values are exactly `NaN`,
+/// `Infinity`, `+Infinity`, `-Infinity` (Rust would also accept `nan`,
+/// `inf`, `infinity` in any case), an optional `d` / `f` suffix is allowed,
+/// and hexadecimal floats are refused. `None` for text Java rejects.
+pub(crate) fn parse_java_double_text(text: &str) -> Option<String> {
+    let trimmed = text.trim_matches(|c: char| c <= ' ');
+    match trimmed {
+        "NaN" => return Some("NaN".to_string()),
+        "Infinity" | "+Infinity" => return Some("inf".to_string()),
+        "-Infinity" => return Some("-inf".to_string()),
+        _ => {}
+    }
+    let (sign, body) = match trimmed.strip_prefix(['+', '-']) {
+        Some(rest) => (&trimmed[..1], rest),
+        None => ("", trimmed),
+    };
+    let body = body.strip_suffix(['d', 'D', 'f', 'F']).unwrap_or(body);
+    // Digits [. Digits] [(e|E) [+-] Digits] with at least one mantissa digit.
+    let (mantissa, exponent) = match body.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (body, None),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if int_part.is_empty() && frac_part.is_empty()
+        || !digits(int_part)
+        || !digits(frac_part)
+        || mantissa.matches('.').count() > 1
+    {
+        return None;
+    }
+    if let Some(e) = exponent {
+        let e_digits = e.strip_prefix(['+', '-']).unwrap_or(e);
+        if e_digits.is_empty() || !digits(e_digits) {
+            return None;
+        }
+    }
+    Some(format!("{sign}{body}"))
+}
+
+/// `trino_double(x)` / `trino_real(x)` (and the `try_` forms): `CAST(x AS
+/// DOUBLE / REAL)` with Java's text grammar for varchar sources; every
+/// other source goes through Arrow's cast.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoFloat {
+    signature: Signature,
+    try_cast: bool,
+    real: bool,
+}
+
+impl TrinoFloat {
+    /// New instance.
+    pub fn new(try_cast: bool, real: bool) -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+            try_cast,
+            real,
+        }
+    }
+
+    fn target(&self) -> DataType {
+        if self.real {
+            DataType::Float32
+        } else {
+            DataType::Float64
+        }
+    }
+
+    fn type_name(&self) -> &'static str {
+        if self.real { "REAL" } else { "DOUBLE" }
+    }
+}
+
+impl ScalarUDFImpl for TrinoFloat {
+    fn name(&self) -> &str {
+        match (self.try_cast, self.real) {
+            (false, false) => "trino_double",
+            (false, true) => "trino_real",
+            (true, false) => "trino_try_double",
+            (true, true) => "trino_try_real",
+        }
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        match &arg_types[0] {
+            DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View => Ok(self.target()),
+            other => Err(type_mismatch(format!(
+                "Cannot cast {} to {}",
+                trino_type_name(other),
+                self.type_name().to_lowercase()
+            ))),
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let input = args.args[0].to_array(rows)?;
+        if !matches!(
+            input.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) {
+            let options = arrow::compute::CastOptions {
+                safe: self.try_cast,
+                format_options: Default::default(),
+            };
+            return Ok(ColumnarValue::Array(arrow::compute::cast_with_options(
+                &input,
+                &self.target(),
+                &options,
+            )?));
+        }
+        let strings = string_array("CAST", &args.args[0], rows)?;
+        let mut cleaned = StringBuilder::new();
+        for i in 0..rows {
+            if strings.is_null(i) {
+                cleaned.append_null();
+                continue;
+            }
+            match parse_java_double_text(strings.value(i)) {
+                Some(text) => cleaned.append_value(text),
+                None if self.try_cast => cleaned.append_null(),
+                None => {
+                    return Err(data_error(
+                        "INVALID_CAST_ARGUMENT",
+                        format!("Cannot cast '{}' to {}", strings.value(i), self.type_name()),
+                    ));
+                }
+            }
+        }
+        let cleaned: ArrayRef = Arc::new(cleaned.finish());
+        Ok(ColumnarValue::Array(cast(&cleaned, &self.target())?))
+    }
 }
 
 /// `trino_round_for_cast(x)`: rounds floating-point and decimal values
@@ -513,6 +671,42 @@ mod tests {
             ("", None),
         ] {
             assert_eq!(parse_trino_boolean(text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn double_text_follows_java() {
+        for (text, expected) in [
+            ("1.5", Some("1.5")),
+            (" 1.5 ", Some("1.5")),
+            ("\t-2e3\n", Some("-2e3")),
+            ("+.5", Some("+.5")),
+            ("1.", Some("1.")),
+            ("1.e5", Some("1.e5")),
+            ("1.5d", Some("1.5")),
+            ("2F", Some("2")),
+            ("NaN", Some("NaN")),
+            ("Infinity", Some("inf")),
+            ("+Infinity", Some("inf")),
+            ("-Infinity", Some("-inf")),
+            ("nan", None),
+            ("inf", None),
+            ("infinity", None),
+            ("INFINITY", None),
+            ("-inf", None),
+            ("0x1p3", None),
+            ("1e", None),
+            ("e5", None),
+            (".", None),
+            ("", None),
+            ("1_000", None),
+            ("1,5", None),
+        ] {
+            assert_eq!(
+                parse_java_double_text(text).as_deref(),
+                expected,
+                "{text:?}"
+            );
         }
     }
 

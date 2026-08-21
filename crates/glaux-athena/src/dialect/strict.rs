@@ -141,7 +141,6 @@ pub(crate) fn comparable(left: &DataType, right: &DataType) -> bool {
 fn trino_function_name(name: &str) -> &str {
     match name {
         "character_length" => "length",
-        "btrim" => "trim",
         "levenshtein" => "levenshtein_distance",
         "to_timestamp" => "date_parse",
         other => other,
@@ -240,7 +239,7 @@ fn date_argument(name: &str) -> Option<usize> {
 /// signature.
 fn string_arguments(name: &str) -> &'static [usize] {
     match name {
-        "character_length" | "ltrim" | "rtrim" | "btrim" => &[0],
+        "character_length" => &[0],
         "starts_with" | "strpos" | "levenshtein" | "regexp_match" => &[0, 1],
         "replace" | "translate" => &[0, 1, 2],
         // `date_parse(x, fmt)`: the parsed text must be a varchar.

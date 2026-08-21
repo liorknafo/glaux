@@ -28,7 +28,7 @@ use sqlparser::ast::{
     FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident,
     JoinConstraint, JoinOperator, NamedWindowExpr, ObjectName, ObjectNamePart, OrderByExpr,
     OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Subscript, TableAlias, TableFactor,
-    TimezoneInfo, UnaryOperator, Value, VisitMut, VisitorMut, WindowType,
+    TimezoneInfo, TrimWhereField, UnaryOperator, Value, VisitMut, VisitorMut, WindowType,
 };
 
 use super::error::GlauxSqlError;
@@ -953,6 +953,30 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             *expr = func("trino_substr", args);
             Ok(())
         }
+        Expr::Trim {
+            expr: source,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => {
+            if trim_characters.is_some() {
+                return Err(GlauxSqlError::unsupported(
+                    "TRIM(x, chars)",
+                    "not Trino syntax; use TRIM(BOTH chars FROM x)",
+                ));
+            }
+            let name = match trim_where {
+                None | Some(TrimWhereField::Both) => "trino_trim",
+                Some(TrimWhereField::Leading) => "trino_ltrim",
+                Some(TrimWhereField::Trailing) => "trino_rtrim",
+            };
+            let mut args = vec![take(source)];
+            if let Some(what) = trim_what.take() {
+                args.push(*what);
+            }
+            *expr = func(name, args);
+            Ok(())
+        }
         Expr::Position { expr: needle, r#in } => {
             let args = vec![take(r#in), take(needle)];
             *expr = cast_to(func("strpos", args), bigint());
@@ -1289,6 +1313,23 @@ fn rewrite_cast(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             *expr = func("trino_varchar", vec![take(inner)]);
             Ok(())
         }
+        DataType::Double(_) | DataType::DoublePrecision | DataType::Real => {
+            let real = matches!(data_type, DataType::Real);
+            let name = match (kind, real) {
+                (CastKind::TryCast, false) => "trino_try_double",
+                (CastKind::TryCast, true) => "trino_try_real",
+                (_, false) => "trino_double",
+                (_, true) => "trino_real",
+            };
+            *expr = func(name, vec![take(inner)]);
+            Ok(())
+        }
+        DataType::Float(_) | DataType::Float4 | DataType::Float8 | DataType::Float64 => {
+            Err(GlauxSqlError::unsupported(
+                format!("CAST(... AS {data_type})"),
+                "not a Trino type name; use DOUBLE or REAL",
+            ))
+        }
         _ => Ok(()),
     }
 }
@@ -1451,6 +1492,23 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
         }
         // String
         "codepoint" => return simple_rename("trino_codepoint", &[1]),
+        "trim" | "ltrim" | "rtrim" => {
+            if args.len() != 1 {
+                return Err(GlauxSqlError::invalid_arguments(
+                    name,
+                    format!(
+                        "{name} takes one argument in Trino; to strip specific characters use \
+                         TRIM({} 'chars' FROM x)",
+                        match name {
+                            "ltrim" => "LEADING",
+                            "rtrim" => "TRAILING",
+                            _ => "BOTH",
+                        }
+                    ),
+                ));
+            }
+            return simple_rename(&format!("trino_{name}"), &[1]);
+        }
         "lpad" => return simple_rename("trino_lpad", &[3]),
         "rpad" => return simple_rename("trino_rpad", &[3]),
         "upper" => return simple_rename("trino_upper", &[1]),
@@ -1579,16 +1637,18 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
                 func(
                     "round",
                     vec![binary(
-                        cast_to(args.into_iter().next().unwrap(), double()),
+                        func("trino_double", vec![args.into_iter().next().unwrap()]),
                         BinaryOperator::Multiply,
                         num_lit(1000),
                     )],
                 ),
                 bigint(),
             );
+            // Trino's result is a `timestamp(3) with time zone`, UTC on
+            // Athena (printed `... UTC`), like `parse_datetime` and `now()`.
             func(
                 "arrow_cast",
-                vec![millis, str_lit("Timestamp(Millisecond, None)")],
+                vec![millis, str_lit("Timestamp(Millisecond, Some(\"UTC\"))")],
             )
         }
         "to_unixtime" => return simple_rename("trino_to_unixtime", &[1]),
@@ -1656,6 +1716,7 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
         }
         "rand" => return simple_rename("random", &[0]),
         "sign" => return simple_rename("trino_sign", &[1]),
+        "sqrt" => return simple_rename("trino_sqrt", &[1]),
         "truncate" => return simple_rename("trino_truncate", &[1, 2]),
         // Arrays
         "array_join" => return simple_rename("trino_array_join", &[2, 3]),
@@ -1807,7 +1868,7 @@ mod tests {
         );
         assert_eq!(
             rewrite("SELECT from_unixtime(t) AS a, to_unixtime(ts) AS b, date_trunc('day', ts) AS c FROM t").unwrap(),
-            "SELECT arrow_cast(CAST(round(CAST(t AS DOUBLE) * 1000) AS BIGINT), 'Timestamp(Millisecond, None)') AS a, trino_to_unixtime(ts) AS b, trino_date_trunc('day', ts) AS c FROM t"
+            "SELECT arrow_cast(CAST(round(trino_double(t) * 1000) AS BIGINT), 'Timestamp(Millisecond, Some(\"UTC\"))') AS a, trino_to_unixtime(ts) AS b, trino_date_trunc('day', ts) AS c FROM t"
         );
     }
 

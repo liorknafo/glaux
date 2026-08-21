@@ -779,7 +779,12 @@ fn json_path_map<T>(
             cached = Some((path.to_string(), parse_json_path(function, path)?));
         }
         let steps = &cached.as_ref().expect("cached path").1;
-        let value = parse_json(function, json.value(i))?;
+        // Trino's varchar overloads return NULL for text that is not JSON
+        // (only `json_parse` raises); a bad path is still an error.
+        let Ok(value) = json::parse(json.value(i)) else {
+            append(None);
+            continue;
+        };
         append(f(navigate(&value, steps)));
     }
     Ok(())
@@ -939,9 +944,12 @@ impl ScalarUDFImpl for JsonSize {
     }
 }
 
-/// Evaluate a `(json) -> T` function row by row over validated JSON.
+/// Evaluate a `(json) -> T` function row by row. Text that is not JSON is
+/// an error when `strict` (`json_parse`) and NULL otherwise
+/// (`json_array_length`), as in Trino's varchar overloads.
 fn json_map<T>(
     function: &str,
+    strict: bool,
     args: &ScalarFunctionArgs,
     mut f: impl FnMut(json::Json) -> Option<T>,
     mut append: impl FnMut(Option<T>),
@@ -953,7 +961,18 @@ fn json_map<T>(
             append(None);
             continue;
         }
-        append(f(parse_json(function, json.value(i))?));
+        let parsed = if strict {
+            parse_json(function, json.value(i))?
+        } else {
+            match json::parse(json.value(i)) {
+                Ok(v) => v,
+                Err(_) => {
+                    append(None);
+                    continue;
+                }
+            }
+        };
+        append(f(parsed));
     }
     Ok(())
 }
@@ -999,6 +1018,7 @@ impl ScalarUDFImpl for JsonParse {
         let mut out = StringBuilder::new();
         json_map(
             "json_parse",
+            true,
             &args,
             |v| Some(v.canonical()),
             |v| out.append_option(v),
@@ -1045,6 +1065,7 @@ impl ScalarUDFImpl for JsonFormat {
         let mut out = StringBuilder::new();
         json_map(
             "json_format",
+            true,
             &args,
             |v| Some(v.canonical()),
             |v| out.append_option(v),
@@ -1092,6 +1113,7 @@ impl ScalarUDFImpl for JsonArrayLength {
         let mut out = Int64Builder::new();
         json_map(
             "json_array_length",
+            false,
             &args,
             |v| match v {
                 json::Json::Array(a) => Some(a.len() as i64),

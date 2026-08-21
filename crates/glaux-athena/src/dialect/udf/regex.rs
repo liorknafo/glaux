@@ -8,7 +8,10 @@
 //! (a close superset of Java's syntax for common patterns; look-around and
 //! back-references are compile errors, reported as user errors), validate
 //! every group reference against the compiled pattern, and replace all
-//! matches as Trino does.
+//! matches as Trino does. Patterns are translated from Java syntax first
+//! ([`translate_java_pattern`]): Trino's engine reads `\d`, `\w`, `\s`,
+//! and `\b` as ASCII classes and `$` as "end of text or before a final
+//! newline", where Rust's defaults are Unicode-aware and strict.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,19 +62,250 @@ fn invalid(function: &str, message: impl Into<String>) -> DataFusionError {
     )
 }
 
-/// Compile `pattern`, caching by text (patterns are usually constant).
+/// Java's ASCII character classes, as Trino's regex engine (Joni in Java
+/// syntax) reads them. Rust's `regex` crate makes `\d`, `\w`, `\s`, and
+/// `\b` Unicode-aware, so `regexp_like('٣', '\d')` would be true and
+/// `regexp_replace('José', '\W', '')` would keep the `é`.
+const ASCII_DIGIT: &str = "0-9";
+const ASCII_WORD: &str = "a-zA-Z0-9_";
+const ASCII_SPACE: &str = " \\t\\n\\x0B\\f\\r";
+/// Java's `\h` (horizontal whitespace) and `\v` (vertical whitespace)
+/// classes; Rust reads `\v` as a single `U+000B`.
+const HORIZONTAL_SPACE: &str =
+    " \\t\\xA0\\x{1680}\\x{180e}\\x{2000}-\\x{200a}\\x{202f}\\x{205f}\\x{3000}";
+const VERTICAL_SPACE: &str = "\\n\\x0B\\f\\r\\x85\\x{2028}\\x{2029}";
+
+/// Translate a Java-syntax pattern (what Trino accepts) to the equivalent
+/// Rust `regex` pattern, or refuse constructs whose meaning would differ:
+///
+/// - `\d \w \s \h \v` and their negations become explicit ASCII classes
+///   (inside a bracket class too), `\b` / `\B` the ASCII word boundary;
+/// - `$` outside a class (and `\Z`) matches at the end of the text or
+///   before a final newline, as Joni's does in single-line mode; `\A`, `\z`,
+///   and `^` already agree;
+/// - the inline flags `u` and `U` are refused: Java's (Unicode case /
+///   Unicode classes) and Rust's (Unicode mode / lazy quantifiers) differ;
+///   `m`, `s`, `i`, `x` agree, and an `m` flag leaves `$` alone.
+///
+/// Everything else is passed through; Java syntax Rust lacks (look-around,
+/// back-references, possessive quantifiers, `\Q..\E`) fails at compile
+/// time as an invalid pattern, never silently.
+pub fn translate_java_pattern(pattern: &str) -> std::result::Result<String, String> {
+    let multiline = has_multiline_flag(pattern);
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let mut chars = pattern.chars().peekable();
+    // Bracket-class nesting depth (Java and Rust both allow `[a[b]]`).
+    let mut depth = 0usize;
+    // Just after `[` or `[^`, where `]` is a literal in Java.
+    let mut class_start = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                let Some(escaped) = chars.next() else {
+                    return Err("pattern ends with a dangling backslash".to_string());
+                };
+                let in_class = depth > 0;
+                let class = |set: &str, negated: bool| {
+                    if in_class {
+                        if negated {
+                            format!("[^{set}]")
+                        } else {
+                            set.to_string()
+                        }
+                    } else if negated {
+                        format!("[^{set}]")
+                    } else {
+                        format!("[{set}]")
+                    }
+                };
+                match escaped {
+                    'd' => out.push_str(&class(ASCII_DIGIT, false)),
+                    'D' => out.push_str(&class(ASCII_DIGIT, true)),
+                    'w' => out.push_str(&class(ASCII_WORD, false)),
+                    'W' => out.push_str(&class(ASCII_WORD, true)),
+                    's' => out.push_str(&class(ASCII_SPACE, false)),
+                    'S' => out.push_str(&class(ASCII_SPACE, true)),
+                    'h' => out.push_str(&class(HORIZONTAL_SPACE, false)),
+                    'H' => out.push_str(&class(HORIZONTAL_SPACE, true)),
+                    'v' => out.push_str(&class(VERTICAL_SPACE, false)),
+                    'V' => out.push_str(&class(VERTICAL_SPACE, true)),
+                    'b' if !in_class => out.push_str("(?-u:\\b)"),
+                    'B' if !in_class => out.push_str("(?-u:\\B)"),
+                    'Z' if !in_class => out.push_str("(?:\\n?\\z)"),
+                    'p' | 'P' => {
+                        // `\p{Alpha}` etc. are Java's POSIX names (ASCII);
+                        // Rust would read some of them as Unicode scripts or
+                        // refuse them. Only the shared Unicode category names
+                        // pass through unchanged.
+                        out.push('\\');
+                        out.push(escaped);
+                        let mut name = String::new();
+                        if chars.peek() == Some(&'{') {
+                            for inner in chars.by_ref() {
+                                name.push(inner);
+                                if inner == '}' {
+                                    break;
+                                }
+                            }
+                        } else if let Some(single) = chars.next() {
+                            name.push(single);
+                        }
+                        let body = name.trim_matches(['{', '}']);
+                        let body = body.strip_prefix("Is").unwrap_or(body);
+                        if !is_unicode_category(body) {
+                            return Err(format!(
+                                "\\{escaped}{name} is a Java-specific character class that glaux \
+                                 does not translate"
+                            ));
+                        }
+                        out.push_str(&name);
+                    }
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+                class_start = false;
+            }
+            '[' => {
+                depth += 1;
+                out.push('[');
+                if chars.peek() == Some(&'^') {
+                    chars.next();
+                    out.push('^');
+                }
+                class_start = true;
+                continue;
+            }
+            ']' if depth > 0 && class_start => {
+                // Java: a `]` right after `[` or `[^` is literal.
+                out.push_str("\\]");
+                class_start = false;
+            }
+            ']' if depth > 0 => {
+                depth -= 1;
+                out.push(']');
+            }
+            '$' if depth == 0 && !multiline => out.push_str("(?:\\n?\\z)"),
+            '(' if depth == 0 && chars.peek() == Some(&'?') => {
+                out.push('(');
+                // Inline flags: `(?flags)` or `(?flags:...)`.
+                let rest: String = chars.clone().collect();
+                let flags_end = rest[1..]
+                    .find(|ch: char| !(ch.is_ascii_alphabetic() || ch == '-'))
+                    .map(|i| i + 1);
+                if let Some(end) = flags_end
+                    && matches!(&rest[end..end + 1], ")" | ":")
+                    && end > 1
+                {
+                    let flags = &rest[1..end];
+                    if flags.contains(['u', 'U', 'd']) {
+                        return Err(format!(
+                            "the inline flag group (?{flags}) uses a flag whose meaning differs \
+                             between Java and glaux's regex engine (u, U, d)"
+                        ));
+                    }
+                }
+                class_start = false;
+                continue;
+            }
+            other => {
+                out.push(other);
+                class_start = false;
+            }
+        }
+        if c != '[' {
+            class_start = false;
+        }
+    }
+    Ok(out)
+}
+
+/// Whether the pattern enables the `m` (MULTILINE) flag anywhere; then `$`
+/// means end-of-line in both engines and is left alone.
+fn has_multiline_flag(pattern: &str) -> bool {
+    let mut rest = pattern;
+    while let Some(i) = rest.find("(?") {
+        let after = &rest[i + 2..];
+        let flags: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() || *c == '-')
+            .collect();
+        let enabled = flags.split('-').next().unwrap_or("");
+        if enabled.contains('m') && after[flags.len()..].starts_with([')', ':']) {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
+/// Unicode general categories, spelled the same in Java (`\p{Lu}`,
+/// `\p{IsLu}`) and Rust (`\p{Lu}`). Java's POSIX names (`\p{Alpha}`),
+/// binary properties (`\p{IsAlphabetic}`), scripts (`\p{IsGreek}`), and
+/// blocks (`\p{InGreek}`) are refused rather than guessed.
+fn is_unicode_category(name: &str) -> bool {
+    matches!(
+        name,
+        "L" | "Lu"
+            | "Ll"
+            | "Lt"
+            | "Lm"
+            | "Lo"
+            | "M"
+            | "Mn"
+            | "Mc"
+            | "Me"
+            | "N"
+            | "Nd"
+            | "Nl"
+            | "No"
+            | "P"
+            | "Pc"
+            | "Pd"
+            | "Ps"
+            | "Pe"
+            | "Pi"
+            | "Pf"
+            | "Po"
+            | "S"
+            | "Sm"
+            | "Sc"
+            | "Sk"
+            | "So"
+            | "Z"
+            | "Zs"
+            | "Zl"
+            | "Zp"
+            | "C"
+            | "Cc"
+            | "Cf"
+            | "Co"
+            | "Cn"
+    )
+}
+
+/// Compile `pattern` (Java syntax, translated), caching by text (patterns
+/// are usually constant).
 fn compile<'a>(
     function: &str,
     cache: &'a mut HashMap<String, Regex>,
     pattern: &str,
 ) -> Result<&'a Regex> {
     if !cache.contains_key(pattern) {
-        let compiled = Regex::new(pattern).map_err(|e| {
+        let translated = translate_java_pattern(pattern).map_err(|e| {
+            invalid(
+                function,
+                format!("regular expression {pattern:?} is not supported: {e}"),
+            )
+        })?;
+        let compiled = Regex::new(&translated).map_err(|e| {
             invalid(
                 function,
                 format!(
-                    "invalid regular expression {pattern:?}: {e} (glaux uses Rust regex syntax, \
-                     which lacks Java's look-around and back-references)"
+                    "invalid regular expression {pattern:?}: {e} (glaux translates Java \
+                     syntax to Rust regex syntax, which lacks Java's look-around and \
+                     back-references)"
                 ),
             )
         })?;
@@ -378,6 +612,42 @@ mod tests {
         let plain = Regex::new("b").unwrap();
         let err = parse_replacement(&plain, "$1").unwrap_err().to_string();
         assert!(err.contains("No group 1"), "{err}");
+    }
+
+    #[test]
+    fn java_classes_become_ascii_and_dollar_allows_a_final_newline() {
+        let t = |p: &str| translate_java_pattern(p).unwrap();
+        assert_eq!(t(r"\d+"), "[0-9]+");
+        assert_eq!(t(r"[\d_]"), "[0-9_]");
+        assert_eq!(t(r"[^\w]"), "[^a-zA-Z0-9_]");
+        assert_eq!(t(r"\W"), "[^a-zA-Z0-9_]");
+        assert_eq!(t(r"[\D]"), "[[^0-9]]");
+        assert_eq!(t(r"\bx\b"), r"(?-u:\b)x(?-u:\b)");
+        assert_eq!(t(r"b$"), r"b(?:\n?\z)");
+        assert_eq!(t(r"[$]"), "[$]");
+        assert_eq!(t(r"\$"), r"\$");
+        assert_eq!(t(r"(?m)b$"), "(?m)b$");
+        assert_eq!(t(r"(?i)ab"), "(?i)ab");
+        assert_eq!(t(r"[]a]"), r"[\]a]");
+        assert_eq!(t(r"\p{L}+"), r"\p{L}+");
+        for bad in [r"(?u)a", r"(?U)a", r"\p{Alpha}", r"\p{IsAlphabetic}", r"a\"] {
+            assert!(translate_java_pattern(bad).is_err(), "{bad}");
+        }
+        let re = Regex::new(&t(r"b$")).unwrap();
+        assert!(re.is_match("ab\n"));
+        assert!(!re.is_match("ab\n\n"));
+        assert!(Regex::new(&t(r"\d")).unwrap().is_match("3"));
+        assert!(!Regex::new(&t(r"\d")).unwrap().is_match("٣"));
+        assert!(!Regex::new(&t(r"\w")).unwrap().is_match("é"));
+        assert!(!Regex::new(&t(r"\s")).unwrap().is_match("\u{a0}"));
+        assert_eq!(
+            Regex::new(&t(r"\b")).unwrap().replace_all("aé b", "|"),
+            "|a|é |b|"
+        );
+        assert_eq!(
+            Regex::new(&t(r"\W")).unwrap().replace_all("José", ""),
+            "Jos"
+        );
     }
 
     #[test]
