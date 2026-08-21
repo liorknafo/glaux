@@ -69,3 +69,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: ci/check-no-fakecloud-deps.sh
+
+  flagship-pipeline:
+    name: flagship pipeline (EventBridge → SQS → Firehose → Parquet → Athena)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The Rust integration test drives the pipeline over the wire against
+      # the all-in-one `glaux` binary, with a fakecloud process for the
+      # EventBridge hop (downloaded from GitHub releases by the test itself).
+      # GLAUX_REQUIRE_FAKECLOUD turns "fakecloud unavailable" from a skip
+      # into a failure so CI can never go green by skipping.
+      - run: cargo test -p glaux --test flagship_pipeline_it -- --nocapture
+        env:
+          GLAUX_REQUIRE_FAKECLOUD: "1"
+      # The same flow as a shell script over the AWS CLI — what the README
+      # demo and the release gate run.
+      - run: examples/flagship-pipeline.sh
+        env:
+          GLAUX_BIN: target/debug/glaux
