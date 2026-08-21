@@ -536,7 +536,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "split(varchar, delimiter) → array(varchar)",
         "String",
         Rewrite,
-        "Rust UDF `trino_split`: `split('', ',')` is `['']` and an empty delimiter splits into characters, as in Trino. The 3-argument `split(x, delimiter, limit)` form is refused.",
+        "Rust UDF `trino_split`: `split('', ',')` is `['']` (DataFusion's `string_to_array` gives `[]`) and an empty delimiter is an `INVALID_FUNCTION_ARGUMENT` error (`The delimiter may not be the empty string`), as in Trino — only `split_part` splits into characters on it. The 3-argument `split(x, delimiter, limit)` form is refused.",
         ["trino_split"]
     ),
     shim!(
@@ -609,7 +609,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "regexp_extract(varchar, pattern[, group]) → varchar",
         "Regular expression",
         Rewrite,
-        "Rust UDF `trino_regexp_extract`: `group` must be a literal and is checked against the pattern's capture groups (`Pattern has 1 groups. Cannot access group 2`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b` are ASCII-only and `$` also matches before a final newline, as in Trino's engine (Rust's Unicode-aware defaults would differ); look-around, back-references, `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors.",
+        "Rust UDF `trino_regexp_extract`: `group` must be a literal and is checked against the pattern's capture groups (`Pattern has 1 groups. Cannot access group 2`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b` are ASCII-only and `$` also matches before a final newline, as in Trino's engine (Rust's Unicode-aware defaults would differ); look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors.",
         ["trino_regexp_extract"]
     ),
     shim!(
@@ -625,7 +625,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "regexp_like(varchar, pattern) → boolean",
         "Regular expression",
         Rewrite,
-        "Rust UDF `trino_regexp_like`. Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b` are ASCII-only and `$` also matches before a final newline, as in Trino's engine (Rust's Unicode-aware defaults would differ); look-around, back-references, `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors.",
+        "Rust UDF `trino_regexp_like`. Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b` are ASCII-only and `$` also matches before a final newline, as in Trino's engine (Rust's Unicode-aware defaults would differ); look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors.",
         ["trino_regexp_like"]
     ),
     shim!(
@@ -633,7 +633,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "regexp_replace(varchar, pattern[, replacement]) → varchar",
         "Regular expression",
         Rewrite,
-        "Rust UDF `trino_regexp_replace`: every match is replaced, the replacement uses Java syntax (`$1x` is group 1 then `x`, `${name}` a named group, `\\$` a literal dollar) and every group reference is validated against the pattern (`No group 2`, `No group with name {y}`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b` are ASCII-only and `$` also matches before a final newline, as in Trino's engine (Rust's Unicode-aware defaults would differ); look-around, back-references, `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors. The lambda form is refused.",
+        "Rust UDF `trino_regexp_replace`: every match is replaced, the replacement uses Java syntax (`$1x` is group 1 then `x`, `${name}` a named group, `\\$` a literal dollar) and every group reference is validated against the pattern (`No group 2`, `No group with name {y}`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b` are ASCII-only and `$` also matches before a final newline, as in Trino's engine (Rust's Unicode-aware defaults would differ); look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors. The lambda form is refused.",
         ["trino_regexp_replace"]
     ),
     shim!(
@@ -714,7 +714,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "date_parse(varchar, format) → timestamp",
         "Date and time",
         Rewrite,
-        "`to_timestamp(x, <strftime>)` with the MySQL-style format translated, cast to a zone-less `timestamp(3)` (fractions beyond milliseconds are truncated, as Joda does); the format must be a literal and the input a varchar. `%f` accepts 1-9 fractional digits when parsing, like Trino, but only directly after a `.`.",
+        "`to_timestamp(x, <strftime>)` with the MySQL-style format translated, cast to a zone-less `timestamp(3)` (fractions beyond milliseconds are truncated, as Joda does); the format must be a literal and the input a varchar. `%f` accepts 1-9 fractional digits when parsing, like Trino, but only directly after a `.`. A second of `60` (chrono's leap second, which DataFusion would roll over to the next minute) is refused with Joda's `Value 60 for secondOfMinute must be in the range [0,59]`.",
         ["to_timestamp", "arrow_cast"]
     ),
     shim!(
@@ -778,7 +778,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "format_datetime(timestamp, pattern) → varchar",
         "Date and time",
         Rewrite,
-        "`to_char(x, <strftime>)` with the Joda pattern translated; the pattern must be a literal and unknown pattern letters are refused. `Z` / `ZZ` / `ZZZ` print `+0000` / `+00:00` / `UTC` (timestamps are UTC instants).",
+        "`to_char(x, <strftime>)` with the Joda pattern translated; the pattern must be a literal and unknown pattern letters are refused. Numeric fields honour Joda's letter count as a minimum digit count (`D` prints `5`, `DDD` `005`, `w` `1`, `ww` `01`, `H:m:s` `14:5:9`); counts chrono cannot pad to (`DD`, `yyyyy`, `ddd`, `ee`, ...) are refused by name. `Z` / `ZZ` / `ZZZ` print `+0000` / `+00:00` / `UTC` (timestamps are UTC instants).",
         ["to_char"]
     ),
     shim!(
@@ -1003,7 +1003,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "log(base, x) → double",
         "Math",
         Passthrough,
-        "DataFusion `log(base, x)` (same argument order)",
+        "DataFusion `log(base, x)` (same argument order). Trino has only the two-argument form: `log(x)` is refused (DataFusion would run it as `log10`); use `log10`, `log2`, or `ln`.",
         ["log"]
     ),
     shim!(
@@ -1424,7 +1424,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Subqueries (derived tables, scalar, IN, EXISTS)",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "Correlated `EXISTS` / `IN` are decorrelated by DataFusion.",
+        notes: "Correlated `EXISTS` / `IN` are decorrelated by DataFusion. A scalar subquery that returns no rows is NULL, also over a non-nullable source such as `VALUES` or a literal (DataFusion alone would fail with `declared as non-nullable but contains null values`).",
         corpus_marker: "EXISTS (",
     },
     Construct {
@@ -1452,7 +1452,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "UNION / UNION ALL / INTERSECT / EXCEPT",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "Corresponding columns must have comparable types (`SELECT 1 UNION SELECT 'a'` is a `TYPE_MISMATCH`, as on Athena). The result types follow Trino: `SELECT 1 UNION SELECT 1` is `integer`, `1 UNION ALL 1.5` is `decimal(11,1)`, and `1.5 UNION 2e0` is `double` (DataFusion alone would report `bigint`, `decimal(21,1)`, and `decimal(30,15)`). `FETCH FIRST n ROWS WITH TIES` is refused.",
+        notes: "Corresponding columns must have comparable types (`SELECT 1 UNION SELECT 'a'` is a `TYPE_MISMATCH`, as on Athena). The result types follow Trino: `SELECT 1 UNION SELECT 1` is `integer`, `1 UNION ALL 1.5` is `decimal(11,1)`, and `1.5 UNION 2e0` is `double` (DataFusion alone would report `bigint`, `decimal(21,1)`, and `decimal(30,15)`). `INTERSECT ALL` keeps the minimum multiplicity of each row, as on Trino; `EXCEPT ALL` (bag difference on Trino: `{1, 1, 1} EXCEPT ALL {1}` is `{1, 1}`) is refused by name because DataFusion plans it as an anti-join that drops every matching row. `FETCH FIRST n ROWS WITH TIES` is refused, as are the `BY NAME` quantifiers.",
         corpus_marker: "UNION ALL",
     },
     Construct {
@@ -1487,7 +1487,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "INTERVAL literals",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "`INTERVAL '<n>' YEAR | MONTH | DAY | HOUR | MINUTE | SECOND` (a whole number, optionally signed; a fraction only for `SECOND`) and `timestamp ± interval` arithmetic. PostgreSQL interval strings DataFusion would accept (`INTERVAL '1 day'`, `'1 hour 30 minutes'`) are refused as syntax errors, and the range forms (`INTERVAL '1-2' YEAR TO MONTH`, `'1 02:03:04' DAY TO SECOND`) and `interval * n` are refused by name. `date ± interval` requires a whole number of days (`DATE '2024-01-05' + INTERVAL '1' HOUR` is an error, as on Trino, where DataFusion would drop the hour). `date - date`, `timestamp - timestamp`, and `interval + interval` (an `interval` result in Trino) are refused; use `date_diff`.",
+        notes: "`INTERVAL '<n>' YEAR | MONTH | DAY | HOUR | MINUTE | SECOND` (a whole number, optionally signed; a fraction only for `SECOND`) and `timestamp ± interval` arithmetic. PostgreSQL interval strings DataFusion would accept (`INTERVAL '1 day'`, `'1 hour 30 minutes'`) are refused as syntax errors, and the range forms (`INTERVAL '1-2' YEAR TO MONTH`, `'1 02:03:04' DAY TO SECOND`) and `interval * n` are refused by name. `date ± interval` requires a whole number of days (`DATE '2024-01-05' + INTERVAL '1' HOUR` is an error, as on Trino, where DataFusion would drop the hour). `date - date`, `timestamp - timestamp`, and `interval + interval` (an `interval` result in Trino) are refused; use `date_diff`. Comparing intervals (`INTERVAL '1' DAY = INTERVAL '24' HOUR`, true on Trino, which compares the normalised milliseconds / months and refuses mixed kinds) is refused by name, because DataFusion compares its month/day/nanosecond triple structurally and would answer false.",
         corpus_marker: "INTERVAL '",
     },
     Construct {
@@ -1501,7 +1501,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "BETWEEN / IN (list) / LIKE / IS [NOT] NULL / IS DISTINCT FROM",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "`LIKE` has no default escape character, as in Trino: a backslash in the pattern is literal (`'a_c' LIKE 'a\\_c'` is false) unless an `ESCAPE` clause names it; the escape character must precede `%`, `_`, or itself. `ILIKE`, `SIMILAR TO`, and `LIKE ANY` are refused as non-Trino syntax. Array comparison follows Trino's NULL-element rules: `ARRAY[1, NULL] = ARRAY[1, NULL]` is NULL (a definite element mismatch or a length mismatch is `false`), and ordering arrays with NULL elements (`<`, `ORDER BY`) is an error, `ARRAY comparison not supported for arrays with null elements`.",
+        notes: "`LIKE` has no default escape character, as in Trino: a backslash in the pattern is literal (`'a_c' LIKE 'a\\_c'` is false) unless an `ESCAPE` clause names it; the escape character must precede `%`, `_`, or itself. `ILIKE`, `SIMILAR TO`, `LIKE ANY`, and the `IS [NOT] TRUE` / `IS [NOT] FALSE` / `IS [NOT] UNKNOWN` predicates (not in Trino's grammar; DataFusion would evaluate them) are refused as non-Trino syntax. Array comparison follows Trino's NULL-element rules: `ARRAY[1, NULL] = ARRAY[1, NULL]` is NULL (a definite element mismatch or a length mismatch is `false`), and ordering arrays with NULL elements (`<`, `ORDER BY`) is an error, `ARRAY comparison not supported for arrays with null elements`.",
         corpus_marker: "IS DISTINCT FROM",
     },
     Construct {
@@ -1529,7 +1529,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Numeric literals",
         category: "Semantics",
         status: ConstructStatus::Supported,
-        notes: "`1` is `INTEGER` (when it fits in 32 bits, else `BIGINT`), `1.5` and `DECIMAL '1.5'` are `DECIMAL(2,1)`, `1e2` is `DOUBLE`, and an integer literal beyond bigint is a `DECIMAL(p, 0)`, as in Trino, so `0.1 + 0.2` is exactly `0.3` and `SELECT 1` reports `integer`. Decimal arithmetic follows Trino's result types and rounding: `+ - *` use Trino's precision/scale with `Decimal overflow` errors past 38 digits, and `/` rounds HALF_UP to `max(s1, s2)` places (`1.5 / 2` is `0.8`, `10.00 / 3` is `3.33`). A double mixed with an exact number (`least(1.5, 2e0)`) is a double. Literals above 38 digits are refused.",
+        notes: "`1` is `INTEGER` (when it fits in 32 bits, else `BIGINT`), `1.5` and `DECIMAL '1.5'` are `DECIMAL(2,1)`, `1e2` is `DOUBLE`, and an integer literal beyond bigint is a `DECIMAL(p, 0)`, as in Trino, so `0.1 + 0.2` is exactly `0.3` and `SELECT 1` reports `integer`. A unary minus directly on an integer literal is part of the literal, as in Trino's grammar: `-9223372036854775808` is a `bigint` (not a `decimal(19,0)`) and `-9223372036854775808 - 1` overflows. Decimal arithmetic follows Trino's result types and rounding: `+ - *` use Trino's precision/scale with `Decimal overflow` errors past 38 digits, and `/` rounds HALF_UP to `max(s1, s2)` places (`1.5 / 2` is `0.8`, `10.00 / 3` is `3.33`). A double mixed with an exact number (`least(1.5, 2e0)`) is a double. Literals above 38 digits are refused.",
         corpus_marker: "0.5",
     },
     Construct {
@@ -1620,7 +1620,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Non-Trino syntax",
         category: "Unsupported",
         status: ConstructStatus::Unsupported,
-        notes: "Syntax DataFusion accepts but Trino does not is refused by name instead of running with DataFusion semantics: `DISTINCT ON`, `QUALIFY`, `GROUP BY ALL`, `ORDER BY ALL`, `TABLESAMPLE`, `FOR UPDATE`, `NATURAL` / `SEMI` / `ANTI` / `APPLY` / `ASOF` joins, `[1, 2]` array literals, `x::type` casts, `TOP`, `SELECT INTO`, `SELECT * EXCLUDE`, `ILIKE`, the operators Trino lacks (`&`, `|`, `^`, `~`, `==`, `<=>`, `->`, and the other PostgreSQL operators — use `bitwise_and`, `regexp_like`, ...), a string literal as an alias (`SELECT 'a' 'b'`), PostgreSQL interval strings (`INTERVAL '1 day'`), `JOIN` without `ON` / `USING`, `FLOAT` as a type name, `0x1F` literals, and a number glued to identifier characters (`1_000`, which Trino rejects and sqlparser would read as `1 AS _000`).",
+        notes: "Syntax DataFusion accepts but Trino does not is refused by name instead of running with DataFusion semantics: `DISTINCT ON`, `QUALIFY`, `GROUP BY ALL`, `ORDER BY ALL`, `TABLESAMPLE`, `FOR UPDATE`, `NATURAL` / `SEMI` / `ANTI` / `APPLY` / `ASOF` joins, `[1, 2]` array literals, `x::type` casts, `TOP`, `SELECT INTO`, `SELECT * EXCLUDE`, `ILIKE`, `IS [NOT] TRUE` / `IS [NOT] FALSE` / `IS [NOT] UNKNOWN`, the operators Trino lacks (`&`, `|`, `^`, `~`, `==`, `<=>`, `->`, and the other PostgreSQL operators — use `bitwise_and`, `regexp_like`, ...), a string literal as an alias (`SELECT 'a' 'b'`), PostgreSQL interval strings (`INTERVAL '1 day'`), `JOIN` without `ON` / `USING`, `FLOAT` as a type name, `0x1F` literals, and a number glued to identifier characters (`1_000`, which Trino rejects and sqlparser would read as `1 AS _000`).",
         corpus_marker: "",
     },
     Construct {
