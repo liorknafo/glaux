@@ -51,13 +51,15 @@ async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 bytes = "1"
+flate2 = "1"
 futures = "0.3"
 thiserror = "2"
 toml = "0.9"
 uuid = { version = "1", features = ["v4"] }
 
-# Test-only helpers (referenced from crate dev-dependencies)
 parquet = "59.2"
+
+# Test-only helpers (referenced from crate dev-dependencies)
 tempfile = "3"
 aws-sdk-athena = "1"
 aws-sdk-firehose = "1"

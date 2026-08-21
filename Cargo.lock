@@ -2124,13 +2124,18 @@ dependencies = [
 name = "glaux-firehose"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "async-trait",
  "aws-credential-types",
  "aws-sdk-firehose",
  "axum",
  "base64 0.22.1",
  "bytes",
+ "chrono",
+ "flate2",
  "glaux-catalog",
+ "object_store",
+ "parquet",
  "serde",
  "serde_json",
  "thiserror",

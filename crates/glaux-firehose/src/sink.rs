@@ -36,6 +36,9 @@ pub struct FlushBatch {
     pub stream_name: String,
     /// The delivery stream ARN.
     pub stream_arn: String,
+    /// The delivery stream `VersionId` the destination was accepted under
+    /// (the `<DeliveryStreamVersion>` component of S3 object names).
+    pub stream_version: String,
     /// The destination as configured when the flush happened.
     pub destination: Arc<ExtendedS3DestinationDescription>,
     /// The records, in acceptance order, exactly as the producer sent them.

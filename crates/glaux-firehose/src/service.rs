@@ -30,6 +30,7 @@ use serde_json::Value;
 use crate::buffer::StreamBuffer;
 use crate::error::FirehoseError;
 use crate::model::*;
+use crate::prefix::{PrefixError, validate_prefix};
 use crate::sink::{DeliverySink, FlushReason, SinkError};
 
 const DEFAULT_LIST_LIMIT: usize = 10;
@@ -230,13 +231,33 @@ fn validate_conversion(
             )));
         }
     }
+    if let Some(version) = schema.version_id.as_deref()
+        && version != "LATEST"
+    {
+        return Err(FirehoseError::invalid_argument(format!(
+            "DataFormatConversionConfiguration.SchemaConfiguration.VersionId {version:?} is not \
+             supported by glaux: only LATEST can be resolved from the Glue catalog"
+        )));
+    }
     let deserializer = conversion
         .input_format_configuration
         .as_ref()
         .and_then(|c| c.deserializer.as_ref())
         .and_then(Value::as_object);
     match deserializer {
-        Some(map) if map.contains_key("OpenXJsonSerDe") || map.contains_key("HiveJsonSerDe") => {}
+        Some(map) if map.contains_key("OpenXJsonSerDe") => {}
+        Some(map) if map.contains_key("HiveJsonSerDe") => {
+            let formats = map["HiveJsonSerDe"]
+                .get("TimestampFormats")
+                .and_then(Value::as_array)
+                .is_some_and(|f| !f.is_empty());
+            if formats {
+                return Err(FirehoseError::invalid_argument(
+                    "InputFormatConfiguration.Deserializer.HiveJsonSerDe.TimestampFormats is not \
+                     implemented by glaux: timestamps must be epoch numbers or ISO-8601 strings",
+                ));
+            }
+        }
         Some(map) => {
             let names: Vec<_> = map.keys().cloned().collect();
             return Err(FirehoseError::invalid_argument(format!(
@@ -348,11 +369,48 @@ fn resolve_destination(
         .compression_format
         .or_else(|| current.map(|c| c.compression_format))
         .unwrap_or_default();
+    if !matches!(
+        compression_format,
+        CompressionFormat::Uncompressed | CompressionFormat::Gzip
+    ) {
+        return Err(FirehoseError::invalid_argument(format!(
+            "CompressionFormat {} is not implemented by glaux: use UNCOMPRESSED or GZIP",
+            compression_format.as_str()
+        )));
+    }
     if conversion_enabled && compression_format != CompressionFormat::Uncompressed {
         return Err(FirehoseError::invalid_argument(format!(
             "CompressionFormat must be UNCOMPRESSED when DataFormatConversionConfiguration is \
              enabled (got {}); Parquet applies its own compression",
             compression_format.as_str()
+        )));
+    }
+
+    let prefix = config
+        .prefix
+        .clone()
+        .or_else(|| current.and_then(|c| c.prefix.clone()));
+    if let Some(prefix) = &prefix {
+        validate_prefix("Prefix", prefix, false)
+            .map_err(|PrefixError(message)| FirehoseError::invalid_argument(message))?;
+    }
+    let error_output_prefix = config
+        .error_output_prefix
+        .clone()
+        .or_else(|| current.and_then(|c| c.error_output_prefix.clone()));
+    if let Some(prefix) = &error_output_prefix {
+        validate_prefix("ErrorOutputPrefix", prefix, true)
+            .map_err(|PrefixError(message)| FirehoseError::invalid_argument(message))?;
+    }
+    let file_extension = config
+        .file_extension
+        .clone()
+        .or_else(|| current.and_then(|c| c.file_extension.clone()));
+    if let Some(ext) = &file_extension
+        && (!ext.starts_with('.') || ext.len() < 2 || ext.contains('/'))
+    {
+        return Err(FirehoseError::validation(format!(
+            "FileExtension {ext:?} is invalid: it must start with '.' and contain no '/'"
         )));
     }
 
@@ -818,7 +876,9 @@ impl FirehoseService {
             + 1;
         entry.description.version_id = next_version.to_string();
         entry.description.last_update_timestamp = now_epoch_seconds();
-        entry.buffer.update_destination(resolved);
+        entry
+            .buffer
+            .update_destination(resolved, entry.description.version_id.clone());
         Ok(())
     }
 

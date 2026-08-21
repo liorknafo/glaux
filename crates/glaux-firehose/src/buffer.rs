@@ -64,6 +64,8 @@ struct Pending {
 
 struct Inner {
     destination: Arc<ExtendedS3DestinationDescription>,
+    /// The stream `VersionId` matching `destination`.
+    version_id: String,
     size_bytes: usize,
     interval: Duration,
     pending: Option<Pending>,
@@ -161,6 +163,7 @@ impl StreamBuffer {
             sink,
             inner: Mutex::new(Inner {
                 destination,
+                version_id: "1".to_string(),
                 size_bytes: usize_from(hints.size_bytes()),
                 interval: hints.interval(),
                 pending: None,
@@ -211,13 +214,21 @@ impl StreamBuffer {
     /// apply immediately: an open buffer's deadline is recomputed from its
     /// opening time, and a buffer already over the new size threshold is
     /// flushed by the timer task right away.
-    pub fn update_destination(&self, destination: Arc<ExtendedS3DestinationDescription>) {
+    ///
+    /// `version_id` is the stream's new `VersionId`; it is reported on every
+    /// subsequent [`FlushBatch`] and ends up in S3 object names.
+    pub fn update_destination(
+        &self,
+        destination: Arc<ExtendedS3DestinationDescription>,
+        version_id: impl Into<String>,
+    ) {
         let hints = destination.buffering_hints.resolved();
         {
             let mut inner = self.inner.lock().unwrap();
             inner.size_bytes = usize_from(hints.size_bytes());
             inner.interval = hints.interval();
             inner.destination = destination;
+            inner.version_id = version_id.into();
             if let Some(pending) = &inner.pending {
                 let over_size = pending.bytes >= inner.size_bytes;
                 inner.deadline = Some(if over_size {
@@ -385,6 +396,7 @@ impl StreamBuffer {
         FlushBatch {
             stream_name: self.stream_name.clone(),
             stream_arn: self.stream_arn.clone(),
+            stream_version: inner.version_id.clone(),
             destination: Arc::clone(&inner.destination),
             records: pending.records,
             reason,
@@ -665,7 +677,7 @@ mod tests {
 
         // Shorten the interval to 30s: the buffer opened 20s ago, so it
         // must flush 10s from now.
-        b.update_destination(destination(128, 30));
+        b.update_destination(destination(128, 30), "2");
         tokio::time::advance(Duration::from_millis(9_999)).await;
         settle().await;
         assert!(sink.is_empty());
