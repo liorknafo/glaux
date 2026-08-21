@@ -1,0 +1,15 @@
+# CodeRabbit configuration for glaux.
+#
+# Generated test fixtures and recorded snapshots dominate the file count of
+# several PRs (a single dialect PR carries 350+ corpus cases), which pushes
+# reviews past CodeRabbit's 100-file limit and causes the review to be skipped
+# entirely. These files are data, not code under review: corpus cases are
+# checked by the test harness, and snapshots are recorded output. Excluding
+# them keeps reviews focused on source and lets them run at all.
+reviews:
+  auto_review:
+    enabled: true
+  path_filters:
+    - "!crates/*/tests/corpus/**"
+    - "!crates/*/tests/snapshots/**"
+    - "!**/Cargo.lock"
