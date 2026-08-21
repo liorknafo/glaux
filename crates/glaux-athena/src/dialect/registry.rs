@@ -1068,7 +1068,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "round(x[, d])",
         "Math",
         Rewrite,
-        "Rust UDF `trino_round`: for doubles exactly Trino's `Math.round(x · 10ⁿ) / 10ⁿ` (sign-flipped for negatives, Trino's BigInteger fallback when `Math.round` saturates), so the double product decides the tie: `round(2.675, 2)` is `2.68` (the product is exactly `267.5`, though the double `2.675` is below 2.675) but `round(1.005, 2)` is `1.0` (the product is `100.49999999999999`); integers keep their type (`round(1250, -2)` is `1300`); a `decimal(p, s)` rounds HALF_UP to `decimal(p - s + min(s, 1), 0)` with one argument and to `decimal(p + 1, s)` with two (`round(2.789, 2)` is `2.790`).",
+        "Rust UDF `trino_round`: for doubles exactly Trino's `Math.round(x · 10ⁿ) / 10ⁿ` (sign-flipped for negatives, Trino's BigInteger fallback when `Math.round` saturates), so the double product decides the tie: `round(2.675, 2)` is `2.68` (the product is exactly `267.5`, though the double `2.675` is below 2.675) but `round(1.005, 2)` is `1.0` (the product is `100.49999999999999`); DataFusion rounds the exact decimal instead and answers `2.67` / `1.01`. Trino declares the double overload `neverFails`, so the edge branches return values rather than erroring: a product that overflows to infinity gives `x` back (`round(1e308, 2)` is `1e308`) and an `n` so negative that `10ⁿ` underflows to zero gives a signed zero (`round(-1.5e0, -400)` is `-0.0`). Integers keep their type (`round(1250, -2)` is `1300`); a `decimal(p, s)` rounds HALF_UP to `decimal(p - s + min(s, 1), 0)` with one argument and to `decimal(p + 1, s)` with two (`round(2.789, 2)` is `2.790`).",
         ["trino_round"]
     ),
     shim!(
@@ -1092,7 +1092,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "truncate(x[, n])",
         "Math",
         Rewrite,
-        "Rust UDF `trino_truncate`: integers keep their type; a `decimal(p, s)` becomes `decimal(p - s + min(s, 1), 0)` with one argument and keeps `decimal(p, s)` with two (`truncate(2.789, 2)` is `2.780`); single-argument `truncate(double)` rounds toward zero. `truncate(double, n)` is refused: Trino (Athena engine v3) has no two-argument truncate for DOUBLE / REAL — it fails with unexpected parameters — and Presto 0.217 (engine v2) computed `truncate(x · 10ⁿ) / 10ⁿ`, a different value.",
+        "Rust UDF `trino_truncate`: integers keep their type; a `decimal(p, s)` becomes `decimal(p - s + min(s, 1), 0)` with one argument and keeps `decimal(p, s)` with two (`truncate(2.789, 2)` is `2.780`); single-argument `truncate(double)` is `signum(x) · floor(|x|)`. `truncate(double, n)` is refused by name: the two-argument overload exists only for DECIMAL — neither Trino (Athena engine v3) nor Presto 0.217 (engine v2) declares one for DOUBLE / REAL, so Athena answers it with a function-resolution error, and DataFusion's own two-argument trunc would silently return a value Athena never would.",
         ["trino_truncate"]
     ),
     // --- Array -------------------------------------------------------------

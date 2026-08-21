@@ -6,6 +6,7 @@
 //!   when `Math.round` saturates), so the double product decides:
 //!   `round(2.675, 2)` is `2.68` (the product is exactly `267.5`) but
 //!   `round(1.005, 2)` is `1.0` (the product is `100.49999999999999`).
+//!   DataFusion rounds the exact decimal instead and gives `2.67` / `1.01`.
 //!   Integer inputs keep their type
 //!   (`round(bigint, -2)` rounds the integer); decimals round HALF_UP
 //!   exactly into Trino's result type.
@@ -13,9 +14,11 @@
 //!   type in Trino (`floor(5)` is the bigint `5`, `sign(2.5)` is
 //!   `decimal(1,0)`); DataFusion returns a double for integers and keeps
 //!   the scale for decimals.
-//! - `truncate(double, n)` is refused: Trino (Athena engine v3) has no
-//!   two-argument truncate for DOUBLE/REAL, and Presto 0.217 (engine v2)
-//!   computed a different value; only the DECIMAL overload exists.
+//! - `truncate(double, n)` is refused: the two-argument overload is
+//!   DECIMAL-only in both Trino (Athena engine v3) and Presto 0.217
+//!   (engine v2), so Athena answers it with a function-resolution error.
+//!   DataFusion's two-argument `trunc` would happily return a value
+//!   instead.
 
 use std::sync::Arc;
 
@@ -34,7 +37,6 @@ use datafusion::logical_expr::{
 use super::casts::trino_type_name;
 use super::decimal::MAX_PRECISION;
 use super::{data_error, is_integer, type_mismatch, unsupported_error};
-use crate::results::java_double_text;
 
 /// The math UDFs.
 pub fn all() -> Vec<ScalarUDF> {
@@ -174,45 +176,49 @@ fn java_math_round(a: f64) -> i64 {
     }
 }
 
-/// Trino's `round(double, n)` (MathFunctions.java, identical in 407 and
-/// master): `factor = Math.pow(10, n)`, `Math.round(|x| · factor) / factor`
-/// with the sign reapplied, so the rounding sees the double product, not
-/// the exact decimal: `round(2.675, 2)` is `2.68` (the product is exactly
-/// `267.5`, though the double `2.675` is below 2.675) but `round(1.005, 2)`
-/// is `1.0` (the product is `100.49999999999999`). When `Math.round`
-/// saturates Trino falls back to
-/// Guava's `DoubleMath.roundToBigInteger(…, HALF_UP)`, which is the exact
-/// division for a finite product and throws for an infinite one.
-pub(crate) fn trino_round_double(x: f64, decimals: i64) -> Result<f64> {
+/// Trino's `round(double, n)`, statement for statement from
+/// `MathFunctions.round(double, long)`: `factor = Math.pow(10, n)`, then
+/// `Math.round(|x| · factor) / factor` with the sign reapplied. The
+/// rounding therefore sees the *double product*, not the exact decimal:
+/// `round(2.675, 2)` is `2.68` (the product is exactly `267.5`, though the
+/// double `2.675` is below 2.675) but `round(1.005, 2)` is `1.0` (the
+/// product is `100.49999999999999`).
+///
+/// Three edge branches come straight from Trino and each returns a value —
+/// the function is declared `neverFails = true` there, so it has no error
+/// path at all:
+///
+/// - `factor == 0` (n ≲ -324, where `10ⁿ` underflows): every finite `x`
+///   rounds to `sign · 0.0`, so negatives give `-0.0`.
+/// - `Math.round` saturating at `Long.MAX_VALUE` with a *finite* product:
+///   Guava's `DoubleMath.roundToBigInteger(…, HALF_UP)`. A finite double
+///   ≥ 2⁶³ is already integral, so that round-trip is the identity and the
+///   result is just the division.
+/// - `Math.round` saturating with an *infinite* product: `x` unchanged
+///   (Trino's comment notes rounding is a no-op at that magnitude).
+pub(crate) fn trino_round_double(x: f64, decimals: i64) -> f64 {
     if x.is_nan() || x.is_infinite() {
-        return Ok(x);
+        return x;
     }
     let factor = pow10_f64(decimals);
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    if factor == 0.0 {
+        return sign * 0.0;
+    }
     let rescaled = sign * x * factor;
     let rounded = java_math_round(rescaled);
     if rounded != i64::MAX {
-        return Ok(sign * (rounded as f64 / factor));
+        return sign * (rounded as f64 / factor);
     }
     if rescaled.is_infinite() {
-        // Trino's fallback throws `ArithmeticException("input is infinite
-        // or NaN")` from Guava here; fail loudly the same way.
-        return Err(data_error(
-            "GENERIC_INTERNAL_ERROR",
-            format!(
-                "round: input is infinite or NaN ({} · 10^{decimals} overflows a double, an error on Trino too)",
-                java_double_text(x)
-            ),
-        ));
+        return x;
     }
-    // A finite double >= 2^63 is integral, so the BigInteger round-trip in
-    // Trino's fallback returns it exactly and the result is the division.
-    Ok(sign * (rescaled / factor))
+    sign * (rescaled / factor)
 }
 
-/// Trino's single-argument `truncate(double)`: round toward zero. The
-/// two-argument DOUBLE/REAL form does not exist on Trino and is refused in
-/// [`TrinoMath::return_type`].
+/// Trino's single-argument `truncate(double)`:
+/// `Math.signum(x) · Math.floor(|x|)`. The two-argument DOUBLE / REAL form
+/// does not exist on Trino and is refused in [`TrinoMath::return_type`].
 pub(crate) fn trino_truncate_double(x: f64) -> f64 {
     if !x.is_finite() {
         return x;
@@ -412,7 +418,7 @@ impl ScalarUDFImpl for TrinoMath {
             DataType::Null => cast(&input, &DataType::Float64)?,
             DataType::Float64 => map_primitive::<Float64Type>(&input, |x| {
                 Ok(match (op, decimals) {
-                    (MathOp::Round, n) => trino_round_double(x, n.unwrap_or(0))?,
+                    (MathOp::Round, n) => trino_round_double(x, n.unwrap_or(0)),
                     (MathOp::Floor, _) => x.floor(),
                     (MathOp::Ceil, _) => x.ceil(),
                     (MathOp::Truncate, _) => trino_truncate_double(x),
@@ -428,7 +434,7 @@ impl ScalarUDFImpl for TrinoMath {
             DataType::Float32 => map_primitive::<Float32Type>(&input, |x| {
                 let x = f64::from(x);
                 Ok(match (op, decimals) {
-                    (MathOp::Round, n) => trino_round_double(x, n.unwrap_or(0))? as f32,
+                    (MathOp::Round, n) => trino_round_double(x, n.unwrap_or(0)) as f32,
                     (MathOp::Floor, _) => x.floor() as f32,
                     (MathOp::Ceil, _) => x.ceil() as f32,
                     (MathOp::Truncate, _) => trino_truncate_double(x) as f32,
@@ -486,7 +492,7 @@ mod tests {
 
     #[test]
     fn round_double_matches_trino_math_round() {
-        let round = |x, n| trino_round_double(x, n).unwrap();
+        let round = trino_round_double;
         // The double product re-rounds: 2.675 · 100 is exactly 267.5.
         assert_eq!(round(2.675, 2), 2.68);
         assert_eq!(round(1.115, 2), 1.12);
@@ -508,8 +514,15 @@ mod tests {
         assert_eq!(round(0.0, 400), 0.0); // 0 · Infinity is NaN; Math.round(NaN) = 0
         assert!(round(f64::NAN, 2).is_nan());
         assert_eq!(round(f64::INFINITY, 2), f64::INFINITY);
-        // An infinite product raises Guava's ArithmeticException on Trino.
-        assert!(trino_round_double(1.0e308, 2).is_err());
+        // A product that overflows to infinity returns the input unchanged
+        // (rounding is a no-op at that magnitude), it does not fail: Trino
+        // declares round `neverFails = true`.
+        assert_eq!(round(1.0e308, 2), 1.0e308);
+        // `10ⁿ` underflowing to 0 rounds every finite input to a signed
+        // zero — the branch that would otherwise divide 0 by 0 and give NaN.
+        assert_eq!(round(1.5, -400), 0.0);
+        assert!(round(1.5, -400).is_sign_positive());
+        assert!(round(-1.5, -400).is_sign_negative());
     }
 
     #[test]
