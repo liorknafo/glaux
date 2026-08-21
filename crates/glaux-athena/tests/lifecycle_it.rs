@@ -1,7 +1,9 @@
 //! Full Athena lifecycle through the real `aws-sdk-athena` client against an
 //! in-process glaux server: start → poll → page results, failure shapes,
 //! cancellation of a running DataFusion scan, listing/batch lookups,
-//! workgroups, and the CSV written to the `OutputLocation`.
+//! workgroups, and the CSV written to the `OutputLocation`. Queries run
+//! through the Trino dialect layer ([`TrinoEngine`]), as they do in the
+//! binaries.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -32,7 +34,7 @@ use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use futures::TryStreamExt;
 use glaux_athena::http::router;
-use glaux_athena::{AthenaService, AthenaServiceConfig, DataFusionEngine};
+use glaux_athena::{AthenaService, AthenaServiceConfig, TrinoEngine};
 use glaux_catalog::{CatalogError, ObjectSummary, StorageBackend};
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
@@ -286,7 +288,7 @@ async fn start() -> Harness {
     });
     let service = Arc::new(AthenaService::new(
         AthenaServiceConfig::default(),
-        Arc::new(DataFusionEngine::new(ctx, "datafusion")),
+        Arc::new(TrinoEngine::new(ctx, "datafusion")),
         Arc::clone(&storage) as Arc<dyn StorageBackend>,
     ));
 
@@ -613,6 +615,56 @@ async fn bad_sql_fails_with_athena_error_details_not_fake_rows() {
         }
         other => panic!("expected InvalidRequestException, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn trino_dialect_runs_and_unsupported_constructs_fail_by_name() {
+    let h = start().await;
+
+    // Trino-only functions and argument orders work through the SDK.
+    let id = start_query(
+        &h,
+        "SELECT id, if(active, 'yes', 'no') AS flag, \
+                date_diff('day', DATE '2024-01-01', CAST(seen_at AS DATE)) AS days, \
+                element_at(split(name, 'n'), 1) AS head \
+         FROM people WHERE id = 1",
+    )
+    .await;
+    let qe = wait_terminal(&h, &id).await;
+    assert_eq!(
+        qe.status().unwrap().state(),
+        Some(&QueryExecutionState::Succeeded),
+        "{qe:?}"
+    );
+    let (rows, columns) = all_rows(&h, &id, 10).await;
+    assert_eq!(
+        columns.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+        ["bigint", "varchar", "bigint", "varchar"]
+    );
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(rows[0], vec![s("id"), s("flag"), s("days"), s("head")]);
+    // ann, active, seen 2024-01-31T12:34:56.789Z → 30 days after New Year.
+    assert_eq!(rows[1], vec![s("1"), s("yes"), s("30"), s("a")]);
+
+    // A construct glaux cannot translate fails the query with a user-category
+    // AthenaError naming the construct — no rows are ever synthesised.
+    let id = start_query(&h, "SELECT transform(ARRAY[1, 2], x -> x + 1)").await;
+    let qe = wait_terminal(&h, &id).await;
+    let status = qe.status().unwrap();
+    assert_eq!(status.state(), Some(&QueryExecutionState::Failed));
+    let err = status.athena_error().expect("AthenaError details");
+    assert_eq!(err.error_category(), Some(2), "user error");
+    assert_eq!(err.error_type(), Some(1003), "NOT_SUPPORTED");
+    let message = err.error_message().unwrap();
+    assert!(message.contains("NOT_SUPPORTED"), "{message}");
+    assert!(message.contains("lambda expression"), "{message}");
+
+    // Unknown functions are refused even when DataFusion has a same-named
+    // function with different semantics.
+    let id = start_query(&h, "SELECT repeat('a', 3)").await;
+    let qe = wait_terminal(&h, &id).await;
+    let reason = qe.status().unwrap().state_change_reason().unwrap();
+    assert!(reason.contains("function repeat"), "{reason}");
 }
 
 #[tokio::test]
