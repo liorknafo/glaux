@@ -2066,6 +2066,16 @@ fn check_passthrough_arity(name: &str, f: &Function) -> Result<(), GlauxSqlError
         FunctionArguments::List(list) => list.args.len(),
         _ => return Ok(()),
     };
+    // Trino declares only `count()` and `count(x)`; `count(DISTINCT a, b)`
+    // is an unknown overload there. DataFusion answers "This feature is not
+    // implemented: COUNT DISTINCT with multiple arguments", which reads as
+    // a glaux TODO rather than a refusal Athena would make too.
+    if name == "count" && count > 1 {
+        return Err(GlauxSqlError::type_mismatch(format!(
+            "Unexpected parameters ({count} arguments) for function count. Expected: count(), \
+             count(t)"
+        )));
+    }
     match (name, count) {
         ("strpos", 3) => Err(GlauxSqlError::invalid_arguments(
             name,
@@ -2241,29 +2251,30 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             } else {
                 joda_to_chrono(name, &fmt, Direction::Parse)?
             };
-            // `date_parse` is a zone-less `timestamp(3)`; `parse_datetime`
-            // is a `timestamp(3) with time zone` (UTC). DataFusion's
-            // `to_timestamp` is nanosecond-precise; the cast truncates like
-            // Joda's fraction parser.
-            let target = if name == "date_parse" {
-                "Timestamp(Millisecond, None)"
-            } else {
-                "Timestamp(Millisecond, Some(\"UTC\"))"
-            };
-            // chrono accepts a leap second (`:60`) and DataFusion would
-            // roll it over into the next minute; Joda rejects it. The
-            // check UDF returns its input unchanged.
-            let checked = func(
-                "trino_check_parsed_time",
-                vec![args[0].clone(), str_lit(&chrono)],
-            );
-            func(
-                "arrow_cast",
+            // `date_parse` is a zone-less `timestamp(3)`, which is what
+            // the UDF returns; `parse_datetime` is a `timestamp(3) with
+            // time zone` (UTC), so its result is re-tagged.
+            let target = "Timestamp(Millisecond, Some(\"UTC\"))";
+            // DataFusion's `to_timestamp` resolves the parsed fields with
+            // chrono, which drops the whole time of day when the format
+            // names an hour but no minute (or a 12-hour field with no
+            // AM/PM) and rolls a leap second over into the next minute.
+            // `trino_date_parse` follows Joda: epoch defaults for every
+            // field the format does not name, and a loud refusal for `:60`.
+            let parsed = func(
+                "trino_date_parse",
                 vec![
-                    func("to_timestamp", vec![checked, str_lit(&chrono)]),
-                    str_lit(target),
+                    args[0].clone(),
+                    str_lit(&chrono),
+                    str_lit(name),
+                    str_lit(&fmt),
                 ],
-            )
+            );
+            if name == "date_parse" {
+                parsed
+            } else {
+                func("arrow_cast", vec![parsed, str_lit(target)])
+            }
         }
         "date_format" | "format_datetime" => {
             arity(name, &args, &[2])?;
@@ -2324,6 +2335,17 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             day_of_week(args.into_iter().next().unwrap())
         }
         // Math
+        // Trino's two float constructors. glaux has no way to write a NaN
+        // or an infinite literal in the AST, and DataFusion's own parser
+        // has no such function; `trino_double` is glaux's `CAST(varchar AS
+        // DOUBLE)`, which follows Java's `Double.parseDouble` and so reads
+        // exactly `NaN` and `Infinity` (`-infinity()` is the negation).
+        "nan" | "infinity" => {
+            require_scalar_call(name, f)?;
+            arity(name, &args, &[0])?;
+            let text = if name == "nan" { "NaN" } else { "Infinity" };
+            func("trino_double", vec![str_lit(text)])
+        }
         "mod" => {
             require_scalar_call(name, f)?;
             arity(name, &args, &[2])?;
@@ -2514,7 +2536,7 @@ mod tests {
     fn date_functions_translate_formats_and_units() {
         assert_eq!(
             rewrite("SELECT date_parse(s, '%Y-%m-%d %H:%i:%s') AS a, format_datetime(ts, 'yyyy-MM-dd') AS b, parse_datetime(s, 'yyyy') AS c FROM t").unwrap(),
-            "SELECT arrow_cast(to_timestamp(trino_check_parsed_time(s, '%Y-%m-%d %H:%M:%S'), '%Y-%m-%d %H:%M:%S'), 'Timestamp(Millisecond, None)') AS a, to_char(ts, '%Y-%m-%d') AS b, arrow_cast(to_timestamp(trino_check_parsed_time(s, '%Y'), '%Y'), 'Timestamp(Millisecond, Some(\"UTC\"))') AS c FROM t"
+            "SELECT trino_date_parse(s, '%Y-%m-%d %H:%M:%S', 'date_parse', '%Y-%m-%d %H:%i:%s') AS a, to_char(ts, '%Y-%m-%d') AS b, arrow_cast(trino_date_parse(s, '%Y', 'parse_datetime', 'yyyy'), 'Timestamp(Millisecond, Some(\"UTC\"))') AS c FROM t"
         );
         assert_eq!(
             rewrite("SELECT day_of_week(d) AS a, month(d) AS b FROM t").unwrap(),

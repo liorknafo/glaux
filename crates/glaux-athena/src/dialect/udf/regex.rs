@@ -419,23 +419,52 @@ fn parse_replacement(regex: &Regex, replacement: &str) -> Result<Vec<Piece>> {
     Ok(pieces)
 }
 
+/// Replace every match, advancing the way Trino's `JoniRegexpFunctions`
+/// does.
+///
+/// Rust's `Regex::replace_all` skips an empty match that starts where the
+/// previous match ended, so a pattern that can match the empty string
+/// produced one replacement too few at every such boundary
+/// (`regexp_replace('aaa', 'a*', 'X')` was `'X'`). Joni advances with
+/// `getNextStart`, which only skips forward when the match *itself* was
+/// zero-width, so the empty match right after a non-empty one is still
+/// emitted — `'XX'`, and `"abc".replaceAll("b*", "X")` is `"XaXXcX"` in
+/// Java for the same reason. The search also has to run once *at* the end
+/// of the text, which is where the final empty match comes from.
 fn replace_all(regex: &Regex, text: &str, pieces: &[Piece]) -> String {
-    regex
-        .replace_all(text, |caps: &regex::Captures| {
-            let mut out = String::new();
-            for piece in pieces {
-                match piece {
-                    Piece::Literal(s) => out.push_str(s),
-                    Piece::Group(i) => {
-                        if let Some(m) = caps.get(*i) {
-                            out.push_str(m.as_str());
-                        }
+    let mut out = String::with_capacity(text.len());
+    let mut last_end = 0;
+    let mut next_start = 0;
+    while next_start <= text.len() {
+        let Some(caps) = regex.captures_at(text, next_start) else {
+            break;
+        };
+        let matched = caps.get(0).expect("group 0 always matches");
+        out.push_str(&text[last_end..matched.start()]);
+        for piece in pieces {
+            match piece {
+                Piece::Literal(s) => out.push_str(s),
+                Piece::Group(i) => {
+                    if let Some(m) = caps.get(*i) {
+                        out.push_str(m.as_str());
                     }
                 }
             }
-            out
-        })
-        .into_owned()
+        }
+        last_end = matched.end();
+        next_start = if matched.is_empty() {
+            // Zero-width: step over one code point, or past the end.
+            matched.end()
+                + text[matched.end()..]
+                    .chars()
+                    .next()
+                    .map_or(1, char::len_utf8)
+        } else {
+            matched.end()
+        };
+    }
+    out.push_str(&text[last_end..]);
+    out
 }
 
 /// See the module docs.

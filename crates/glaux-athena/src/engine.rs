@@ -441,6 +441,32 @@ fn classify(err: DataFusionError) -> EngineError {
                         .to_string(),
                 };
             }
+            // A column name that resolves nowhere. DataFusion lists the
+            // schema ("No field named x. Valid fields are orders.id, ...")
+            // and sometimes guesses ("Did you mean 'c.tags'?"); Trino names
+            // the column and stops there.
+            if let Some(rest) = root_message.split("No field named ").nth(1) {
+                // The name ends at the first `.` that closes the sentence;
+                // a qualified `c.nope` keeps its own dot, which is followed
+                // by a letter rather than whitespace or the end of the text.
+                let end = rest
+                    .char_indices()
+                    .find(|(i, c)| {
+                        *c == '.' && rest[i + 1..].chars().next().is_none_or(char::is_whitespace)
+                    })
+                    .map_or(rest.len(), |(i, _)| i);
+                let name = rest[..end].replace('"', "");
+                return EngineError::Plan(format!("Column '{name}' cannot be resolved"));
+            }
+            // `SELECT DISTINCT ... ORDER BY x` where `x` is not selected.
+            // DataFusion names the column in its own qualified form and
+            // leaks the "Error during planning:" prefix.
+            if root_message.contains("For SELECT DISTINCT, ORDER BY expressions") {
+                return EngineError::Plan(
+                    "For SELECT DISTINCT, ORDER BY expressions must appear in select list"
+                        .to_string(),
+                );
+            }
             // A window function written without `OVER`: DataFusion cannot
             // resolve it as a scalar or aggregate and says `Invalid
             // function 'rank'.`. Every name that reaches the planner is in

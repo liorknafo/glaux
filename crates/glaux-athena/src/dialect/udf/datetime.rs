@@ -5,19 +5,28 @@
 //!   (DataFusion widens it to a timestamp), sub-day units on a `DATE` are
 //!   errors, and varchar input is refused (DataFusion would parse it).
 //! - `to_unixtime(timestamp)` refuses varchar input for the same reason.
-//! - `trino_check_parsed_time(text, chrono_format)` guards `date_parse` /
-//!   `parse_datetime`: chrono parses a leap second (`10:30:60`) that
-//!   DataFusion's `to_timestamp` then rolls over to `10:31:00`, where Joda
-//!   raises `Value 60 for secondOfMinute must be in the range [0,59]`. The
-//!   function returns its text unchanged or raises that error.
+//! - `trino_date_parse(text, chrono_format, function, trino_format)` is
+//!   `date_parse` / `parse_datetime`. It replaces DataFusion's
+//!   `to_timestamp`, which resolves the parsed fields with chrono's
+//!   `Parsed::to_naive_datetime_with_offset` and *falls back to midnight*
+//!   whenever the time is incomplete — so `%H` without a minute, and a
+//!   12-hour field without AM/PM, silently dropped the whole time of day.
+//!   Trino runs Joda, whose parse bucket starts at `1970-01-01T00:00:00`
+//!   and applies the parsed fields on top, so every field the format does
+//!   not name keeps its epoch default. This UDF does the same: it resolves
+//!   the date with chrono where the parsed fields are complete and fills
+//!   year / month / day / hour / minute / second / nanosecond from the
+//!   epoch otherwise. A parsed second of 60 (chrono's leap second, which
+//!   Joda refuses) raises `Value 60 for secondOfMinute must be in the
+//!   range [0,59]`.
 
 use std::sync::Arc;
 
-use arrow::array::{Array, AsArray, Float64Array};
+use arrow::array::{Array, AsArray, Float64Array, TimestampMillisecondBuilder};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, TimeUnit, TimestampMicrosecondType};
 use chrono::format::{Parsed, StrftimeItems};
-use chrono::{Datelike, NaiveDate, NaiveDateTime, TimeDelta};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta};
 use datafusion::common::Result;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
@@ -34,52 +43,111 @@ pub fn all() -> Vec<ScalarUDF> {
     vec![
         ScalarUDF::new_from_impl(TrinoDateTrunc::new()),
         ScalarUDF::new_from_impl(TrinoToUnixtime::new()),
-        ScalarUDF::new_from_impl(TrinoCheckParsedTime::new()),
+        ScalarUDF::new_from_impl(TrinoDateParse::new()),
     ]
 }
 
-/// Whether `text` parsed with the chrono `format` carries a field value
-/// Joda rejects: a second of 60 (chrono's leap second). `Ok(())` when the
-/// text does not parse at all — `to_timestamp` reports that itself.
-pub fn check_parsed_time(text: &str, format: &str) -> Result<()> {
-    let mut parsed = Parsed::new();
-    let items = StrftimeItems::new(format);
-    if chrono::format::parse(&mut parsed, text, items).is_err() {
-        return Ok(());
+/// Joda's parse bucket starts at the epoch, so a field the pattern does
+/// not name keeps its `1970-01-01T00:00:00.000` default.
+const EPOCH_YEAR: i64 = 1970;
+
+/// Resolve the date the way Joda does: chrono's own resolution when the
+/// parsed fields determine a date, and the epoch defaults for the fields
+/// the format left out (`%Y-%m` is the first of the month, a
+/// time-of-day-only format is 1970-01-01). `None` when the remaining
+/// fields still cannot be resolved — a weekday without a full date, say —
+/// which is refused loudly rather than guessed at.
+fn resolve_date(parsed: &Parsed) -> Option<NaiveDate> {
+    if let Ok(date) = parsed.to_naive_date() {
+        return Some(date);
     }
+    let mut p = parsed.clone();
+    if p.year().is_none()
+        && p.year_mod_100().is_none()
+        && p.isoyear().is_none()
+        && p.isoyear_mod_100().is_none()
+    {
+        p.set_year(EPOCH_YEAR).ok()?;
+    }
+    if let Ok(date) = p.to_naive_date() {
+        return Some(date);
+    }
+    if p.month().is_none()
+        && p.ordinal().is_none()
+        && p.isoweek().is_none()
+        && p.week_from_mon().is_none()
+        && p.week_from_sun().is_none()
+    {
+        p.set_month(1).ok()?;
+    }
+    if let Ok(date) = p.to_naive_date() {
+        return Some(date);
+    }
+    if p.day().is_none() && p.ordinal().is_none() {
+        p.set_day(1).ok()?;
+    }
+    p.to_naive_date().ok()
+}
+
+/// Resolve the time of day with Joda's defaults: an unset hour, minute,
+/// second, or fraction is the epoch's zero. `%I` / `hh` without an AM/PM
+/// field leaves `hour_div_12` unset, which is Joda's AM default — where
+/// chrono's own `to_naive_time` refuses the whole time.
+fn resolve_time(parsed: &Parsed) -> Option<NaiveTime> {
+    let hour = parsed.hour_div_12().unwrap_or(0) * 12 + parsed.hour_mod_12().unwrap_or(0);
+    NaiveTime::from_hms_nano_opt(
+        hour,
+        parsed.minute().unwrap_or(0),
+        parsed.second().unwrap_or(0),
+        parsed.nanosecond().unwrap_or(0),
+    )
+}
+
+/// Parse `text` with the chrono `format`, filling every unnamed field from
+/// Joda's epoch defaults. `Ok(None)` means the text does not parse.
+pub fn parse_joda(text: &str, format: &str) -> Result<Option<NaiveDateTime>> {
+    let mut parsed = Parsed::new();
+    if chrono::format::parse(&mut parsed, text, StrftimeItems::new(format)).is_err() {
+        return Ok(None);
+    }
+    // chrono accepts a leap second (`10:30:60`); Joda raises.
     if parsed.second() == Some(60) {
         return Err(data_error(
             "INVALID_FUNCTION_ARGUMENT",
             "Value 60 for secondOfMinute must be in the range [0,59]",
         ));
     }
-    Ok(())
+    Ok(resolve_date(&parsed)
+        .zip(resolve_time(&parsed))
+        .map(|(date, time)| date.and_time(time)))
 }
 
-/// `trino_check_parsed_time(text, format)`: see the module docs.
+/// `trino_date_parse(text, chrono_format, function, trino_format)`: see the
+/// module docs. The result is a zone-less `timestamp(3)`; `parse_datetime`
+/// casts it to UTC in the rewriter.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct TrinoCheckParsedTime {
+pub struct TrinoDateParse {
     signature: Signature,
 }
 
-impl Default for TrinoCheckParsedTime {
+impl Default for TrinoDateParse {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TrinoCheckParsedTime {
+impl TrinoDateParse {
     /// New instance.
     pub fn new() -> Self {
         Self {
-            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+            signature: Signature::new(TypeSignature::Any(4), Volatility::Immutable),
         }
     }
 }
 
-impl ScalarUDFImpl for TrinoCheckParsedTime {
+impl ScalarUDFImpl for TrinoDateParse {
     fn name(&self) -> &str {
-        "trino_check_parsed_time"
+        "trino_date_parse"
     }
 
     fn signature(&self) -> &Signature {
@@ -87,20 +155,48 @@ impl ScalarUDFImpl for TrinoCheckParsedTime {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        Ok(arg_types[0].clone())
+        match &arg_types[0] {
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Null => {
+                Ok(DataType::Timestamp(TimeUnit::Millisecond, None))
+            }
+            other => Err(type_mismatch(format!(
+                "Unexpected parameters ({}, varchar) for function date_parse. Expected: \
+                 date_parse(varchar, varchar)",
+                trino_type_name(other)
+            ))),
+        }
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let rows = args.number_rows;
         let texts = string_array("date_parse", &args.args[0], rows)?;
         let formats = string_array("date_parse", &args.args[1], rows)?;
+        let functions = string_array("date_parse", &args.args[2], rows)?;
+        let originals = string_array("date_parse", &args.args[3], rows)?;
+        let mut out = TimestampMillisecondBuilder::with_capacity(rows);
         for i in 0..rows {
             if texts.is_null(i) || formats.is_null(i) {
+                out.append_null();
                 continue;
             }
-            check_parsed_time(texts.value(i), formats.value(i))?;
+            let function = if functions.is_null(i) {
+                "date_parse"
+            } else {
+                functions.value(i)
+            };
+            match parse_joda(texts.value(i), formats.value(i))? {
+                Some(ts) => out.append_value(ts.and_utc().timestamp_millis()),
+                None => {
+                    return user_err!(
+                        function,
+                        "cannot parse '{}' with format '{}'",
+                        texts.value(i),
+                        originals.value(i)
+                    );
+                }
+            }
         }
-        Ok(args.args[0].clone())
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
 }
 
@@ -272,10 +368,46 @@ mod tests {
 
     #[test]
     fn leap_seconds_are_refused_like_joda() {
-        check_parsed_time("2024-01-05 10:30:59", "%Y-%m-%d %H:%M:%S").unwrap();
-        check_parsed_time("garbage", "%Y-%m-%d %H:%M:%S").unwrap();
-        let err = check_parsed_time("2024-01-05 10:30:60", "%Y-%m-%d %H:%M:%S").unwrap_err();
+        parse_joda("2024-01-05 10:30:59", "%Y-%m-%d %H:%M:%S").unwrap();
+        assert_eq!(parse_joda("garbage", "%Y-%m-%d %H:%M:%S").unwrap(), None);
+        let err = parse_joda("2024-01-05 10:30:60", "%Y-%m-%d %H:%M:%S").unwrap_err();
         assert!(err.to_string().contains("secondOfMinute"), "{err}");
+    }
+
+    #[test]
+    fn unnamed_fields_keep_jodas_epoch_defaults() {
+        // An hour with no minute, and a 12-hour field with no AM/PM, are
+        // exactly the shapes chrono cannot resolve on its own; Joda keeps
+        // the parsed hour and defaults the rest.
+        for (text, format, expected) in [
+            ("2024-01-05 10", "%Y-%m-%d %H", ts(2024, 1, 5, 10, 0, 0)),
+            (
+                "2024-01-05 10:30",
+                "%Y-%m-%d %I:%M",
+                ts(2024, 1, 5, 10, 30, 0),
+            ),
+            (
+                "2024-01-05 10 PM",
+                "%Y-%m-%d %I %p",
+                ts(2024, 1, 5, 22, 0, 0),
+            ),
+            ("12:30 AM", "%I:%M %p", ts(1970, 1, 1, 0, 30, 0)),
+            ("2024-01", "%Y-%m", ts(2024, 1, 1, 0, 0, 0)),
+            ("2024", "%Y", ts(2024, 1, 1, 0, 0, 0)),
+            ("03-15", "%m-%d", ts(1970, 3, 15, 0, 0, 0)),
+            ("2024-032", "%Y-%j", ts(2024, 2, 1, 0, 0, 0)),
+            (
+                "2024-01-05 10:30:15",
+                "%Y-%m-%d %H:%M:%S",
+                ts(2024, 1, 5, 10, 30, 15),
+            ),
+        ] {
+            assert_eq!(
+                parse_joda(text, format).unwrap(),
+                Some(expected),
+                "{text} / {format}"
+            );
+        }
     }
     #[test]
     fn truncation_follows_trino_units() {

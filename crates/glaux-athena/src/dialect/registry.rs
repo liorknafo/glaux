@@ -633,7 +633,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "regexp_replace(varchar, pattern[, replacement]) → varchar",
         "Regular expression",
         Rewrite,
-        "Rust UDF `trino_regexp_replace`: every match is replaced, the replacement uses Java syntax (`$1x` is group 1 then `x`, `${name}` a named group, `\\$` a literal dollar) and every group reference is validated against the pattern (`No group 2`, `No group with name {y}`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b`, and `(?i)` are Unicode-aware (Trino runs Joni with Unicode character tables, which Rust's defaults match: `regexp_like('٣', '\\d')` is true) and `$` also matches before a final newline, as in Trino's engine; `\\h` / `\\v` (which Joni reads differently from `java.util.regex`), look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors. The lambda form is refused.",
+        "Rust UDF `trino_regexp_replace`: every match is replaced, advancing the way Trino's `JoniRegexpFunctions` does — `getNextStart` only skips forward when the match *itself* was zero-width, so an empty match landing right after a non-empty one is still replaced (`regexp_replace('aaa', 'a*', 'X')` is `XX` and `regexp_replace('abc', 'b*', 'X')` is `XaXXcX`, exactly as Java's `Matcher.replaceAll`), where Rust's `Regex::replace_all` skips it and lost one replacement per such boundary; the replacement uses Java syntax (`$1x` is group 1 then `x`, `${name}` a named group, `\\$` a literal dollar) and every group reference is validated against the pattern (`No group 2`, `No group with name {y}`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b`, and `(?i)` are Unicode-aware (Trino runs Joni with Unicode character tables, which Rust's defaults match: `regexp_like('٣', '\\d')` is true) and `$` also matches before a final newline, as in Trino's engine; `\\h` / `\\v` (which Joni reads differently from `java.util.regex`), look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors. The lambda form is refused.",
         ["trino_regexp_replace"]
     ),
     shim!(
@@ -714,8 +714,8 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "date_parse(varchar, format) → timestamp",
         "Date and time",
         Rewrite,
-        "`to_timestamp(x, <strftime>)` with the MySQL-style format translated, cast to a zone-less `timestamp(3)` (fractions beyond milliseconds are truncated, as Joda does); the format must be a literal and the input a varchar. `%f` accepts 1-9 fractional digits when parsing, like Trino, but only directly after a `.`. A second of `60` (chrono's leap second, which DataFusion would roll over to the next minute) is refused with Joda's `Value 60 for secondOfMinute must be in the range [0,59]`.",
-        ["to_timestamp", "arrow_cast"]
+        "Rust UDF `trino_date_parse(x, <strftime>, ...)` with the MySQL-style format translated; the format must be a literal and the input a varchar, and the result is a zone-less `timestamp(3)` (fractions beyond milliseconds are truncated, as Joda does). Every field the format does not name keeps the epoch default Joda's parse bucket starts from, so `date_parse('2024-01-05 10', '%Y-%m-%d %H')` is `10:00:00`, `date_parse('2024-01-05 10:30', '%Y-%m-%d %h:%i')` is `10:30:00` (a 12-hour field with no `%p` is AM, as Joda's `clockhourOfHalfday` default is), `date_parse('12:30 AM', '%h:%i %p')` is `1970-01-01 00:30:00`, and `date_parse('2024-01', '%Y-%m')` is the first of the month. DataFusion's `to_timestamp` is not used: chrono's field resolution needs hour + minute (and AM/PM for a 12-hour field) and silently fell back to midnight for the rest, dropping the whole time of day. `%f` accepts 1-9 fractional digits when parsing, like Trino, but only directly after a `.`. A second of `60` (chrono's leap second, which DataFusion would roll over to the next minute) is refused with Joda's `Value 60 for secondOfMinute must be in the range [0,59]`. A format that names a weekday without pinning the date down (`%W` alone, which Joda resolves against its epoch base) is refused rather than guessed at.",
+        ["trino_date_parse"]
     ),
     shim!(
         "date_trunc",
@@ -858,8 +858,8 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "parse_datetime(varchar, pattern) → timestamp",
         "Date and time",
         Rewrite,
-        "`to_timestamp(x, <strftime>)` with the Joda pattern translated, as a `timestamp(3) with time zone` at UTC (Athena prints `... UTC`); the pattern must be a literal. `SSS` / `SSSSSS` parse exactly that many fractional digits (Joda accepts fewer). Zone letters (`Z`, `z`) are refused: Trino would keep the parsed offset, which glaux cannot.",
-        ["to_timestamp", "arrow_cast"]
+        "Rust UDF `trino_date_parse` (see `date_parse`, including Joda's epoch defaults for the fields the pattern leaves out: `parse_datetime('2024-01-05 10', 'yyyy-MM-dd HH')` is `10:00:00` and `'yyyy-MM-dd hh a'` reads `10 PM` as `22:00:00`) with the Joda pattern translated, re-tagged as a `timestamp(3) with time zone` at UTC (Athena prints `... UTC`); the pattern must be a literal. `SSS` / `SSSSSS` parse exactly that many fractional digits (Joda accepts fewer). Zone letters (`Z`, `z`) are refused: Trino would keep the parsed offset, which glaux cannot.",
+        ["trino_date_parse", "arrow_cast"]
     ),
     shim!(
         "quarter",
@@ -1024,12 +1024,28 @@ pub static FUNCTIONS: &[FunctionShim] = &[
     ),
     shim!("mod", "mod(n, m)", "Math", Rewrite, "`n % m`", []),
     shim!(
+        "infinity",
+        "infinity() → double",
+        "Math",
+        Rewrite,
+        "`trino_double('Infinity')` — glaux's `CAST(varchar AS DOUBLE)`, which follows Java's `Double.parseDouble`. There is no infinite literal to fold onto, and DataFusion has no such function. Negative infinity is `-infinity()`.",
+        ["trino_double"]
+    ),
+    shim!(
         "pi",
         "pi() → double",
         "Math",
         Passthrough,
         "DataFusion `pi`",
         ["pi"]
+    ),
+    shim!(
+        "nan",
+        "nan() → double",
+        "Math",
+        Rewrite,
+        "`trino_double('NaN')` — glaux's `CAST(varchar AS DOUBLE)`, which follows Java's `Double.parseDouble`. There is no NaN literal to fold onto, and DataFusion has no such function; `0e0 / 0e0` is the same value.",
+        ["trino_double"]
     ),
     shim!(
         "pow",
@@ -1424,7 +1440,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Subqueries (derived tables, scalar, IN, EXISTS)",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "Correlated `EXISTS` / `IN` are decorrelated by DataFusion. A scalar subquery that returns no rows is NULL, also over a non-nullable source such as `VALUES` or a literal (DataFusion alone would fail with `declared as non-nullable but contains null values`). A **correlated scalar subquery that is not itself an aggregate** — `SELECT (SELECT c.id FROM customers c WHERE c.id = o.customer_id) FROM orders o`, valid Trino — is rewritten into `trino_scalar_subquery((SELECT trino_single_value(x) …), (SELECT trino_group_rows(x) …))`: DataFusion's decorrelation needs an aggregate, and the row count is checked *outside* the subquery so that only groups an outer row really matches raise `SUBQUERY_MULTIPLE_ROWS`, as on Trino (checking inside the aggregate would refuse a group no outer row selects). Refused by name, not answered differently: a correlated scalar subquery in `ORDER BY` or a `JOIN` condition (Trino allows it; DataFusion decorrelates only in `SELECT` / `WHERE` / `GROUP BY`), one carrying an `ORDER BY` or `LIMIT` (Trino applies it per outer row, which decorrelation cannot express), one whose correlation condition compares `DOUBLE` / `REAL`, and one whose correlation conditions name two columns with the same bare name from different relations (`… WHERE c.id = o.customer_id AND x.id = o.id`) — DataFusion re-qualifies correlated columns by their bare name, so the two would collapse onto one join key and every row would come back wrong. `IN (subquery)` / `EXISTS` used as a *value* (in the select list or any position other than a `WHERE` / `HAVING` predicate) is refused by name — DataFusion cannot evaluate it as an expression. `IN (subquery)` over `DOUBLE` / `REAL` operands is refused by name: Trino compares with IEEE equality (NaN never matches), which DataFusion's semi-join does not reproduce.",
+        notes: "Correlated `EXISTS` / `IN` are decorrelated by DataFusion. A scalar subquery that returns no rows is NULL, also over a non-nullable source such as `VALUES` or a literal (DataFusion alone would fail with `declared as non-nullable but contains null values`). A **correlated scalar subquery that is not itself an aggregate** — `SELECT (SELECT c.id FROM customers c WHERE c.id = o.customer_id) FROM orders o`, valid Trino — is rewritten into `trino_scalar_subquery((SELECT trino_single_value(x) …), (SELECT trino_group_rows(x) …))`: DataFusion's decorrelation needs an aggregate, and the row count is checked *outside* the subquery so that only groups an outer row really matches raise `SUBQUERY_MULTIPLE_ROWS`, as on Trino (checking inside the aggregate would refuse a group no outer row selects). Refused by name, not answered differently: a correlated scalar subquery in `ORDER BY` or a `JOIN` condition (Trino allows it; DataFusion decorrelates only in `SELECT` / `WHERE` / `GROUP BY`), one carrying an `ORDER BY` or `LIMIT` (Trino applies it per outer row, which decorrelation cannot express), one whose correlation condition compares `DOUBLE` / `REAL`, and one whose correlation conditions name two columns with the same bare name from different relations (`… WHERE c.id = o.customer_id AND x.id = o.id`) — DataFusion re-qualifies correlated columns by their bare name, so the two would collapse onto one join key and every row would come back wrong. `IN (subquery)` / `EXISTS` used as a *value* (in the select list or any position other than a `WHERE` / `HAVING` predicate) is refused by name — DataFusion cannot evaluate it as an expression. `IN (subquery)` over `DOUBLE` / `REAL` operands is refused by name: Trino compares with IEEE equality (NaN never matches), which DataFusion's semi-join does not reproduce. The quantified comparison predicates `> ALL` / `= ANY` / `< SOME` are refused by name; see their own row.",
         corpus_marker: "EXISTS (",
     },
     Construct {
@@ -1557,14 +1573,14 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Timestamp precision",
         category: "Semantics",
         status: ConstructStatus::Supported,
-        notes: "Every timestamp is a `timestamp(3)`, as on Athena: a scanned column with microsecond or nanosecond values is rounded HALF_UP to milliseconds before any function sees it (so `second(x)` and the printed text agree, and `10:00:00.9996` is `10:00:01.000`), `CAST(varchar AS TIMESTAMP)` rounds the fraction, and `now()` is rounded too. `timestamp with time zone` values (`current_timestamp`, `parse_datetime`, `from_iso8601_timestamp`) are UTC and print as `2024-01-05 10:00:00.000 UTC`; `TIME` values print with milliseconds. Calendar arithmetic (`date_add`, `date_diff`, `date_trunc`) works on the calendar value, so dates outside Arrow's nanosecond window (`DATE '9999-12-31'`, `1583-01-01`) are ordinary values; `date_parse` still runs through DataFusion's nanosecond parser and fails loudly outside 1677–2262.",
+        notes: "Every timestamp is a `timestamp(3)`, as on Athena: a scanned column with microsecond or nanosecond values is rounded HALF_UP to milliseconds before any function sees it (so `second(x)` and the printed text agree, and `10:00:00.9996` is `10:00:01.000`), `CAST(varchar AS TIMESTAMP)` rounds the fraction, and `now()` is rounded too. `timestamp with time zone` values (`current_timestamp`, `parse_datetime`, `from_iso8601_timestamp`) are UTC and print as `2024-01-05 10:00:00.000 UTC`; `TIME` values print with milliseconds. Calendar arithmetic (`date_add`, `date_diff`, `date_trunc`) works on the calendar value, so dates outside Arrow's nanosecond window (`DATE '9999-12-31'`, `1583-01-01`) are ordinary values; `date_parse` / `parse_datetime` build the millisecond value themselves, so they have no Arrow nanosecond range limit either (`date_parse('1000-01-01', '%Y-%m-%d')` is an ordinary value).",
         corpus_marker: "TIMESTAMP '",
     },
     Construct {
         name: "DOUBLE / REAL special values (NaN, -0.0)",
         category: "Semantics",
         status: ConstructStatus::Supported,
-        notes: "Comparisons involving a float operand use Trino's IEEE operators (`DoubleType`: Java's primitive `==`, `<`, …): every `=` / `<` / `<=` / `>` / `>=` with NaN is false, `NaN <> NaN` is true, and `-0.0 = 0.0` is true — where Arrow's kernels use a total order (NaN equal to NaN and above every number). The same routing covers `IN` lists, `BETWEEN`, simple `CASE` operands, `nullif` (`nullif(0e0, -0e0)` is NULL, `nullif(NaN, NaN)` is NaN), and equi-join keys (nested-loop joined). `greatest` / `max` / `array_max` rank NaN smallest (`COMPARISON_UNORDERED_FIRST`), so `max` of `{1.0, NaN}` is `1.0`; the min side needs no substitute. `contains` / `array_position` / `array_remove` match with EQUAL semantics, so NaN is never found or removed. `ORDER BY`, `GROUP BY`, `DISTINCT`, and `array_distinct` group and order NaN like Trino already. Ordering *arrays* with NaN elements (`ARRAY[NaN] < ...`) is refused: Trino's per-element IEEE ordering has no total-order equivalent.",
+        notes: "Comparisons involving a float operand use Trino's IEEE operators (`DoubleType`: Java's primitive `==`, `<`, …): every `=` / `<` / `<=` / `>` / `>=` with NaN is false, `NaN <> NaN` is true, and `-0.0 = 0.0` is true — where Arrow's kernels use a total order (NaN equal to NaN and above every number). The same routing covers `IN` lists, `BETWEEN`, simple `CASE` operands, `nullif` (`nullif(0e0, -0e0)` is NULL, `nullif(NaN, NaN)` is NaN), and equi-join keys (nested-loop joined). `greatest` / `max` / `array_max` rank NaN smallest (`COMPARISON_UNORDERED_FIRST`), so `max` of `{1.0, NaN}` is `1.0`; the min side needs no substitute. `contains` / `array_position` / `array_remove` match with EQUAL semantics, so NaN is never found or removed. `ORDER BY`, `GROUP BY`, `DISTINCT`, and `array_distinct` group and order NaN like Trino already. Ordering *arrays* with NaN elements (`ARRAY[NaN] < ...`) is refused: Trino's per-element IEEE ordering has no total-order equivalent. The values themselves are written with Trino's constructors, `nan()` and `infinity()` / `-infinity()` (`0e0 / 0e0` and `1e0 / 0e0` are the same values), and print as Java does: `NaN`, `Infinity`, `-Infinity`.",
         corpus_marker: "NaN",
     },
     Construct {
@@ -1573,6 +1589,13 @@ pub static CONSTRUCTS: &[Construct] = &[
         status: ConstructStatus::Supported,
         notes: "`SELECT`, `WITH`, `VALUES`, `EXPLAIN` (DataFusion's plan text, not Trino's).",
         corpus_marker: "SELECT",
+    },
+    Construct {
+        name: "Quantified comparison (ALL / ANY / SOME)",
+        category: "Unsupported",
+        status: ConstructStatus::Unsupported,
+        notes: "`x > ALL (subquery)`, `x = ANY (subquery)`, `x <> SOME (VALUES ...)` — valid Trino — are refused by name on the token stream, before parsing. DataFusion has no equivalent predicate: its planner rewrites the shapes sqlparser parses into `cardinality` / `array_max` / `array_min` / `array_has` over the subquery, which does not reproduce Trino's rules for an empty or NULL-bearing operand (`x > ALL (empty)` is true, `x = ANY (…NULL…)` is NULL rather than false), and it fails naming those internal helpers instead of the predicate. sqlparser cannot parse the `(VALUES 1, 2)` operand at all. Rewrite them: `= ANY` is `IN (subquery)`, `<> ALL` is `NOT IN (subquery)`, and the ordering forms are a comparison against `(SELECT max(y) …)` / `(SELECT min(y) …)` or an `EXISTS` carrying the comparison.",
+        corpus_marker: "",
     },
     Construct {
         name: "lambda expression",

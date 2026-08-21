@@ -148,7 +148,7 @@ fn trino_function_name(name: &str) -> &str {
         "trino_replace" => "replace",
         "trino_power" => "power",
         "levenshtein" => "levenshtein_distance",
-        "to_timestamp" => "date_parse",
+        "trino_date_parse" => "date_parse",
         other => other,
     }
 }
@@ -317,7 +317,7 @@ fn string_arguments(name: &str) -> &'static [usize] {
         "starts_with" | "strpos" | "levenshtein" | "regexp_match" => &[0, 1],
         "trino_replace" | "translate" => &[0, 1, 2],
         // `date_parse(x, fmt)`: the parsed text must be a varchar.
-        "to_timestamp" => &[0],
+        "trino_date_parse" => &[0],
         _ => &[],
     }
 }
@@ -667,6 +667,27 @@ fn check_no_window_function(node: &LogicalPlan) -> Result<(), GlauxSqlError> {
     ))
 }
 
+/// The `i`-th output expression of a set-operation branch, when the branch
+/// is a projection: `SELECT 'a' UNION ALL SELECT 1` must name the literal
+/// types Trino gives them (`varchar(1)`, `integer`), not the `varchar` /
+/// `bigint` DataFusion planned them as.
+fn branch_output(plan: &LogicalPlan, i: usize) -> Option<&Expr> {
+    match plan {
+        LogicalPlan::Projection(projection) => projection.expr.get(i),
+        LogicalPlan::SubqueryAlias(alias) => branch_output(&alias.input, i),
+        _ => None,
+    }
+}
+
+/// [`trino_expr_type_name`] for a set-operation branch column, falling back
+/// to the schema type when the branch is not a projection.
+fn branch_type_name(plan: &LogicalPlan, i: usize, data_type: &DataType) -> String {
+    match branch_output(plan, i) {
+        Some(expr) => trino_expr_type_name(expr, data_type),
+        None => trino_type_name(data_type),
+    }
+}
+
 fn strip_projection(plan: &LogicalPlan) -> &LogicalPlan {
     match plan {
         LogicalPlan::Projection(projection) => strip_projection(&projection.input),
@@ -700,8 +721,8 @@ fn check_plan_node(node: &LogicalPlan, schema: &DFSchema) -> Result<(), GlauxSql
                         return Err(GlauxSqlError::type_mismatch(format!(
                             "column {} in UNION query has incompatible types: {}, {}",
                             i + 1,
-                            trino_type_name(a.data_type()),
-                            trino_type_name(b.data_type())
+                            branch_type_name(first, i, a.data_type()),
+                            branch_type_name(other, i, b.data_type())
                         )));
                     }
                 }

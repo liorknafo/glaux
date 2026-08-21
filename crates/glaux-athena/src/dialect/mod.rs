@@ -155,6 +155,8 @@ pub fn translate_full(sql: &str) -> Result<Translation, GlauxSqlError> {
 /// itself:
 ///
 /// - refuse digit-glued identifiers and `==` (Trino syntax errors);
+/// - refuse the quantified comparison predicates `> ALL (...)` /
+///   `= ANY (...)` / `< SOME (...)` by name;
 /// - `ARRAY(T)` type syntax (Trino's) → `ARRAY<T>` (the form sqlparser
 ///   parses), and Hive's `ARRAY<T>` — not Trino syntax — refused by name;
 /// - bare-row `VALUES 1, 2` (valid Trino) → `VALUES (1), (2)`.
@@ -165,6 +167,7 @@ fn preprocess_tokens(sql: &str) -> Result<Vec<sqlparser::tokenizer::TokenWithSpa
             message: e.to_string(),
         })?;
     reject_digit_identifiers(&tokens)?;
+    reject_quantified_comparison(&tokens)?;
     let tokens = convert_array_type_parens(tokens)?;
     let tokens = rewrite_bare_trim_specification(tokens);
     Ok(wrap_bare_values_rows(tokens))
@@ -244,6 +247,72 @@ fn reject_digit_identifiers(
                 ),
             });
         }
+    }
+    Ok(())
+}
+
+/// Trino's quantified comparison predicates — `x > ALL (subquery)`,
+/// `x = ANY (subquery)`, `x <> SOME (VALUES ...)` — are valid Trino that
+/// glaux does not execute, and they have to be caught here, on the token
+/// stream, rather than on the AST: DataFusion's planner turns the shapes
+/// sqlparser *does* parse into `cardinality` / `array_max` / `array_min` /
+/// `array_has` calls and then fails naming those internal helpers, and
+/// sqlparser cannot parse the `(VALUES 1, 2)` operand at all (a raw
+/// `Expected: ), found: ,`). Neither diagnostic names what the user wrote.
+///
+/// The pattern is unambiguous: a comparison operator, then a bare `ALL` /
+/// `ANY` / `SOME`, then `(`. `UNION ALL (...)`, `SELECT ALL`, and function
+/// names such as `any_match(` are all different token shapes.
+fn reject_quantified_comparison(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+) -> Result<(), GlauxSqlError> {
+    for (i, token) in tokens.iter().enumerate() {
+        if !matches!(
+            token.token,
+            Token::Eq | Token::Neq | Token::Lt | Token::LtEq | Token::Gt | Token::GtEq
+        ) {
+            continue;
+        }
+        let Some(word_at) = next_significant(tokens, i) else {
+            continue;
+        };
+        let Token::Word(word) = &tokens[word_at].token else {
+            continue;
+        };
+        if word.quote_style.is_some() {
+            continue;
+        }
+        let quantifier = word.value.to_ascii_uppercase();
+        if !matches!(quantifier.as_str(), "ALL" | "ANY" | "SOME") {
+            continue;
+        }
+        if next_significant(tokens, word_at)
+            .is_none_or(|j| !matches!(tokens[j].token, Token::LParen))
+        {
+            continue;
+        }
+        return Err(GlauxSqlError::unsupported(
+            format!("quantified comparison ({quantifier})"),
+            format!(
+                "`x {} {quantifier} (...)` is valid Trino, but glaux does not translate the \
+                 quantified comparison predicates (ALL / ANY / SOME) in v0.1: DataFusion has no \
+                 equivalent, and its own rewrite of the shapes it does parse turns them into \
+                 `cardinality` / `array_max` / `array_min` calls whose NULL rules are not \
+                 Trino's. Rewrite the predicate: {}",
+                token.token,
+                match quantifier.as_str() {
+                    "ALL" =>
+                        "`x = ALL (s)` / `x <> ALL (s)` as `x NOT IN (s)` or a NOT EXISTS, \
+                              and the ordering forms as a comparison against `(SELECT max(y) \
+                              FROM s)` / `(SELECT min(y) FROM s)`, handling an empty or \
+                              NULL-bearing s yourself",
+                    _ =>
+                        "`x = ANY (s)` as `x IN (s)`, and the ordering forms as a comparison \
+                          against `(SELECT min(y) FROM s)` / `(SELECT max(y) FROM s)` or an \
+                          EXISTS with the comparison in its WHERE",
+                }
+            ),
+        ));
     }
     Ok(())
 }
