@@ -15,6 +15,9 @@
 //!   and is `NULL` for a `NULL` `x`.
 //! - `array_join(array, sep[, null_replacement])`: elements rendered in
 //!   Trino's text forms (`1.0`, `2024-01-05 10:00:00.000`).
+//! - `=` / `<>` / `<` … between arrays ([`ArrayCmp`]): three-valued
+//!   equality over NULL elements and an error when ordering arrays with
+//!   NULL elements, as in Trino (the analyzer routes the operators here).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -25,7 +28,7 @@ use arrow::array::{
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::{SortOptions, cast, sort_to_indices, take};
 use arrow::datatypes::{DataType, Field};
-use datafusion::common::{Result, ScalarValue, plan_err};
+use datafusion::common::{DataFusionError, Result, ScalarValue, plan_err};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
@@ -47,6 +50,13 @@ pub fn all() -> Vec<ScalarUDF> {
         ScalarUDF::new_from_impl(TrinoArrayExtreme::new(false)),
         ScalarUDF::new_from_impl(TrinoArrayRemove::new()),
         ScalarUDF::new_from_impl(TrinoArrayJoin::new()),
+        ScalarUDF::new_from_impl(TrinoArrayCompare::new(ArrayCmp::Eq)),
+        ScalarUDF::new_from_impl(TrinoArrayCompare::new(ArrayCmp::NotEq)),
+        ScalarUDF::new_from_impl(TrinoArrayCompare::new(ArrayCmp::Lt)),
+        ScalarUDF::new_from_impl(TrinoArrayCompare::new(ArrayCmp::LtEq)),
+        ScalarUDF::new_from_impl(TrinoArrayCompare::new(ArrayCmp::Gt)),
+        ScalarUDF::new_from_impl(TrinoArrayCompare::new(ArrayCmp::GtEq)),
+        ScalarUDF::new_from_impl(TrinoArraySortKey::new()),
     ]
 }
 
@@ -783,5 +793,319 @@ mod tests {
                 .to_string();
             assert!(err.contains(needle), "{index}: {err}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Array comparison
+// ---------------------------------------------------------------------------
+
+/// Trino's array operators. `=` / `<>` use three-valued element logic: a
+/// length mismatch or an element pair that definitely differs is `false`
+/// (`true` for `<>`); otherwise a NULL element anywhere makes the result
+/// NULL (`ARRAY[1, NULL] = ARRAY[1, NULL]` is NULL, not true as DataFusion
+/// says). The ordering operators compare lexicographically and raise `ARRAY
+/// comparison not supported for arrays with null elements` when a NULL
+/// element is reached (DataFusion sorts NULL elements).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArrayCmp {
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+}
+
+impl ArrayCmp {
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Eq => "=",
+            Self::NotEq => "<>",
+            Self::Lt => "<",
+            Self::LtEq => "<=",
+            Self::Gt => ">",
+            Self::GtEq => ">=",
+        }
+    }
+}
+
+fn null_element_error() -> DataFusionError {
+    data_error(
+        "NOT_SUPPORTED",
+        "ARRAY comparison not supported for arrays with null elements",
+    )
+}
+
+/// Three-valued equality of elements `i` of `left` and `j` of `right`,
+/// recursing into nested arrays.
+fn element_equal(
+    left: &dyn Array,
+    i: usize,
+    right: &dyn Array,
+    j: usize,
+    comparator: &arrow::array::DynComparator,
+) -> Result<Option<bool>> {
+    if is_null_at(left, i) || is_null_at(right, j) {
+        return Ok(None);
+    }
+    match (left.data_type(), right.data_type()) {
+        (DataType::List(_), DataType::List(_)) => {
+            let (l, r) = (left.as_list::<i32>(), right.as_list::<i32>());
+            array_equal(l.value(i).as_ref(), r.value(j).as_ref())
+        }
+        _ => Ok(Some(comparator(i, j) == std::cmp::Ordering::Equal)),
+    }
+}
+
+/// Trino's `ArrayEqualOperator` over two element arrays.
+fn array_equal(left: &dyn Array, right: &dyn Array) -> Result<Option<bool>> {
+    if left.len() != right.len() {
+        return Ok(Some(false));
+    }
+    let comparator = arrow::array::make_comparator(left, right, SortOptions::default())?;
+    let mut unknown = false;
+    for k in 0..left.len() {
+        match element_equal(left, k, right, k, &comparator)? {
+            Some(false) => return Ok(Some(false)),
+            Some(true) => {}
+            None => unknown = true,
+        }
+    }
+    Ok(if unknown { None } else { Some(true) })
+}
+
+/// Whether any element (at any depth) of `array` is NULL.
+fn has_null_element(array: &dyn Array) -> bool {
+    if array.null_count() > 0 || array.data_type() == &DataType::Null {
+        return array.len() > 0;
+    }
+    if let DataType::List(_) = array.data_type() {
+        let list = array.as_list::<i32>();
+        return (0..list.len()).any(|i| has_null_element(list.value(i).as_ref()));
+    }
+    false
+}
+
+/// Trino's lexicographic array ordering; an error on NULL elements.
+fn array_ordering(left: &dyn Array, right: &dyn Array) -> Result<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let comparator = arrow::array::make_comparator(left, right, SortOptions::default())?;
+    for k in 0..left.len().min(right.len()) {
+        if is_null_at(left, k) || is_null_at(right, k) {
+            return Err(null_element_error());
+        }
+        let ordering = match (left.data_type(), right.data_type()) {
+            (DataType::List(_), DataType::List(_)) => array_ordering(
+                left.as_list::<i32>().value(k).as_ref(),
+                right.as_list::<i32>().value(k).as_ref(),
+            )?,
+            _ => comparator(k, k),
+        };
+        if ordering != Ordering::Equal {
+            return Ok(ordering);
+        }
+    }
+    Ok(left.len().cmp(&right.len()))
+}
+
+/// Cast both lists to `List<common element type>` so the element arrays
+/// are directly comparable (`ARRAY[1] = ARRAY[1.0]`).
+fn unify_lists(function: &str, left: ArrayRef, right: ArrayRef) -> Result<(ListArray, ListArray)> {
+    let left = as_list(function, left)?;
+    let right = as_list(function, right)?;
+    let (l, r) = (left.value_type(), right.value_type());
+    if l == r {
+        return Ok((left, right));
+    }
+    let Some(common) = datafusion::logical_expr::type_coercion::binary::comparison_coercion(&l, &r)
+    else {
+        return Err(type_mismatch(format!(
+            "Cannot apply operator: {} {function} {}",
+            trino_type_name(left.data_type()),
+            trino_type_name(right.data_type())
+        )));
+    };
+    let target = DataType::List(Arc::new(Field::new("item", common, true)));
+    let left = cast(&left, &target)?.as_list::<i32>().clone();
+    let right = cast(&right, &target)?.as_list::<i32>().clone();
+    Ok((left, right))
+}
+
+/// `trino_array_eq(a, b)` and friends: see [`ArrayCmp`].
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoArrayCompare {
+    signature: Signature,
+    op: ArrayCmp,
+}
+
+impl TrinoArrayCompare {
+    /// New instance.
+    pub fn new(op: ArrayCmp) -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+            op,
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoArrayCompare {
+    fn name(&self) -> &str {
+        match self.op {
+            ArrayCmp::Eq => "trino_array_eq",
+            ArrayCmp::NotEq => "trino_array_neq",
+            ArrayCmp::Lt => "trino_array_lt",
+            ArrayCmp::LtEq => "trino_array_lte",
+            ArrayCmp::Gt => "trino_array_gt",
+            ArrayCmp::GtEq => "trino_array_gte",
+        }
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        match (element_type(&arg_types[0]), element_type(&arg_types[1])) {
+            (Some(l), Some(r)) if comparable(l, r) => Ok(DataType::Boolean),
+            _ => Err(type_mismatch(format!(
+                "Cannot apply operator: {} {} {}",
+                trino_type_name(&arg_types[0]),
+                self.op.symbol(),
+                trino_type_name(&arg_types[1])
+            ))),
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        use std::cmp::Ordering;
+        let rows = args.number_rows;
+        let (left, right) = unify_lists(
+            self.op.symbol(),
+            args.args[0].to_array(rows)?,
+            args.args[1].to_array(rows)?,
+        )?;
+        let mut out = BooleanBuilder::with_capacity(rows);
+        for i in 0..rows {
+            if left.is_null(i) || right.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            let (l, r) = (left.value(i), right.value(i));
+            match self.op {
+                ArrayCmp::Eq => out.append_option(array_equal(l.as_ref(), r.as_ref())?),
+                ArrayCmp::NotEq => {
+                    out.append_option(array_equal(l.as_ref(), r.as_ref())?.map(|b| !b))
+                }
+                ordering_op => {
+                    let ordering = array_ordering(l.as_ref(), r.as_ref())?;
+                    out.append_value(match ordering_op {
+                        ArrayCmp::Lt => ordering == Ordering::Less,
+                        ArrayCmp::LtEq => ordering != Ordering::Greater,
+                        ArrayCmp::Gt => ordering == Ordering::Greater,
+                        _ => ordering != Ordering::Less,
+                    });
+                }
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+/// `trino_array_sort_key(arr)`: the array unchanged, after checking that no
+/// element is NULL — `ORDER BY` on an array sorts by Trino's ordering
+/// operator, which raises on NULL elements where DataFusion would sort them.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoArraySortKey {
+    signature: Signature,
+}
+
+impl Default for TrinoArraySortKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoArraySortKey {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoArraySortKey {
+    fn name(&self) -> &str {
+        "trino_array_sort_key"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[0].clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let input = args.args[0].to_array(args.number_rows)?;
+        let list = as_list("ORDER BY", Arc::clone(&input))?;
+        for i in 0..list.len() {
+            if !list.is_null(i) && has_null_element(list.value(i).as_ref()) {
+                return Err(null_element_error());
+            }
+        }
+        Ok(ColumnarValue::Array(input))
+    }
+}
+
+#[cfg(test)]
+mod comparison_tests {
+    use arrow::array::Int64Array;
+
+    use super::*;
+
+    fn ints(values: &[Option<i64>]) -> ArrayRef {
+        Arc::new(Int64Array::from(values.to_vec()))
+    }
+
+    #[test]
+    fn equality_is_three_valued_and_ordering_refuses_nulls() {
+        let eq = |a: &[Option<i64>], b: &[Option<i64>]| {
+            array_equal(ints(a).as_ref(), ints(b).as_ref()).unwrap()
+        };
+        assert_eq!(eq(&[Some(1), None], &[Some(1), None]), None);
+        assert_eq!(eq(&[Some(1), None], &[Some(1), Some(2)]), None);
+        assert_eq!(eq(&[Some(1), None], &[Some(2), None]), Some(false));
+        assert_eq!(eq(&[Some(1)], &[Some(1), Some(2)]), Some(false));
+        assert_eq!(eq(&[Some(1), Some(2)], &[Some(1), Some(2)]), Some(true));
+        assert_eq!(eq(&[], &[]), Some(true));
+        let ord = |a: &[Option<i64>], b: &[Option<i64>]| {
+            array_ordering(ints(a).as_ref(), ints(b).as_ref())
+        };
+        assert_eq!(
+            ord(&[Some(1), Some(5)], &[Some(1), Some(7)]).unwrap(),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            ord(&[Some(1)], &[Some(1), Some(7)]).unwrap(),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            ord(&[Some(2)], &[Some(1), Some(7)]).unwrap(),
+            std::cmp::Ordering::Greater
+        );
+        let err = ord(&[Some(1), None], &[Some(1), Some(2)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("null elements"), "{err}");
+        // A NULL after the deciding element is never reached, as in Trino.
+        assert_eq!(
+            ord(&[Some(0), None], &[Some(1), Some(2)]).unwrap(),
+            std::cmp::Ordering::Less
+        );
+        assert!(has_null_element(ints(&[Some(1), None]).as_ref()));
+        assert!(!has_null_element(ints(&[Some(1)]).as_ref()));
     }
 }

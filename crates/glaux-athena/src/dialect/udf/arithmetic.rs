@@ -12,6 +12,13 @@
 //! - decimal `+ - * /`, `sum`, and `avg` to UDFs with Trino's result types
 //!   and HALF_UP rounding (see [`super::decimal`]);
 //! - `date ± interval` to a UDF that refuses sub-day intervals;
+//! - `sum` / `avg` over `real` to UDFs returning `real` (DataFusion gives
+//!   a `double`);
+//! - array `=`, `<>`, and ordering operators to UDFs with Trino's NULL-
+//!   element rules, and array `ORDER BY` keys to a check that refuses NULL
+//!   elements;
+//! - set operations and joins get their schema recomputed so the narrowed
+//!   literal types show (`SELECT 1 UNION SELECT 1` is `integer`);
 //! - `greatest` / `least` over a mix of double and exact numbers to double
 //!   (Trino's common supertype; DataFusion picks a wide decimal);
 //! - table scans whose timestamp columns are not millisecond-precise to a
@@ -24,7 +31,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, AsArray};
+use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::compute::cast;
 use arrow::compute::kernels::numeric;
 use arrow::datatypes::{DataType, Field, FieldRef, Int64Type, TimeUnit};
@@ -38,10 +45,11 @@ use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::{
     Accumulator, AggregateUDF, AggregateUDFImpl, ColumnarValue, Expr, ExprSchemable, LogicalPlan,
     LogicalPlanBuilder, Operator, Projection, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, TypeSignature, Volatility, WindowFunctionDefinition,
+    Signature, TypeSignature, Union, Volatility, WindowFunctionDefinition,
 };
 use datafusion::optimizer::analyzer::AnalyzerRule;
 
+use super::arrays::{ArrayCmp, TrinoArrayCompare, TrinoArraySortKey};
 use super::casts::trino_type_name;
 use super::decimal::{
     DecimalAgg, TrinoDecimalAgg, TrinoDecimalDiv, decimal_binary, decimal_result_type,
@@ -58,9 +66,14 @@ pub fn scalar_udfs() -> Vec<ScalarUDF> {
         .collect()
 }
 
-/// The checked aggregate UDFs (`trino_checked_sum`).
+/// The checked aggregate UDFs (`trino_checked_sum`) and the `real`
+/// aggregates (`trino_real_sum`, `trino_real_avg`).
 pub fn aggregate_udfs() -> Vec<AggregateUDF> {
-    vec![AggregateUDF::new_from_impl(CheckedIntSum::new())]
+    vec![
+        AggregateUDF::new_from_impl(CheckedIntSum::new()),
+        AggregateUDF::new_from_impl(RealAgg::new(false)),
+        AggregateUDF::new_from_impl(RealAgg::new(true)),
+    ]
 }
 
 fn overflow(type_name: &str, op: &str) -> DataFusionError {
@@ -360,6 +373,172 @@ impl Accumulator for DistinctCheckedSum {
 }
 
 // ---------------------------------------------------------------------------
+// sum / avg over REAL
+// ---------------------------------------------------------------------------
+
+/// `trino_real_sum(real)` / `trino_real_avg(real)`: Trino accumulates a
+/// `real` sum in a double and returns a `real` (`sum` of `1.1` and `2.2`
+/// prints `3.3000002`); DataFusion's `sum` / `avg` return a `double`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct RealAgg {
+    signature: Signature,
+    avg: bool,
+}
+
+impl RealAgg {
+    /// New instance; `avg` selects the average.
+    pub fn new(avg: bool) -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+            avg,
+        }
+    }
+}
+
+impl AggregateUDFImpl for RealAgg {
+    fn name(&self) -> &str {
+        if self.avg {
+            "trino_real_avg"
+        } else {
+            "trino_real_sum"
+        }
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        if arg_types[0] == DataType::Float32 {
+            Ok(DataType::Float32)
+        } else {
+            Err(type_mismatch(format!(
+                "expected a real argument, got {}",
+                trino_type_name(&arg_types[0])
+            )))
+        }
+    }
+
+    fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(RealAccumulator {
+            avg: self.avg,
+            distinct: args.is_distinct,
+            sum: 0.0,
+            count: 0,
+            seen: HashSet::new(),
+        }))
+    }
+
+    fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        Ok(vec![
+            Arc::new(Field::new(
+                format!("{}[real sum]", args.name),
+                DataType::Float64,
+                true,
+            )),
+            Arc::new(Field::new(
+                format!("{}[real count]", args.name),
+                DataType::Int64,
+                true,
+            )),
+            Arc::new(Field::new_list(
+                format!("{}[real distinct]", args.name),
+                Field::new_list_field(DataType::Float32, true),
+                true,
+            )),
+        ])
+    }
+}
+
+/// Double-precision running sum and count over `real` values; `seen` holds
+/// the distinct values (as bit patterns) for `DISTINCT`.
+#[derive(Debug)]
+struct RealAccumulator {
+    avg: bool,
+    distinct: bool,
+    sum: f64,
+    count: i64,
+    seen: HashSet<u32>,
+}
+
+impl RealAccumulator {
+    fn add(&mut self, value: f32) {
+        if self.distinct && !self.seen.insert(value.to_bits()) {
+            return;
+        }
+        self.sum += f64::from(value);
+        self.count += 1;
+    }
+}
+
+impl Accumulator for RealAccumulator {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        let floats = cast(&values[0], &DataType::Float32)?;
+        for v in floats
+            .as_primitive::<arrow::datatypes::Float32Type>()
+            .iter()
+            .flatten()
+        {
+            self.add(v);
+        }
+        Ok(())
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        if self.count == 0 {
+            return Ok(ScalarValue::Float32(None));
+        }
+        let value = if self.avg {
+            self.sum / self.count as f64
+        } else {
+            self.sum
+        };
+        Ok(ScalarValue::Float32(Some(value as f32)))
+    }
+
+    fn size(&self) -> usize {
+        size_of_val(self) + self.seen.capacity() * size_of::<u32>()
+    }
+
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        let seen: Vec<ScalarValue> = self
+            .seen
+            .iter()
+            .map(|bits| ScalarValue::Float32(Some(f32::from_bits(*bits))))
+            .collect();
+        Ok(vec![
+            ScalarValue::Float64(Some(self.sum)),
+            ScalarValue::Int64(Some(self.count)),
+            ScalarValue::List(ScalarValue::new_list_nullable(&seen, &DataType::Float32)),
+        ])
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        if self.distinct {
+            for list in states[2].as_list::<i32>().iter().flatten() {
+                for v in list
+                    .as_primitive::<arrow::datatypes::Float32Type>()
+                    .iter()
+                    .flatten()
+                {
+                    self.add(v);
+                }
+            }
+            return Ok(());
+        }
+        let sums = states[0].as_primitive::<arrow::datatypes::Float64Type>();
+        let counts = states[1].as_primitive::<Int64Type>();
+        for i in 0..sums.len() {
+            if !sums.is_null(i) {
+                self.sum += sums.value(i);
+                self.count += counts.value(i);
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The analyzer rule
 // ---------------------------------------------------------------------------
 
@@ -433,10 +612,33 @@ fn widen_exact_to_double(exprs: &[&Expr], schema: &DFSchema) -> Option<Vec<Expr>
     )
 }
 
+fn is_list(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+    )
+}
+
 fn rewrite_binary(left: &Expr, op: Operator, right: &Expr, schema: &DFSchema) -> Option<Expr> {
     let (Ok(l), Ok(r)) = (left.get_type(schema), right.get_type(schema)) else {
         return None;
     };
+    // Array comparison: Trino's NULL-element rules (see `arrays::ArrayCmp`).
+    if is_list(&l) && is_list(&r) {
+        let cmp = match op {
+            Operator::Eq => ArrayCmp::Eq,
+            Operator::NotEq => ArrayCmp::NotEq,
+            Operator::Lt => ArrayCmp::Lt,
+            Operator::LtEq => ArrayCmp::LtEq,
+            Operator::Gt => ArrayCmp::Gt,
+            Operator::GtEq => ArrayCmp::GtEq,
+            _ => return None,
+        };
+        return Some(udf_call(
+            TrinoArrayCompare::new(cmp),
+            vec![left.clone(), right.clone()],
+        ));
+    }
     if let Some(widened) = widen_exact_to_double(&[left, right], schema) {
         let mut it = widened.into_iter();
         return Some(Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
@@ -481,6 +683,24 @@ fn rewrite_binary(left: &Expr, op: Operator, right: &Expr, schema: &DFSchema) ->
     }
 }
 
+/// The Trino substitute for `sum` / `avg` over an argument of type `t`:
+/// overflow-checked for integers, Trino's decimal typing for decimals, a
+/// `real` result for `real` inputs. `None` keeps DataFusion's aggregate.
+fn trino_sum_avg(name: &str, t: &DataType) -> Option<AggregateUDF> {
+    Some(match (name, t) {
+        ("sum", t) if is_integer(t) => AggregateUDF::new_from_impl(CheckedIntSum::new()),
+        ("sum", DataType::Decimal128(..)) => {
+            AggregateUDF::new_from_impl(TrinoDecimalAgg::new(DecimalAgg::Sum))
+        }
+        ("avg", DataType::Decimal128(..)) => {
+            AggregateUDF::new_from_impl(TrinoDecimalAgg::new(DecimalAgg::Avg))
+        }
+        ("sum", DataType::Float32) => AggregateUDF::new_from_impl(RealAgg::new(false)),
+        ("avg", DataType::Float32) => AggregateUDF::new_from_impl(RealAgg::new(true)),
+        _ => return None,
+    })
+}
+
 fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     expr.transform_up(|e| {
         match &e {
@@ -493,6 +713,7 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     )));
                 }
             }
+
             Expr::BinaryExpr(binary) => {
                 if let Some(replacement) =
                     rewrite_binary(&binary.left, binary.op, &binary.right, schema)
@@ -504,19 +725,7 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                 if let [arg] = agg.params.args.as_slice()
                     && let Ok(t) = arg.get_type(schema)
                 {
-                    let replacement = match (agg.func.name(), &t) {
-                        ("sum", t) if is_integer(t) => {
-                            Some(AggregateUDF::new_from_impl(CheckedIntSum::new()))
-                        }
-                        ("sum", DataType::Decimal128(..)) => Some(AggregateUDF::new_from_impl(
-                            TrinoDecimalAgg::new(DecimalAgg::Sum),
-                        )),
-                        ("avg", DataType::Decimal128(..)) => Some(AggregateUDF::new_from_impl(
-                            TrinoDecimalAgg::new(DecimalAgg::Avg),
-                        )),
-                        _ => None,
-                    };
-                    if let Some(func) = replacement {
+                    if let Some(func) = trino_sum_avg(agg.func.name(), &t) {
                         let mut replacement = agg.clone();
                         replacement.func = Arc::new(func);
                         return Ok(Transformed::yes(Expr::AggregateFunction(replacement)));
@@ -529,19 +738,7 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     && let [arg] = window.params.args.as_slice()
                     && let Ok(t) = arg.get_type(schema)
                 {
-                    let replacement = match (func.name(), &t) {
-                        ("sum", t) if is_integer(t) => {
-                            Some(AggregateUDF::new_from_impl(CheckedIntSum::new()))
-                        }
-                        ("sum", DataType::Decimal128(..)) => Some(AggregateUDF::new_from_impl(
-                            TrinoDecimalAgg::new(DecimalAgg::Sum),
-                        )),
-                        ("avg", DataType::Decimal128(..)) => Some(AggregateUDF::new_from_impl(
-                            TrinoDecimalAgg::new(DecimalAgg::Avg),
-                        )),
-                        _ => None,
-                    };
-                    if let Some(func) = replacement {
+                    if let Some(func) = trino_sum_avg(func.name(), &t) {
                         let mut replacement: WindowFunction = window.as_ref().clone();
                         replacement.fun = WindowFunctionDefinition::AggregateUDF(Arc::new(func));
                         return Ok(Transformed::yes(Expr::WindowFunction(Box::new(
@@ -595,6 +792,144 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     })
 }
 
+/// The rows of a `VALUES` after the literal narrowing, ready to be
+/// re-planned: the name-preserving aliases are stripped (the builder would
+/// otherwise cast the aliased literal), the planner's own casts of integer
+/// literals to the column type it had inferred from `bigint` literals
+/// (`VALUES (1, 2.5), (NULL, 3)`) are dropped so the builder re-infers it
+/// from the `integer` ones (`decimal(11,1)`, as on Trino; a user-written
+/// cast carries a `trino_` wrapper and is kept), and a column whose values
+/// are all `integer` or typed NULLs gets `integer` NULLs.
+fn narrow_values(rows: &[Vec<Expr>]) -> Vec<Vec<Expr>> {
+    // A numeric literal, or the `CAST('1e2' AS DOUBLE)` an exponent literal
+    // arrives as.
+    let is_numeric_literal = |e: &Expr| match e {
+        Expr::Literal(
+            ScalarValue::Int32(_)
+            | ScalarValue::Int64(None)
+            | ScalarValue::Decimal128(..)
+            | ScalarValue::Float64(_),
+            _,
+        ) => true,
+        Expr::Cast(cast) => {
+            cast.field.data_type() == &DataType::Float64
+                && matches!(cast.expr.as_ref(), Expr::Literal(ScalarValue::Utf8(_), _))
+        }
+        _ => false,
+    };
+    let strip_planner_cast = |e: Expr| match e {
+        Expr::Cast(cast)
+            if matches!(
+                cast.field.data_type(),
+                DataType::Int64 | DataType::Decimal128(..) | DataType::Float64
+            ) && is_numeric_literal(&cast.expr) =>
+        {
+            *cast.expr
+        }
+        other => other,
+    };
+    let mut rows: Vec<Vec<Expr>> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|e| strip_planner_cast(e.clone().unalias_nested().data))
+                .collect()
+        })
+        .collect();
+    let width = rows.first().map_or(0, Vec::len);
+    for column in 0..width {
+        let is_typed_null = |e: &Expr| matches!(e, Expr::Literal(ScalarValue::Int64(None), _));
+        let all_integer = rows.iter().all(|row| {
+            matches!(row[column], Expr::Literal(ScalarValue::Int32(_), _))
+                || is_typed_null(&row[column])
+        });
+        let any_integer = rows
+            .iter()
+            .any(|row| matches!(row[column], Expr::Literal(ScalarValue::Int32(_), _)));
+        if all_integer && any_integer {
+            for row in &mut rows {
+                if is_typed_null(&row[column]) {
+                    row[column] = Expr::Literal(ScalarValue::Int32(None), None);
+                }
+            }
+        }
+        // A column mixing doubles and exact numbers is double on Trino.
+        let literal_type = |e: &Expr| match e {
+            Expr::Literal(v, _) => Some(v.data_type()),
+            // `1e2` arrives as `CAST('1e2' AS DOUBLE)`.
+            Expr::Cast(cast) if matches!(cast.expr.as_ref(), Expr::Literal(..)) => {
+                Some(cast.field.data_type().clone())
+            }
+            _ => None,
+        };
+        let types: Vec<DataType> = rows
+            .iter()
+            .filter_map(|row| literal_type(&row[column]))
+            .collect();
+        if types.iter().any(is_float) && types.iter().any(is_exact_numeric) {
+            for row in &mut rows {
+                if literal_type(&row[column]).is_some_and(|t| is_exact_numeric(&t)) {
+                    row[column] = to_double(&row[column]);
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// Trino's common supertype of a double and an exact number is double, also
+/// across set operations (`SELECT 1.5 UNION SELECT 2e0` is a `double`);
+/// DataFusion would widen both into a wide decimal. Wraps the inputs whose
+/// column is exact, where another input's is double, in a projection that
+/// casts it to double.
+fn widen_union_to_double(inputs: Vec<Arc<LogicalPlan>>) -> Result<Vec<Arc<LogicalPlan>>> {
+    let width = inputs
+        .first()
+        .map_or(0, |input| input.schema().fields().len());
+    let mut widen = vec![false; width];
+    for (i, flag) in widen.iter_mut().enumerate() {
+        let types: Vec<&DataType> = inputs
+            .iter()
+            .filter_map(|input| input.schema().fields().get(i))
+            .map(|f| f.data_type())
+            .collect();
+        *flag = types.iter().any(|t| is_float(t)) && types.iter().any(|t| is_exact_numeric(t));
+    }
+    if !widen.iter().any(|w| *w) {
+        return Ok(inputs);
+    }
+    inputs
+        .into_iter()
+        .map(|input| {
+            let needs = input
+                .schema()
+                .fields()
+                .iter()
+                .zip(&widen)
+                .any(|(f, w)| *w && is_exact_numeric(f.data_type()));
+            if !needs {
+                return Ok(input);
+            }
+            let exprs: Vec<Expr> = input
+                .schema()
+                .iter()
+                .zip(&widen)
+                .map(|((qualifier, field), w)| {
+                    let column = Expr::Column(datafusion::common::Column::from((qualifier, field)));
+                    if *w && is_exact_numeric(field.data_type()) {
+                        to_double(&column).alias_qualified(qualifier.cloned(), field.name())
+                    } else {
+                        column
+                    }
+                })
+                .collect();
+            Ok(Arc::new(LogicalPlan::Projection(Projection::try_new(
+                exprs, input,
+            )?)))
+        })
+        .collect()
+}
+
 /// Wrap a scan whose schema has non-millisecond timestamps in a projection
 /// that rounds them, keeping every (qualifier, name) pair.
 fn round_scan_timestamps(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
@@ -636,22 +971,53 @@ impl AnalyzerRule for TrinoSemantics {
                 return round_scan_timestamps(node);
             }
             let schema = input_schema(&node);
+            // Sorting arrays uses Trino's ordering operator, which refuses
+            // NULL elements.
+            let node = if let LogicalPlan::Sort(sort) = node {
+                let mut sort = sort;
+                for item in &mut sort.expr {
+                    if item.expr.get_type(&schema).is_ok_and(|t| is_list(&t)) {
+                        item.expr = udf_call(TrinoArraySortKey::new(), vec![item.expr.clone()]);
+                    }
+                }
+                LogicalPlan::Sort(sort)
+            } else {
+                node
+            };
             let name_preserver = NamePreserver::new(&node);
-            let transformed = node.map_expressions(|expr| {
+            let mut transformed = node.map_expressions(|expr| {
                 let original = name_preserver.save(&expr);
                 rewrite_expr(expr, &schema).map(|t| t.update_data(|e| original.restore(e)))
             })?;
+            // Nodes keep the schema computed at planning, where the literals
+            // were still `bigint`; recompute it from the rewritten
+            // expressions and inputs so the narrowed types show through
+            // set operations and joins (`SELECT 1 UNION SELECT 1` stays
+            // `integer`, as on Trino: DataFusion's coercion derives the
+            // union type from the input schemas).
+            transformed.data = match transformed.data {
+                LogicalPlan::Union(union) => LogicalPlan::Union(Union::try_new_with_loose_types(
+                    widen_union_to_double(union.inputs)?,
+                )?),
+                other => other.recompute_schema()?,
+            };
             // `VALUES` keeps its planned schema; rebuild it so the narrowed
             // literal types show.
-            if let LogicalPlan::Values(values) = &transformed.data
-                && transformed.transformed
-            {
-                let rebuilt = LogicalPlanBuilder::values(values.values.clone())?.build()?;
-                return Ok(Transformed::yes(rebuilt));
+            if let LogicalPlan::Values(values) = &transformed.data {
+                let rows = narrow_values(&values.values);
+                if rows != values.values {
+                    let rebuilt = LogicalPlanBuilder::values(rows)?.build()?;
+                    return Ok(Transformed::yes(rebuilt));
+                }
             }
             Ok(transformed)
         })
-        .map(|t| t.data)
+        .map(|t| {
+            if std::env::var_os("GLAUX_DEBUG_PLAN").is_some() {
+                eprintln!("after trino_semantics:\n{}", t.data.display_indent_schema());
+            }
+            t.data
+        })
     }
 
     fn name(&self) -> &str {
