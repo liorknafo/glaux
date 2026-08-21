@@ -9,7 +9,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-CRATES=(glaux-athena glaux-firehose glaux-catalog glaux-server)
+CRATES=(glaux-athena glaux-firehose glaux-catalog glaux-server glaux-fidelity)
 status=0
 
 for crate in "${CRATES[@]}"; do
