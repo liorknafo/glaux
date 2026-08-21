@@ -2,9 +2,10 @@
 //!
 //! [`QueryEngine`] is the trait the service drives: it receives the SQL text
 //! plus the execution context and returns Arrow batches with scan
-//! statistics. [`DataFusionEngine`] is the v0.1 passthrough implementation
-//! that hands the SQL straight to DataFusion's planner; the Trino-dialect
-//! translation layer (LIO-22) slots in behind the same trait.
+//! statistics. [`DataFusionEngine`] hands the SQL straight to DataFusion's
+//! planner (DataFusion's own dialect); [`crate::dialect::TrinoEngine`] wraps
+//! it with the Trino-dialect translation layer Athena clients need and is
+//! what the binaries should use.
 //!
 //! # Never silently wrong
 //!
@@ -69,6 +70,16 @@ pub enum EngineError {
         /// Why / what to do instead.
         message: String,
     },
+    /// A function was called with arguments it cannot handle (bad format
+    /// string, unknown unit, invalid JSON, ...), detected at translation or
+    /// at runtime. A user error.
+    #[error("INVALID_FUNCTION_ARGUMENT: {function}: {message}")]
+    InvalidArgument {
+        /// The function.
+        function: String,
+        /// What was wrong.
+        message: String,
+    },
     /// Execution failed after planning (I/O, type errors at runtime, ...).
     #[error("GENERIC_INTERNAL_ERROR: {0}")]
     Execution(String),
@@ -78,7 +89,7 @@ impl EngineError {
     /// Athena `ErrorCategory`: `2` for user errors, `1` for system errors.
     pub fn category(&self) -> i32 {
         match self {
-            Self::Plan(_) | Self::Unsupported { .. } => 2,
+            Self::Plan(_) | Self::Unsupported { .. } | Self::InvalidArgument { .. } => 2,
             Self::Execution(_) => 1,
         }
     }
@@ -89,7 +100,7 @@ impl EngineError {
     /// unsupported constructs, and `1` for engine failures.
     pub fn error_type(&self) -> i32 {
         match self {
-            Self::Plan(_) => 1001,
+            Self::Plan(_) | Self::InvalidArgument { .. } => 1001,
             Self::Unsupported { .. } => 1003,
             Self::Execution(_) => 1,
         }
@@ -139,7 +150,10 @@ impl DataFusionEngine {
 
     /// A per-query context whose default catalog/schema follow the
     /// request's `QueryExecutionContext`.
-    fn context_for(&self, request: &QueryRequest) -> Result<SessionContext, EngineError> {
+    pub(crate) fn context_for(
+        &self,
+        request: &QueryRequest,
+    ) -> Result<SessionContext, EngineError> {
         let catalog = match request.catalog.as_deref() {
             None => self.default_catalog.clone(),
             // Athena's built-in catalog name is case-insensitive on the wire.
@@ -195,7 +209,26 @@ fn reject_non_read(plan: &LogicalPlan) -> Result<(), EngineError> {
     }
 }
 
-fn plan_error(err: DataFusionError) -> EngineError {
+/// Recover a [`GlauxSqlError`](crate::dialect::GlauxSqlError) raised inside
+/// a UDF at runtime (carried as `DataFusionError::External`).
+fn glaux_error(err: &DataFusionError) -> Option<EngineError> {
+    match err.find_root() {
+        DataFusionError::External(inner) => inner
+            .downcast_ref::<crate::dialect::GlauxSqlError>()
+            .cloned()
+            .map(EngineError::from),
+        _ => None,
+    }
+}
+
+pub(crate) fn execution_error(err: DataFusionError) -> EngineError {
+    glaux_error(&err).unwrap_or_else(|| EngineError::Execution(err.to_string()))
+}
+
+pub(crate) fn plan_error(err: DataFusionError) -> EngineError {
+    if let Some(user) = glaux_error(&err) {
+        return user;
+    }
     // Planning errors arrive wrapped in `Context`/`Diagnostic` layers;
     // classify on the root cause.
     match err.find_root() {
@@ -243,39 +276,50 @@ impl ExecutionPlanVisitor for ScanAccountant {
     }
 }
 
+/// Gate, optimise, and execute a logical plan, accounting for scanned bytes.
+/// `started` is when the engine began work on the request, so the reported
+/// engine time covers parsing and planning too.
+///
+/// Planning happens first, then the read-only gate: `SessionContext::sql`
+/// would *execute* DDL and SET statements eagerly, so the gate must sit
+/// between planning and execution.
+pub(crate) async fn run_logical_plan(
+    ctx: &SessionContext,
+    logical_plan: LogicalPlan,
+    started: Instant,
+) -> Result<QueryOutput, EngineError> {
+    reject_non_read(&logical_plan)?;
+    let df = ctx
+        .execute_logical_plan(logical_plan)
+        .await
+        .map_err(plan_error)?;
+    let task_ctx = Arc::new(df.task_ctx());
+    let plan = df.create_physical_plan().await.map_err(plan_error)?;
+    let schema = plan.schema();
+    let batches = collect(Arc::clone(&plan), task_ctx)
+        .await
+        .map_err(execution_error)?;
+    let mut accountant = ScanAccountant::default();
+    accept(plan.as_ref(), &mut accountant).map_err(|e| EngineError::Execution(e.to_string()))?;
+    Ok(QueryOutput {
+        schema,
+        batches,
+        data_scanned_bytes: Some(accountant.bytes),
+        engine_time_millis: started.elapsed().as_millis() as u64,
+    })
+}
+
 #[async_trait]
 impl QueryEngine for DataFusionEngine {
     async fn execute(&self, request: QueryRequest) -> Result<QueryOutput, EngineError> {
         let started = Instant::now();
         let ctx = self.context_for(&request)?;
-        // Plan first, then gate: `SessionContext::sql` would *execute* DDL
-        // and SET statements eagerly, so the gate must sit between planning
-        // and execution.
         let logical_plan = ctx
             .state()
             .create_logical_plan(&request.sql)
             .await
             .map_err(plan_error)?;
-        reject_non_read(&logical_plan)?;
-        let df = ctx
-            .execute_logical_plan(logical_plan)
-            .await
-            .map_err(plan_error)?;
-        let task_ctx = Arc::new(df.task_ctx());
-        let plan = df.create_physical_plan().await.map_err(plan_error)?;
-        let schema = plan.schema();
-        let batches = collect(Arc::clone(&plan), task_ctx)
-            .await
-            .map_err(|e| EngineError::Execution(e.to_string()))?;
-        let mut accountant = ScanAccountant::default();
-        accept(plan.as_ref(), &mut accountant)
-            .map_err(|e| EngineError::Execution(e.to_string()))?;
-        Ok(QueryOutput {
-            schema,
-            batches,
-            data_scanned_bytes: Some(accountant.bytes),
-            engine_time_millis: started.elapsed().as_millis() as u64,
-        })
+        run_logical_plan(&ctx, logical_plan, started).await
     }
 }
 
