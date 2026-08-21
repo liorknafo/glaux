@@ -27,9 +27,9 @@ use sqlparser::ast::{
     DateTimeField, Distinct, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident,
     JoinConstraint, JoinOperator, NamedWindowExpr, ObjectName, ObjectNamePart, OrderByExpr,
-    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Subscript, TableAlias, TableFactor,
-    TableWithJoins, TimezoneInfo, TrimWhereField, UnaryOperator, Value, Visit, VisitMut, Visitor,
-    VisitorMut, WindowType,
+    OrderByKind, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
+    Subscript, TableAlias, TableFactor, TableWithJoins, TimezoneInfo, TrimWhereField,
+    UnaryOperator, Value, Visit, VisitMut, Visitor, VisitorMut, WindowType,
 };
 
 use super::error::GlauxSqlError;
@@ -61,6 +61,11 @@ struct Rewriter {
 
 impl VisitorMut for Rewriter {
     type Break = Box<GlauxSqlError>;
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        fold_negative_integer_literal(expr);
+        ControlFlow::Continue(())
+    }
 
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         match rewrite_expr(expr) {
@@ -478,7 +483,13 @@ fn wrap_values_body(body: &mut Box<SetExpr>) {
 fn rewrite_set_expr(body: &mut SetExpr) -> Result<(), GlauxSqlError> {
     match body {
         SetExpr::Select(select) => rewrite_select(select),
-        SetExpr::SetOperation { left, right, .. } => {
+        SetExpr::SetOperation {
+            left,
+            right,
+            op,
+            set_quantifier,
+        } => {
+            check_set_operation(*op, *set_quantifier)?;
             rewrite_set_expr(left)?;
             rewrite_set_expr(right)
         }
@@ -494,6 +505,30 @@ fn rewrite_set_expr(body: &mut SetExpr) -> Result<(), GlauxSqlError> {
                 "writes arrive in v0.2",
             ))
         }
+    }
+}
+
+/// `EXCEPT ALL` is bag difference in Trino (`{1, 1, 1} EXCEPT ALL {1}` is
+/// `{1, 1}`); DataFusion plans it as an anti-join, which removes every
+/// left row whose value appears on the right at all, so it is refused
+/// rather than run with the wrong multiplicities. `INTERSECT ALL` is
+/// correct in DataFusion. The `BY NAME` quantifiers are not Trino syntax.
+fn check_set_operation(op: SetOperator, quantifier: SetQuantifier) -> Result<(), GlauxSqlError> {
+    match (op, quantifier) {
+        (SetOperator::Except, SetQuantifier::All) => Err(GlauxSqlError::unsupported(
+            "EXCEPT ALL",
+            "Trino's EXCEPT ALL keeps the left rows by multiplicity (bag difference); DataFusion \
+             runs it as an anti-join and would drop every matching row. Use EXCEPT (distinct), \
+             or count the rows per value with a GROUP BY and row_number() on each side",
+        )),
+        (_, SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName) => {
+            Err(GlauxSqlError::unsupported(
+                format!("{op} {quantifier}"),
+                "`BY NAME` set operations are not Trino syntax; set operations match columns by \
+             position",
+            ))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -1068,7 +1103,11 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             let Value::Number(text, _) = &v.value else {
                 unreachable!()
             };
-            let digits = text.trim_start_matches('0').len().max(1);
+            let digits = text
+                .trim_start_matches(['-', '+'])
+                .trim_start_matches('0')
+                .len()
+                .max(1);
             if digits > 38 {
                 return Err(GlauxSqlError::unsupported(
                     "DECIMAL precision above 38",
@@ -1268,6 +1307,30 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             }
             rewrite_like_pattern(pattern, escape_char.take())
         }
+        Expr::IsTrue(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotFalse(_)
+        | Expr::IsUnknown(_)
+        | Expr::IsNotUnknown(_) => {
+            let form = match expr {
+                Expr::IsTrue(_) => "IS TRUE",
+                Expr::IsNotTrue(_) => "IS NOT TRUE",
+                Expr::IsFalse(_) => "IS FALSE",
+                Expr::IsNotFalse(_) => "IS NOT FALSE",
+                Expr::IsUnknown(_) => "IS UNKNOWN",
+                _ => "IS NOT UNKNOWN",
+            };
+            Err(GlauxSqlError::unsupported(
+                form,
+                "not Trino syntax (its predicates are IS [NOT] NULL and IS [NOT] DISTINCT \
+                 FROM); write `x = true`, `coalesce(x, false)`, `x IS NULL`, ... instead",
+            ))
+        }
+        Expr::IsNormalized { .. } => Err(GlauxSqlError::unsupported(
+            "IS NORMALIZED",
+            "not Trino syntax; use normalize(x) = x",
+        )),
         Expr::ILike { .. } => Err(GlauxSqlError::unsupported(
             "ILIKE",
             "not Trino syntax; use lower(x) LIKE lower(pattern)",
@@ -1276,6 +1339,16 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             "SIMILAR TO / RLIKE",
             "not Trino syntax; use regexp_like",
         )),
+        // A scalar subquery over a non-nullable source (`VALUES`, a
+        // literal, a NOT NULL column) is NULL when it returns no rows, but
+        // DataFusion carries the source's nullability into the output
+        // schema and fails at execution (`declared as non-nullable but
+        // contains null values`). The wrapper declares a nullable result.
+        Expr::Subquery(_) => {
+            let subquery = take(expr);
+            *expr = func("trino_nullable", vec![subquery]);
+            Ok(())
+        }
         Expr::Lambda(_) => Err(GlauxSqlError::unsupported(
             "lambda expression",
             "`x -> ...` arguments are not translated; express the logic with explicit SQL",
@@ -1481,6 +1554,27 @@ fn translate_like_pattern(pattern: &str, escape: Option<char>) -> Result<String,
         }
     }
     Ok(out)
+}
+
+/// Trino's grammar reads `-<digits>` as one literal (`MINUS? INTEGER_VALUE`),
+/// so `-9223372036854775808` is a `bigint` and `-9223372036854775808 - 1`
+/// overflows. sqlparser reads a unary minus applied to the unsigned
+/// literal, which glaux would type as `decimal(19,0)` (the magnitude is
+/// beyond bigint) before the minus is seen. Folded before the children are
+/// visited so the literal rules see the signed text.
+fn fold_negative_integer_literal(expr: &mut Expr) {
+    if let Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        expr: inner,
+    } = expr
+        && let Expr::Value(v) = inner.as_ref()
+        && let Value::Number(text, long) = &v.value
+        && !text.contains(['e', 'E', '.'])
+        && !text.starts_with(['-', '+'])
+    {
+        let folded = Value::Number(format!("-{text}"), *long).with_span(v.span);
+        *expr = Expr::Value(folded);
+    }
 }
 
 fn is_exponent_literal(value: &Value) -> bool {
@@ -1743,6 +1837,15 @@ fn check_passthrough_arity(name: &str, f: &Function) -> Result<(), GlauxSqlError
             name,
             "the 3-argument form strpos(string, substring, instance) is not supported",
         )),
+        // Trino has only `log(base, x)`; DataFusion's one-argument `log`
+        // is `log10`.
+        ("log", n) if n != 2 => Err(GlauxSqlError::invalid_arguments(
+            name,
+            format!(
+                "Unexpected parameters ({n} argument(s)) for function log: Trino has only \
+                 log(base, x); use log10(x), log2(x), or ln(x)"
+            ),
+        )),
         _ => Ok(()),
     }
 }
@@ -1913,10 +2016,17 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             } else {
                 "Timestamp(Millisecond, Some(\"UTC\"))"
             };
+            // chrono accepts a leap second (`:60`) and DataFusion would
+            // roll it over into the next minute; Joda rejects it. The
+            // check UDF returns its input unchanged.
+            let checked = func(
+                "trino_check_parsed_time",
+                vec![args[0].clone(), str_lit(&chrono)],
+            );
             func(
                 "arrow_cast",
                 vec![
-                    func("to_timestamp", vec![args[0].clone(), str_lit(&chrono)]),
+                    func("to_timestamp", vec![checked, str_lit(&chrono)]),
                     str_lit(target),
                 ],
             )
@@ -2172,7 +2282,7 @@ mod tests {
     fn date_functions_translate_formats_and_units() {
         assert_eq!(
             rewrite("SELECT date_parse(s, '%Y-%m-%d %H:%i:%s') AS a, format_datetime(ts, 'yyyy-MM-dd') AS b, parse_datetime(s, 'yyyy') AS c FROM t").unwrap(),
-            "SELECT arrow_cast(to_timestamp(s, '%Y-%m-%d %H:%M:%S'), 'Timestamp(Millisecond, None)') AS a, to_char(ts, '%Y-%m-%d') AS b, arrow_cast(to_timestamp(s, '%Y'), 'Timestamp(Millisecond, Some(\"UTC\"))') AS c FROM t"
+            "SELECT arrow_cast(to_timestamp(trino_check_parsed_time(s, '%Y-%m-%d %H:%M:%S'), '%Y-%m-%d %H:%M:%S'), 'Timestamp(Millisecond, None)') AS a, to_char(ts, '%Y-%m-%d') AS b, arrow_cast(to_timestamp(trino_check_parsed_time(s, '%Y'), '%Y'), 'Timestamp(Millisecond, Some(\"UTC\"))') AS c FROM t"
         );
         assert_eq!(
             rewrite("SELECT day_of_week(d) AS a, month(d) AS b FROM t").unwrap(),
@@ -2310,6 +2420,11 @@ mod tests {
                 "SEMI / ANTI JOIN",
             ),
             ("SELECT [1, 2]", "[...] array literal"),
+            ("SELECT a IS TRUE FROM t", "IS TRUE"),
+            ("SELECT a FROM t WHERE a IS NOT FALSE", "IS NOT FALSE"),
+            ("SELECT a IS UNKNOWN FROM t", "IS UNKNOWN"),
+            ("SELECT 1 EXCEPT ALL SELECT 1", "EXCEPT ALL"),
+            ("SELECT 1 UNION BY NAME SELECT 1", "UNION BY NAME"),
             ("SELECT 1::INT", ":: cast"),
             ("SELECT TOP 1 a FROM t", "TOP"),
             (
@@ -2342,6 +2457,41 @@ mod tests {
         assert!(!literal_has_zone("10:00:00"));
         assert!(literal_has_zone("2024-01-05 10:00:00 UTC"));
         assert!(literal_has_zone("2024-01-05 10:00:00 -05:00"));
+    }
+
+    #[test]
+    fn unary_minus_folds_into_integer_literals_only() {
+        assert_eq!(
+            rewrite("SELECT -9223372036854775808 AS a, -1 AS b, -(1) AS c, 3 -1 AS d, -1.5 AS e, -1e2 AS f, -x AS g FROM t")
+                .unwrap(),
+            "SELECT -9223372036854775808 AS a, -1 AS b, -(1) AS c, 3 - 1 AS d, -1.5 AS e, -CAST('1e2' AS DOUBLE) AS f, -x AS g FROM t"
+        );
+        // Beyond bigint either way: a decimal with the digit count of the
+        // magnitude.
+        assert_eq!(
+            rewrite("SELECT -99999999999999999999 AS a").unwrap(),
+            "SELECT CAST('-99999999999999999999' AS DECIMAL(20,0)) AS a"
+        );
+        // Set operations other than EXCEPT ALL keep their quantifiers.
+        rewrite("SELECT 1 INTERSECT ALL SELECT 1").unwrap();
+        rewrite("SELECT 1 EXCEPT SELECT 1").unwrap();
+        rewrite("SELECT 1 EXCEPT DISTINCT SELECT 1").unwrap();
+    }
+
+    #[test]
+    fn one_argument_log_is_refused() {
+        let err = rewrite("SELECT log(100)").unwrap_err();
+        assert!(err.to_string().contains("log(base, x)"), "{err}");
+        rewrite("SELECT log(10, 100)").unwrap();
+    }
+
+    #[test]
+    fn scalar_subqueries_are_wrapped_nullable() {
+        assert_eq!(
+            rewrite("SELECT (SELECT max(a) FROM t) AS m, b IN (SELECT a FROM t) AS i FROM u")
+                .unwrap(),
+            "SELECT trino_nullable((SELECT max(a) AS _col0 FROM t)) AS m, b IN (SELECT a FROM t) AS i FROM u"
+        );
     }
 
     #[test]

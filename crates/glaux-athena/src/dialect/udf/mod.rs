@@ -29,6 +29,7 @@ pub mod decimal;
 pub mod iso8601;
 pub mod json;
 pub mod math;
+pub mod nullable;
 pub mod regex;
 pub mod strings;
 pub mod timestamps;
@@ -103,6 +104,7 @@ pub fn all() -> Vec<ScalarUDF> {
     udfs.extend(timestamps::all());
     udfs.extend(decimal::scalar_udfs());
     udfs.extend(math::all());
+    udfs.extend(nullable::all());
     udfs.extend(regex::all());
     udfs.extend(arithmetic::scalar_udfs());
     udfs
