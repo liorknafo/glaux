@@ -374,6 +374,44 @@ fn classify(err: DataFusionError) -> EngineError {
                     trino_type_list(args)
                 ));
             }
+            // An aggregate in `WHERE`: Trino's analyzer refuses it with the
+            // same sentence it uses for a window function there.
+            if root_message.contains("Aggregate functions are not allowed in the WHERE clause") {
+                return EngineError::Data {
+                    code: "EXPRESSION_NOT_SCALAR".to_string(),
+                    message: "WHERE clause cannot contain aggregations, window functions or \
+                              grouping operations"
+                        .to_string(),
+                };
+            }
+            // A column alias list that does not match the relation's width:
+            // DataFusion counts "Source table contains 2 columns but only 1
+            // names given as column alias"; Trino names both counts the
+            // other way round.
+            if let Some(rest) =
+                root_message.strip_prefix("Error during planning: Source table contains ")
+                && let Some((columns, rest)) = rest.split_once(" columns but only ")
+                && let Some((aliases, _)) = rest.split_once(" names given as column alias")
+            {
+                return EngineError::Plan(format!(
+                    "Column alias list has {aliases} entries but relation has {columns} columns"
+                ));
+            }
+            // A select item that is neither grouped nor aggregated.
+            // DataFusion's diagnostic talks about "expanding wildcard" even
+            // when the query has none, and names the GROUP BY column
+            // instead of the offending one.
+            if let Some(rest) = root_message
+                .split("column \"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                && root_message
+                    .contains("Column in SELECT must be in GROUP BY or an aggregate function")
+            {
+                return EngineError::Plan(format!(
+                    "'{rest}' must be an aggregate expression or appear in GROUP BY clause"
+                ));
+            }
             // A correlated subquery DataFusion's decorrelation could not
             // turn into a join (an `ORDER BY` or `LIMIT` inside it, or a
             // correlation equality glaux routed through its IEEE double
@@ -504,6 +542,26 @@ fn runtime_message(message: &str) -> String {
         "Execution error: ",
     ] {
         text = text.strip_prefix(prefix).unwrap_or(text);
+    }
+    // Arrow's cast diagnostics name Arrow types and its own kernels
+    // ("Cannot cast string '1.5' to value of Int32 type", "Can't cast value
+    // 2147483648 to type Int32"); Trino names the SQL type and separates
+    // an unparsable text from an out-of-range value. (The `CAST(... AS
+    // DOUBLE / REAL / DECIMAL / DATE / TIMESTAMP / BOOLEAN)` paths are Rust
+    // UDFs that already word their own failures like Trino.)
+    if let Some(rest) = text.strip_prefix("Cannot cast string '")
+        && let Some((value, arrow_type)) = rest.rsplit_once("' to value of ")
+        && let Some(arrow_type) = arrow_type.strip_suffix(" type")
+    {
+        return format!("Cannot cast '{value}' to {}", trino_type_tokens(arrow_type));
+    }
+    if let Some(rest) = text.strip_prefix("Can't cast value ")
+        && let Some((value, arrow_type)) = rest.rsplit_once(" to type ")
+    {
+        return format!(
+            "Out of range for {}: {value}",
+            trino_type_tokens(arrow_type)
+        );
     }
     // Arrow names the array type in its integer-kernel overflows
     // ("Int64Array overflow on abs(...)"); Trino names the SQL type.
@@ -746,9 +804,20 @@ mod tests {
                 None,
             )),
         ));
+        // ...and Arrow's cast wording is replaced with Trino's.
         assert_eq!(
             err.to_string(),
-            "INVALID_CAST_ARGUMENT: Cannot cast string '9999999999' to value of Int32 type"
+            "INVALID_CAST_ARGUMENT: Cannot cast '9999999999' to integer"
+        );
+        let err = classify(DataFusionError::ArrowError(
+            Box::new(ArrowError::CastError(
+                "Can't cast value 2147483648 to type Int32".to_string(),
+            )),
+            None,
+        ));
+        assert_eq!(
+            err.to_string(),
+            "INVALID_CAST_ARGUMENT: Out of range for integer: 2147483648"
         );
     }
 

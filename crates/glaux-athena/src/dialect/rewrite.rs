@@ -214,6 +214,7 @@ fn rewrite_query(query: &mut Query, wrap_values: bool) -> Result<(), GlauxSqlErr
             OrderByKind::Expressions(items) => default_nulls_last(items)?,
         }
     }
+    check_row_counts(query)?;
     if wrap_values && matches!(query.body.as_ref(), SetExpr::Values(_)) {
         wrap_values_body(&mut query.body);
     }
@@ -221,6 +222,48 @@ fn rewrite_query(query: &mut Query, wrap_values: bool) -> Result<(), GlauxSqlErr
         check_using_references(select, query.order_by.as_ref())?;
     }
     rewrite_set_expr(&mut query.body)
+}
+
+/// Trino's grammar takes a bare `INTEGER_VALUE` for `LIMIT` and `OFFSET`,
+/// so `LIMIT -1` is a parse error there. DataFusion accepts the negative
+/// literal and fails inside an optimizer rule, leaking the rule's name
+/// (`Optimizer rule 'eliminate_limit' failed`), so the row counts are
+/// checked here instead.
+fn check_row_counts(query: &Query) -> Result<(), GlauxSqlError> {
+    let Some(limit_clause) = &query.limit_clause else {
+        return Ok(());
+    };
+    let (limit, offset) = match limit_clause {
+        sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. } => {
+            (limit.as_ref(), offset.as_ref().map(|o| &o.value))
+        }
+        sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
+            (Some(limit), Some(offset))
+        }
+    };
+    for (clause, value) in [("LIMIT", limit), ("OFFSET", offset)] {
+        if value.is_some_and(is_negative_number) {
+            return Err(GlauxSqlError::Parse {
+                message: format!(
+                    "{clause} takes a non-negative row count in Trino (its grammar has no sign \
+                     there), so `{clause} -n` is refused"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A negative numeric literal, however the parser spelled it.
+fn is_negative_number(expr: &Expr) -> bool {
+    match expr {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => matches!(expr.as_ref(), Expr::Value(v) if matches!(&v.value, Value::Number(..))),
+        Expr::Value(v) => matches!(&v.value, Value::Number(text, _) if text.starts_with('-')),
+        _ => false,
+    }
 }
 
 /// `FETCH FIRST n ROWS ONLY` is Trino syntax equivalent to `LIMIT n`;
@@ -1742,6 +1785,15 @@ fn rewrite_cast(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             }
             Ok(())
         }
+        DataType::JSON | DataType::JSONB => Err(GlauxSqlError::unsupported(
+            "CAST(... AS JSON)",
+            "glaux carries Trino's JSON type as the varchar holding its text, and Trino's \
+             `CAST(x AS JSON)` does not mean \"the text\": it builds the JSON *value* for x, so \
+             `CAST('abc' AS JSON)` is the JSON string `\"abc\"` and casting a column of JSON \
+             documents wraps each document in quotes. Returning the text would be a different \
+             answer from Athena's. Use json_parse(x) to read a document, json_format(x) to write \
+             one, and json_extract / json_extract_scalar to read inside it",
+        )),
         DataType::Char(_) | DataType::Character(_) => Err(GlauxSqlError::unsupported(
             "CAST(... AS CHAR(n))",
             "Trino's CHAR type pads to n characters and compares ignoring trailing spaces; \

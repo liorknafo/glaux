@@ -27,8 +27,8 @@
 //! DataFusion the month/day/nanosecond triple.
 
 use arrow::datatypes::DataType;
-use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, Operator};
 
 use super::error::GlauxSqlError;
@@ -186,7 +186,22 @@ fn check_operands(
     let (Ok(left_type), Ok(right_type)) = (left.get_type(schema), right.get_type(schema)) else {
         return Ok(());
     };
-    check_types(&left_type, op, &right_type)
+    check_types(&left_type, op, &right_type).map_err(|err| match &err {
+        // Re-render the operand types from the expressions, so a literal
+        // reports the type Trino gives it (`1 = '1'` is `integer =
+        // varchar(1)`, not `bigint = varchar`).
+        GlauxSqlError::TypeMismatch { message }
+            if message.starts_with("Cannot apply operator: ") =>
+        {
+            GlauxSqlError::type_mismatch(format!(
+                "Cannot apply operator: {} {} {}",
+                trino_expr_type_name(left, &left_type),
+                operator_text(op),
+                trino_expr_type_name(right, &right_type)
+            ))
+        }
+        _ => err,
+    })
 }
 
 fn check_types(left: &DataType, op: Operator, right: &DataType) -> Result<(), GlauxSqlError> {
@@ -236,26 +251,45 @@ fn check_types(left: &DataType, op: Operator, right: &DataType) -> Result<(), Gl
     )))
 }
 
+/// Trino's name for an expression's type, narrowing the two places where
+/// the literal is typed more precisely than the plan says at this point:
+/// DataFusion plans every integer literal as `bigint` (glaux's analyzer
+/// narrows it to `integer` later, and Trino types it `integer` from the
+/// start), and a string literal is `varchar(n)` for its code-point length,
+/// not an unbounded `varchar`.
+pub(crate) fn trino_expr_type_name(expr: &Expr, data_type: &DataType) -> String {
+    match expr {
+        Expr::Literal(ScalarValue::Int64(Some(v)), _) if i32::try_from(*v).is_ok() => {
+            "integer".to_string()
+        }
+        Expr::Literal(ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)), _) => {
+            format!("varchar({})", text.chars().count())
+        }
+        Expr::Alias(alias) => trino_expr_type_name(&alias.expr, data_type),
+        _ => trino_type_name(data_type),
+    }
+}
+
 /// Trino requires the results of `CASE` / `if` / `coalesce` / `nullif` /
 /// `greatest` / `least` to share a type; `what` names the construct in the
 /// diagnostic.
 fn check_common_type(what: &str, exprs: &[&Expr], schema: &DFSchema) -> Result<(), GlauxSqlError> {
-    let mut types: Vec<DataType> = Vec::new();
+    let mut typed: Vec<(&Expr, DataType)> = Vec::new();
     for e in exprs {
         if let Ok(t) = e.get_type(schema) {
-            types.push(t);
+            typed.push((e, t));
         }
     }
-    let Some(first) = types.iter().find(|t| class(t) != Class::Null) else {
+    let Some((first_expr, first)) = typed.iter().find(|(_, t)| class(t) != Class::Null) else {
         return Ok(());
     };
-    for t in &types {
+    for (expr, t) in &typed {
         if !comparable(first, t) {
             return Err(GlauxSqlError::type_mismatch(format!(
                 "All {what} must be the same type or coercible to a common type. Cannot find \
                  common type between {} and {}",
-                trino_type_name(first),
-                trino_type_name(t)
+                trino_expr_type_name(first_expr, first),
+                trino_expr_type_name(expr, t)
             )));
         }
     }
@@ -335,10 +369,9 @@ fn aggregate_argument_class(name: &str) -> Option<(Class, &'static str)> {
 /// `TYPE_MISMATCH: Unexpected parameters (varchar) for function abs:
 /// expected a numeric argument`, Trino's shape for a signature that has no
 /// overload for the argument type.
-fn unexpected_parameters(name: &str, actual: &DataType, expected: &str) -> GlauxSqlError {
+fn unexpected_parameters(name: &str, actual: &str, expected: &str) -> GlauxSqlError {
     GlauxSqlError::type_mismatch(format!(
-        "Unexpected parameters ({}) for function {}: expected {expected}",
-        trino_type_name(actual),
+        "Unexpected parameters ({actual}) for function {}: expected {expected}",
         trino_function_name(name)
     ))
 }
@@ -361,7 +394,11 @@ fn check_argument_class(
     if class(&t) == class_wanted || class(&t) == Class::Null || class(&t) == Class::Other {
         return Ok(());
     }
-    Err(unexpected_parameters(name, &t, expected))
+    Err(unexpected_parameters(
+        name,
+        &trino_expr_type_name(arg, &t),
+        expected,
+    ))
 }
 
 /// Whether Trino has a cast between these type classes (varchar sources are
@@ -578,12 +615,12 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
                             && !matches!(class(&t), Class::String | Class::Null)
                             && !(name == "character_length" && class(&t) == Class::Binary)
                         {
+                            let actual = trino_expr_type_name(arg, &t);
                             return Err(GlauxSqlError::type_mismatch(format!(
-                                "Unexpected parameters ({}) for function {}: expected varchar \
-                                 (Trino does not convert {} to varchar implicitly; use CAST)",
-                                trino_type_name(&t),
+                                "Unexpected parameters ({actual}) for function {}: expected \
+                                 varchar (Trino does not convert {actual} to varchar implicitly; \
+                                 use CAST)",
                                 trino_function_name(name),
-                                trino_type_name(&t)
                             )));
                         }
                     }
@@ -595,8 +632,51 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
     }
 }
 
+/// Trino refuses a window function in a `WHERE` or `HAVING` predicate at
+/// analysis time (`EXPRESSION_NOT_SCALAR`). DataFusion plans it and only
+/// gives up in the physical planner, where it dumps the Rust `Debug` of the
+/// window expression.
+fn check_no_window_function(node: &LogicalPlan) -> Result<(), GlauxSqlError> {
+    let LogicalPlan::Filter(filter) = node else {
+        return Ok(());
+    };
+    let mut found = false;
+    let _ = filter.predicate.apply(|e| {
+        if matches!(e, Expr::WindowFunction(_)) {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    if !found {
+        return Ok(());
+    }
+    // `HAVING` plans as a `Filter` over the `Aggregate` (through the
+    // aggregate's own projection); `WHERE` sits under it.
+    let having = matches!(
+        strip_projection(&filter.input),
+        LogicalPlan::Aggregate(_) | LogicalPlan::Distinct(_)
+    );
+    Err(GlauxSqlError::runtime(
+        "EXPRESSION_NOT_SCALAR",
+        if having {
+            "HAVING clause cannot contain window functions or grouping operations"
+        } else {
+            "WHERE clause cannot contain aggregations, window functions or grouping operations"
+        },
+    ))
+}
+
+fn strip_projection(plan: &LogicalPlan) -> &LogicalPlan {
+    match plan {
+        LogicalPlan::Projection(projection) => strip_projection(&projection.input),
+        other => other,
+    }
+}
+
 /// Plan-level checks: join conditions and set-operation columns.
 fn check_plan_node(node: &LogicalPlan, schema: &DFSchema) -> Result<(), GlauxSqlError> {
+    check_no_window_function(node)?;
     match node {
         LogicalPlan::Join(join) => {
             for (left, right) in &join.on {
@@ -636,12 +716,18 @@ fn check_plan_node(node: &LogicalPlan, schema: &DFSchema) -> Result<(), GlauxSql
         // [`values_row_expr`] so the planner's own coercion casts do not
         // hide the type the user wrote.
         LogicalPlan::Values(values) => {
-            let row_types: Vec<Vec<Option<DataType>>> = values
+            let row_types: Vec<Vec<Option<(DataType, String)>>> = values
                 .values
                 .iter()
                 .map(|row| {
                     row.iter()
-                        .map(|e| values_row_expr(e).get_type(schema).ok())
+                        .map(|e| {
+                            let inner = values_row_expr(e);
+                            inner.get_type(schema).ok().map(|t| {
+                                let name = trino_expr_type_name(inner, &t);
+                                (t, name)
+                            })
+                        })
                         .collect()
                 })
                 .collect();
@@ -650,7 +736,7 @@ fn check_plan_node(node: &LogicalPlan, schema: &DFSchema) -> Result<(), GlauxSql
             };
             for other in row_types.iter().skip(1) {
                 let clash = first.iter().zip(other).any(|(a, b)| match (a, b) {
-                    (Some(a), Some(b)) => !comparable(a, b),
+                    (Some((a, _)), Some((b, _))) => !comparable(a, b),
                     _ => false,
                 });
                 if clash {
@@ -668,12 +754,12 @@ fn check_plan_node(node: &LogicalPlan, schema: &DFSchema) -> Result<(), GlauxSql
 }
 
 /// Trino's `row(integer, varchar(1))` rendering of a `VALUES` row's types.
-fn row_type_text(types: &[Option<DataType>]) -> String {
-    let names: Vec<String> = types
+fn row_type_text(types: &[Option<(DataType, String)>]) -> String {
+    let names: Vec<&str> = types
         .iter()
         .map(|t| match t {
-            Some(t) => trino_type_name(t),
-            None => "unknown".to_string(),
+            Some((_, name)) => name.as_str(),
+            None => "unknown",
         })
         .collect();
     format!("row({})", names.join(", "))
