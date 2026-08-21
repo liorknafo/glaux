@@ -14,7 +14,7 @@
 //!
 //! Configuration glaux cannot honor — Kinesis/MSK sources, non-S3
 //! destinations, Lambda processing, dynamic partitioning, source backup,
-//! KMS encryption — is rejected at `CreateDeliveryStream` /
+//! KMS encryption, customer-managed SSE keys — is rejected at `CreateDeliveryStream` /
 //! `UpdateDestination` time with an error naming the construct, rather than
 //! being accepted and ignored.
 
@@ -272,6 +272,33 @@ fn validate_conversion(
     }
 }
 
+/// Map `DeliveryStreamEncryptionConfigurationInput` onto what the stream
+/// will report. `AWS_OWNED_CMK` is honoured (recorded and echoed as
+/// `ENABLED`); `CUSTOMER_MANAGED_CMK` — which would require a real KMS key
+/// — is rejected by name rather than silently downgraded.
+fn resolve_stream_encryption(
+    input: Option<&DeliveryStreamEncryptionConfigurationInput>,
+) -> Result<DeliveryStreamEncryptionConfiguration, FirehoseError> {
+    let Some(input) = input else {
+        return Ok(DeliveryStreamEncryptionConfiguration::disabled());
+    };
+    match input.key_type.as_deref() {
+        Some("AWS_OWNED_CMK") => Ok(DeliveryStreamEncryptionConfiguration::aws_owned_cmk()),
+        Some("CUSTOMER_MANAGED_CMK") => Err(FirehoseError::invalid_argument(
+            "DeliveryStreamEncryptionConfigurationInput.KeyType CUSTOMER_MANAGED_CMK is not \
+             supported by glaux: there is no KMS to hold the key; use AWS_OWNED_CMK or omit \
+             encryption",
+        )),
+        Some(other) => Err(FirehoseError::invalid_argument(format!(
+            "DeliveryStreamEncryptionConfigurationInput.KeyType {other:?} is not valid: expected \
+             AWS_OWNED_CMK or CUSTOMER_MANAGED_CMK"
+        ))),
+        None => Err(FirehoseError::invalid_argument(
+            "DeliveryStreamEncryptionConfigurationInput.KeyType is required",
+        )),
+    }
+}
+
 /// Resolve a configuration (create) or an update layered on an existing
 /// description into a fully-validated description.
 fn resolve_destination(
@@ -367,6 +394,12 @@ fn resolve_destination(
                  implemented"
             )));
         }
+    }
+    if config.s3_backup_configuration.is_some() {
+        return Err(FirehoseError::invalid_argument(
+            "S3BackupConfiguration is not supported by glaux v0.1: source-record backup is not \
+             implemented, so the backup destination cannot be honoured",
+        ));
     }
 
     let dynamic_partitioning_configuration = config
@@ -572,6 +605,11 @@ impl FirehoseService {
                 )
             })?;
         let destination = Arc::new(resolve_destination(config, None)?);
+        let encryption = resolve_stream_encryption(
+            input
+                .delivery_stream_encryption_configuration_input
+                .as_ref(),
+        )?;
 
         let mut streams = self.streams.lock().unwrap();
         if streams.contains_key(&name) {
@@ -606,9 +644,7 @@ impl FirehoseService {
                 extended_s3_destination_description: (*destination).clone(),
             }],
             has_more_destinations: false,
-            delivery_stream_encryption_configuration: DeliveryStreamEncryptionConfiguration {
-                status: "DISABLED".to_string(),
-            },
+            delivery_stream_encryption_configuration: encryption,
         };
         let buffer = StreamBuffer::spawn(&name, &arn, destination, Arc::clone(&self.sink));
         streams.insert(
@@ -1182,5 +1218,78 @@ mod tests {
             Some(128),
             "unset field kept across the update"
         );
+    }
+
+    fn plain(name: &str) -> Value {
+        json!({
+            "DeliveryStreamName": name,
+            "ExtendedS3DestinationConfiguration": {
+                "RoleARN": "arn:aws:iam::000000000000:role/firehose",
+                "BucketARN": "arn:aws:s3:::lake"
+            }
+        })
+    }
+
+    async fn describe(service: &FirehoseService, name: &str) -> Value {
+        service
+            .handle(
+                "DescribeDeliveryStream",
+                json!({"DeliveryStreamName": name}).to_string().as_bytes(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn sse_with_aws_owned_cmk_is_honoured_and_echoed() {
+        let (service, _sink) = service();
+        let mut body = plain("sse");
+        body["DeliveryStreamEncryptionConfigurationInput"] = json!({"KeyType": "AWS_OWNED_CMK"});
+        create(&service, body).await.unwrap();
+        let described = describe(&service, "sse").await;
+        assert_eq!(
+            described["DeliveryStreamDescription"]["DeliveryStreamEncryptionConfiguration"],
+            json!({"Status": "ENABLED", "KeyType": "AWS_OWNED_CMK"})
+        );
+
+        create(&service, plain("nosse")).await.unwrap();
+        let described = describe(&service, "nosse").await;
+        assert_eq!(
+            described["DeliveryStreamDescription"]["DeliveryStreamEncryptionConfiguration"],
+            json!({"Status": "DISABLED"})
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_with_customer_managed_cmk_is_rejected_by_name() {
+        let (service, _sink) = service();
+        let mut body = plain("cmk");
+        body["DeliveryStreamEncryptionConfigurationInput"] = json!({
+            "KeyType": "CUSTOMER_MANAGED_CMK",
+            "KeyARN": "arn:aws:kms:us-east-1:000000000000:key/abc"
+        });
+        let err = create(&service, body).await.unwrap_err();
+        assert_eq!(err.code(), "InvalidArgumentException");
+        assert!(err.message().contains("CUSTOMER_MANAGED_CMK"), "{err}");
+        assert!(
+            service.handle("ListDeliveryStreams", b"{}").await.unwrap()["DeliveryStreamNames"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "rejected stream must not be created"
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_backup_configuration_is_rejected_by_name() {
+        let (service, _sink) = service();
+        let mut body = plain("bk");
+        body["ExtendedS3DestinationConfiguration"]["S3BackupConfiguration"] = json!({
+            "RoleARN": "arn:aws:iam::000000000000:role/firehose",
+            "BucketARN": "arn:aws:s3:::backup"
+        });
+        let err = create(&service, body).await.unwrap_err();
+        assert_eq!(err.code(), "InvalidArgumentException");
+        assert!(err.message().contains("S3BackupConfiguration"), "{err}");
     }
 }

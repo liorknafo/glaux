@@ -272,7 +272,8 @@ pub struct ExtendedS3DestinationConfiguration {
     /// `Disabled` | `Enabled` (source-record backup; rejected when enabled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s3_backup_mode: Option<String>,
-    /// Backup destination (only meaningful with backup enabled).
+    /// Backup destination (rejected: source-record backup is not
+    /// implemented, so it could not be honoured).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s3_backup_configuration: Option<Value>,
     /// Record format conversion.
@@ -387,12 +388,48 @@ pub struct DestinationDescription {
     pub extended_s3_destination_description: ExtendedS3DestinationDescription,
 }
 
-/// `DeliveryStreamEncryptionConfiguration` (always disabled locally).
+/// `DeliveryStreamEncryptionConfigurationInput` (server-side encryption
+/// at rest). Only `AWS_OWNED_CMK` can be honoured locally (there is nothing
+/// to encrypt with, so it is recorded and echoed); `CUSTOMER_MANAGED_CMK`
+/// is rejected by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct DeliveryStreamEncryptionConfigurationInput {
+    /// `AWS_OWNED_CMK` | `CUSTOMER_MANAGED_CMK`.
+    #[serde(default)]
+    pub key_type: Option<String>,
+    /// KMS key ARN (only with `CUSTOMER_MANAGED_CMK`).
+    #[serde(default, rename = "KeyARN")]
+    pub key_arn: Option<String>,
+}
+
+/// `DeliveryStreamEncryptionConfiguration`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct DeliveryStreamEncryptionConfiguration {
-    /// `DISABLED`.
+    /// `ENABLED` | `DISABLED`.
     pub status: String,
+    /// `AWS_OWNED_CMK` when SSE was requested at creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_type: Option<String>,
+}
+
+impl DeliveryStreamEncryptionConfiguration {
+    /// SSE not requested.
+    pub fn disabled() -> Self {
+        Self {
+            status: "DISABLED".to_string(),
+            key_type: None,
+        }
+    }
+
+    /// SSE with an AWS-owned key.
+    pub fn aws_owned_cmk() -> Self {
+        Self {
+            status: "ENABLED".to_string(),
+            key_type: Some("AWS_OWNED_CMK".to_string()),
+        }
+    }
 }
 
 /// `DeliveryStreamDescription`.
@@ -465,9 +502,11 @@ pub struct CreateDeliveryStreamInput {
     /// Tags.
     #[serde(default)]
     pub tags: Option<Vec<Tag>>,
-    /// Server-side encryption input (accepted; only disabled state stored).
+    /// Server-side encryption input (`AWS_OWNED_CMK` accepted and echoed;
+    /// `CUSTOMER_MANAGED_CMK` rejected).
     #[serde(default)]
-    pub delivery_stream_encryption_configuration_input: Option<Value>,
+    pub delivery_stream_encryption_configuration_input:
+        Option<DeliveryStreamEncryptionConfigurationInput>,
 }
 
 /// `CreateDeliveryStream` output.

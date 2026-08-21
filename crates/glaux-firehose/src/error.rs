@@ -153,7 +153,8 @@ impl FirehoseError {
             | Self::ConcurrentModification { .. }
             | Self::UnknownOperation { .. }
             | Self::Serialization { .. } => 400,
-            Self::ServiceUnavailable { .. } | Self::InternalServer { .. } => 500,
+            Self::ServiceUnavailable { .. } => 503,
+            Self::InternalServer { .. } => 500,
         }
     }
 
@@ -204,7 +205,7 @@ mod tests {
         let err = FirehoseError::ServiceUnavailable {
             message: "sink down".into(),
         };
-        assert_eq!(err.http_status(), 500);
+        assert_eq!(err.http_status(), 503);
         assert_eq!(err.code(), "ServiceUnavailableException");
     }
 }
