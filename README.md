@@ -34,6 +34,10 @@ aws --endpoint-url http://127.0.0.1:4570 firehose list-delivery-streams
 
 `glaux-server` refuses to start without explicit S3 and Glue endpoints (or `--aws`), and refuses to start when an endpoint it was given does not answer. Configuration comes from a TOML file (`--config`), `GLAUX_*` environment variables, and flags, in that order; `GET /health` reports what it is running against. A docker-compose pairing with fakecloud and a full CLI walkthrough live in [`examples/`](examples/README.md).
 
+## Fidelity
+
+`crates/glaux-fidelity` is the differential suite: the SQL corpus (`crates/glaux-athena/tests/corpus`) runs against glaux over Parquet/NDJSON/CSV fixtures and is diffed against recorded snapshots on every CI run (`cargo run -p glaux-fidelity -- replay`). `cargo run -p glaux-fidelity -- record --profile <aws-profile>` re-records the snapshots against real AWS Athena in a scratch bucket/database that is torn down afterwards; snapshots that have not been recorded against AWS yet are marked `UNVERIFIED` in their header and in [`docs/sql-coverage.md`](docs/sql-coverage.md).
+
 ## Status
 
 v0.1 in progress. The all-in-one `glaux` binary runs: an embedded fakecloud control plane (S3, Glue, SQS, SNS, IAM/STS, SSM, Secrets Manager, KMS, Logs) plus glaux's Athena and Firehose on one port, with the engines reading fakecloud's S3/Glue state in-process — see [`crates/glaux/README.md`](crates/glaux/README.md). The v0.1 design spec lives in [`docs/specs/2026-08-15-glaux-v0.1-design.md`](docs/specs/2026-08-15-glaux-v0.1-design.md). Feasibility spikes (ranged S3 reads against fakecloud, embedding custom services on fakecloud's dispatcher) passed on 2026-08-15.
