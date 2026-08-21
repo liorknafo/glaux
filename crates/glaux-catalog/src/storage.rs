@@ -13,7 +13,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::path::Path as ObjectPath;
 use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt as _};
 
@@ -111,6 +111,10 @@ impl NetworkStorageBackend {
         if let Some(endpoint) = &self.endpoint {
             builder = builder
                 .with_endpoint(endpoint.clone())
+                // `from_env` may have picked up AWS_ENDPOINT_URL_S3, which
+                // wins over `with_endpoint` at build time; set it too so the
+                // glaux configuration is what actually takes effect.
+                .with_config(AmazonS3ConfigKey::S3Endpoint, endpoint.clone())
                 // Emulators serve every bucket on one host; virtual-hosted
                 // style would require per-bucket DNS.
                 .with_virtual_hosted_style_request(false)

@@ -1,9 +1,11 @@
 //! `glaux` — the all-in-one binary.
 //!
-//! Links the fakecloud service crates together with the glaux Athena and
-//! Firehose engines on a single port, replacing fakecloud's Athena stub with
-//! real DataFusion-backed execution and defaulting S3/Glue access to
-//! in-process fakecloud state.
+//! Target architecture (wired up in the stories after LIO-18): link the
+//! fakecloud service crates together with the glaux Athena and Firehose
+//! engines on a single port, replacing fakecloud's Athena stub with real
+//! DataFusion-backed execution and defaulting S3/Glue access to in-process
+//! fakecloud state. At this scaffolding stage nothing is wired and the binary
+//! refuses to start.
 //!
 //! This binary is AGPL-3.0 licensed; the engine crates it links
 //! (`glaux-athena`, `glaux-firehose`, `glaux-catalog`) are Apache-2.0 and
