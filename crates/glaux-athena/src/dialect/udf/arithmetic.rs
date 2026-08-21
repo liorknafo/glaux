@@ -823,19 +823,48 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     .iter()
                     .filter_map(|a| a.get_type(schema).ok())
                     .any(|t| is_float(&t));
-                // Trino's `nullif(a, b)` uses the EQUAL operator, so
-                // `nullif(0e0, -0e0)` is NULL and `nullif(NaN, NaN)` is NaN;
-                // DataFusion's kernel compares bit patterns.
-                if name == "nullif" && args.len() == 2 && any_float {
-                    let case = datafusion::logical_expr::expr::Case {
-                        expr: None,
-                        when_then_expr: vec![(
-                            Box::new(ieee_cmp(Operator::Eq, args[0].clone(), args[1].clone())),
-                            Box::new(Expr::Literal(ScalarValue::Null, None)),
-                        )],
-                        else_expr: Some(Box::new(args[0].clone())),
-                    };
-                    return Ok(Transformed::yes(Expr::Case(case)));
+                // Trino types `nullif(a, b)` as the *first* argument's type
+                // and coerces only the comparison to the common supertype
+                // (ExpressionAnalyzer.visitNullIfExpression), so
+                // `nullif(2, 1.0)` is integer 2; DataFusion's `nullif`
+                // widens the result to the supertype too. Mixed-type calls
+                // become `CASE WHEN a = b THEN NULL ELSE a END` with the
+                // coercion confined to the `WHEN`. With a float operand the
+                // comparison further uses Trino's IEEE EQUAL operator
+                // (`nullif(0e0, -0e0)` is NULL, `nullif(NaN, NaN)` is NaN;
+                // DataFusion's kernel compares bit patterns).
+                if name == "nullif" && args.len() == 2 {
+                    let types: Vec<DataType> = call
+                        .args
+                        .iter()
+                        .filter_map(|a| a.get_type(schema).ok())
+                        .collect();
+                    let mixed = types.len() == 2
+                        && types[0] != types[1]
+                        && !types.iter().any(|t| matches!(t, DataType::Null));
+                    if any_float || mixed {
+                        let comparison = if any_float {
+                            ieee_cmp(Operator::Eq, args[0].clone(), args[1].clone())
+                        } else {
+                            Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
+                                Box::new(args[0].clone()),
+                                Operator::Eq,
+                                Box::new(args[1].clone()),
+                            ))
+                        };
+                        let case = datafusion::logical_expr::expr::Case {
+                            expr: None,
+                            when_then_expr: vec![(
+                                Box::new(comparison),
+                                Box::new(Expr::Literal(ScalarValue::Null, None)),
+                            )],
+                            // The *original* first argument, not the widened
+                            // copy the comparison uses: the result keeps its
+                            // type.
+                            else_expr: Some(Box::new(call.args[0].clone())),
+                        };
+                        return Ok(Transformed::yes(Expr::Case(case)));
+                    }
                 }
                 // Trino's `greatest` ranks NaN smallest; DataFusion's ranks
                 // it largest. (`least` agrees between the two.)

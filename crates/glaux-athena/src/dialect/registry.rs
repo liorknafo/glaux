@@ -415,7 +415,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "nullif(a, b)",
         "Conditional",
         Passthrough,
-        "DataFusion `nullif`; over DOUBLE / REAL arguments glaux substitutes `CASE WHEN a = b THEN NULL ELSE a END` with IEEE equality, so `nullif(0e0, -0e0)` is NULL and `nullif(NaN, NaN)` is NaN, as on Trino (DataFusion's kernel compares bit patterns).",
+        "DataFusion `nullif`. Trino types the expression as the *first* argument's type and coerces only the comparison (`nullif(2, 1.0)` is integer 2), where DataFusion widens the result to the common supertype, so glaux rewrites mixed-type calls to `CASE WHEN a = b THEN NULL ELSE a END` with the coercion confined to the `WHEN`. Over DOUBLE / REAL arguments the substituted comparison uses IEEE equality, so `nullif(0e0, -0e0)` is NULL and `nullif(NaN, NaN)` is NaN, as on Trino (DataFusion's kernel compares bit patterns).",
         ["nullif"]
     ),
     shim!(

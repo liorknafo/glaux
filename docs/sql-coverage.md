@@ -103,7 +103,7 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 |---|---|---|---|
 | `coalesce` | `coalesce(a, b, ...)` | passthrough | DataFusion `coalesce` |
 | `if` | `if(condition, true_value[, false_value])` | rewrite | `CASE WHEN condition THEN true_value ELSE false_value END` (`ELSE NULL` when omitted) |
-| `nullif` | `nullif(a, b)` | passthrough | DataFusion `nullif`; over DOUBLE / REAL arguments glaux substitutes `CASE WHEN a = b THEN NULL ELSE a END` with IEEE equality, so `nullif(0e0, -0e0)` is NULL and `nullif(NaN, NaN)` is NaN, as on Trino (DataFusion's kernel compares bit patterns). |
+| `nullif` | `nullif(a, b)` | passthrough | DataFusion `nullif`. Trino types the expression as the *first* argument's type and coerces only the comparison (`nullif(2, 1.0)` is integer 2), where DataFusion widens the result to the common supertype, so glaux rewrites mixed-type calls to `CASE WHEN a = b THEN NULL ELSE a END` with the coercion confined to the `WHEN`. Over DOUBLE / REAL arguments the substituted comparison uses IEEE equality, so `nullif(0e0, -0e0)` is NULL and `nullif(NaN, NaN)` is NaN, as on Trino (DataFusion's kernel compares bit patterns). |
 | `try` | `try(expr)` | unsupported | Refused: DataFusion has no error-suppressing wrapper. `TRY_CAST` covers the cast case. |
 | `typeof` | `typeof(expr) → varchar` | unsupported | Refused: DataFusion's type names (`Utf8`, `Int64`) are not Trino's. |
 
