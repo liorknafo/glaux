@@ -8,11 +8,19 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-arrow = { workspace = true }
 async-trait = { workspace = true }
-object_store = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+glaux-catalog = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+aws-credential-types = { workspace = true }
+aws-sdk-firehose = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
