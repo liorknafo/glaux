@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -90,7 +90,16 @@ async fn root(
     dispatch(&service, &headers, &body).await
 }
 
+/// Request body cap for the router. A full 4 MiB `PutRecordBatch` is about
+/// 5.4 MiB once base64-encoded into JSON; 8 MiB leaves room for framing
+/// while still refusing runaway bodies. Oversized batches are then rejected
+/// by the service with the AWS-shaped limit error, not by the transport.
+pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 /// An axum router serving the Firehose API at `POST /`.
 pub fn router(service: Arc<FirehoseService>) -> Router {
-    Router::new().route("/", post(root)).with_state(service)
+    Router::new()
+        .route("/", post(root))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(service)
 }

@@ -106,7 +106,11 @@ pub struct EncryptionConfiguration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_encryption_config: Option<String>,
     /// KMS encryption is not supported; its presence is an explicit error.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "KMSEncryptionConfig",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub kms_encryption_config: Option<Value>,
 }
 
@@ -167,7 +171,7 @@ pub struct DynamicPartitioningConfiguration {
 #[serde(rename_all = "PascalCase")]
 pub struct SchemaConfiguration {
     /// IAM role (accepted, unused locally).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "RoleARN", skip_serializing_if = "Option::is_none")]
     pub role_arn: Option<String>,
     /// Glue catalog id (defaults to the account).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -239,10 +243,10 @@ impl DataFormatConversionConfiguration {
 #[serde(rename_all = "PascalCase")]
 pub struct ExtendedS3DestinationConfiguration {
     /// IAM role (accepted, unused locally).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "RoleARN", skip_serializing_if = "Option::is_none")]
     pub role_arn: Option<String>,
     /// `arn:aws:s3:::bucket`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "BucketARN", skip_serializing_if = "Option::is_none")]
     pub bucket_arn: Option<String>,
     /// Object key prefix (may contain `!{...}` expressions).
     #[serde(default, skip_serializing_if = "Option::is_none")]

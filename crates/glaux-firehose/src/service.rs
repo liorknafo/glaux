@@ -305,10 +305,16 @@ fn resolve_destination(
         .as_ref()
         .is_some_and(DataFormatConversionConfiguration::is_enabled);
 
-    let hints = config
-        .buffering_hints
-        .or_else(|| current.map(|c| c.buffering_hints))
-        .unwrap_or_default();
+    // Hints merge field-wise: an update naming only IntervalInSeconds keeps
+    // the current SizeInMBs.
+    let requested = config.buffering_hints.unwrap_or_default();
+    let existing = current.map(|c| c.buffering_hints).unwrap_or_default();
+    let hints = BufferingHints {
+        size_in_m_bs: requested.size_in_m_bs.or(existing.size_in_m_bs),
+        interval_in_seconds: requested
+            .interval_in_seconds
+            .or(existing.interval_in_seconds),
+    };
     let buffering_hints = validate_hints(hints, conversion_enabled)?;
 
     let compression_format = config
@@ -986,5 +992,195 @@ impl FirehoseService {
             }
         }
         failures
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sink::RecordingSink;
+    use serde_json::json;
+
+    fn service() -> (FirehoseService, Arc<RecordingSink>) {
+        let sink = Arc::new(RecordingSink::new());
+        let service = FirehoseService::new(
+            FirehoseServiceConfig::default(),
+            Arc::clone(&sink) as Arc<dyn DeliverySink>,
+        );
+        (service, sink)
+    }
+
+    fn conversion(size_mb: u64, compression: &str, serializer: &str) -> Value {
+        json!({
+            "DeliveryStreamName": "conv",
+            "ExtendedS3DestinationConfiguration": {
+                "RoleARN": "arn:aws:iam::000000000000:role/firehose",
+                "BucketARN": "arn:aws:s3:::lake",
+                "Prefix": "events/!{timestamp:yyyy}/",
+                "ErrorOutputPrefix": "errors/!{firehose:error-output-type}/",
+                "BufferingHints": {"SizeInMBs": size_mb, "IntervalInSeconds": 60},
+                "CompressionFormat": compression,
+                "DataFormatConversionConfiguration": {
+                    "Enabled": true,
+                    "SchemaConfiguration": {"DatabaseName": "analytics", "TableName": "events"},
+                    "InputFormatConfiguration": {"Deserializer": {"OpenXJsonSerDe": {}}},
+                    "OutputFormatConfiguration": {"Serializer": {serializer: {}}}
+                }
+            }
+        })
+    }
+
+    async fn create(service: &FirehoseService, body: Value) -> Result<Value, FirehoseError> {
+        service
+            .handle("CreateDeliveryStream", body.to_string().as_bytes())
+            .await
+    }
+
+    #[tokio::test]
+    async fn conversion_configuration_is_stored_verbatim_and_echoed() {
+        let (service, _sink) = service();
+        create(&service, conversion(64, "UNCOMPRESSED", "ParquetSerDe"))
+            .await
+            .unwrap();
+        let described = service
+            .handle(
+                "DescribeDeliveryStream",
+                br#"{"DeliveryStreamName":"conv"}"#,
+            )
+            .await
+            .unwrap();
+        let dest = &described["DeliveryStreamDescription"]["Destinations"][0]["ExtendedS3DestinationDescription"];
+        assert_eq!(dest["Prefix"], "events/!{timestamp:yyyy}/");
+        assert_eq!(
+            dest["ErrorOutputPrefix"],
+            "errors/!{firehose:error-output-type}/"
+        );
+        assert_eq!(
+            dest["DataFormatConversionConfiguration"]["SchemaConfiguration"]["TableName"],
+            "events"
+        );
+        assert_eq!(
+            dest["DataFormatConversionConfiguration"]["OutputFormatConfiguration"]["Serializer"],
+            json!({"ParquetSerDe": {}})
+        );
+        assert_eq!(dest["S3BackupMode"], "Disabled");
+        assert_eq!(
+            dest["EncryptionConfiguration"],
+            json!({"NoEncryptionConfig": "NoEncryption"})
+        );
+    }
+
+    #[tokio::test]
+    async fn conversion_rules_are_enforced_by_name() {
+        let (service, _sink) = service();
+        let err = create(&service, conversion(5, "UNCOMPRESSED", "ParquetSerDe"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message().contains("SizeInMBs must be at least 64"),
+            "{err}"
+        );
+
+        let err = create(&service, conversion(64, "GZIP", "ParquetSerDe"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.message()
+                .contains("CompressionFormat must be UNCOMPRESSED"),
+            "{err}"
+        );
+
+        let err = create(&service, conversion(64, "UNCOMPRESSED", "OrcSerDe"))
+            .await
+            .unwrap_err();
+        assert!(err.message().contains("OrcSerDe"), "{err}");
+        assert!(err.message().contains("ParquetSerDe only"), "{err}");
+
+        let mut missing_schema = conversion(64, "UNCOMPRESSED", "ParquetSerDe");
+        missing_schema["ExtendedS3DestinationConfiguration"]["DataFormatConversionConfiguration"]
+            ["SchemaConfiguration"] = json!({});
+        let err = create(&service, missing_schema).await.unwrap_err();
+        assert!(
+            err.message().contains("SchemaConfiguration.DatabaseName"),
+            "{err}"
+        );
+
+        // A disabled block is accepted without schema checks.
+        let mut disabled = conversion(5, "GZIP", "OrcSerDe");
+        disabled["ExtendedS3DestinationConfiguration"]["DataFormatConversionConfiguration"]["Enabled"] =
+            json!(false);
+        create(&service, disabled).await.unwrap();
+
+        // Unknown compression formats are refused rather than defaulted.
+        let mut bad = conversion(5, "LZ4", "ParquetSerDe");
+        bad["DeliveryStreamName"] = json!("lz4");
+        bad["ExtendedS3DestinationConfiguration"]["DataFormatConversionConfiguration"]["Enabled"] =
+            json!(false);
+        let err = create(&service, bad).await.unwrap_err();
+        assert_eq!(err.code(), "SerializationException");
+        assert!(err.message().contains("LZ4"), "{err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn update_destination_changes_the_live_buffer_thresholds() {
+        let (service, sink) = service();
+        create(
+            &service,
+            json!({
+                "DeliveryStreamName": "live",
+                "ExtendedS3DestinationConfiguration": {
+                    "RoleARN": "arn:aws:iam::000000000000:role/firehose",
+                    "BucketARN": "arn:aws:s3:::lake",
+                    "BufferingHints": {"SizeInMBs": 128, "IntervalInSeconds": 900}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(b"{}");
+        service
+            .handle(
+                "PutRecord",
+                json!({"DeliveryStreamName": "live", "Record": {"Data": data}})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(100)).await;
+
+        service
+            .handle(
+                "UpdateDestination",
+                json!({
+                    "DeliveryStreamName": "live",
+                    "CurrentDeliveryStreamVersionId": "1",
+                    "DestinationId": "destinationId-000000000001",
+                    "ExtendedS3DestinationUpdate": {
+                        "BufferingHints": {"IntervalInSeconds": 120}
+                    }
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // Opened 100 s ago with a 120 s interval: flushes 20 s from now.
+        tokio::time::advance(std::time::Duration::from_secs(19)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(sink.is_empty());
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sink.len(), 1);
+        assert_eq!(
+            sink.batches()[0].destination.buffering_hints.size_in_m_bs,
+            Some(128),
+            "unset field kept across the update"
+        );
     }
 }
