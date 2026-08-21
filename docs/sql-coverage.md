@@ -196,10 +196,10 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | `power` | `power(x, p) → double` | passthrough | DataFusion `power` |
 | `rand` | `rand() → double` | rewrite | `random()` |
 | `random` | `random() → double` | passthrough | DataFusion `random` |
-| `round` | `round(x[, d])` | passthrough | DataFusion `round` |
+| `round` | `round(x[, d])` | passthrough | DataFusion `round` (half away from zero, like Trino). On DECIMAL inputs the result stays a decimal, so `round(2.5)` renders `3` and `round(2.789, 2)` renders `2.79`, matching Trino. |
 | `sign` | `sign(x)` | rewrite | `signum(x)` (always a double; Trino keeps the argument's type) |
 | `sqrt` | `sqrt(x) → double` | passthrough | DataFusion `sqrt` |
-| `truncate` | `truncate(x[, n])` | rewrite | `trunc(x[, n])`. On DECIMAL inputs the one-argument form keeps the input's scale (`2.0` where Trino gives `2`); Trino's two-argument form is defined for DECIMAL inputs and DataFusion computes it in double precision, so `truncate(d, n)` returns a double here. |
+| `truncate` | `truncate(x[, n])` | rewrite | `trunc(x[, n])`. On DECIMAL inputs the result keeps the input's scale, so the value is right but the text has extra zeros (`truncate(2.789, 2)` renders `2.780`, and `truncate(2.7)` renders `2.0` where Trino gives `2`); on DOUBLE inputs the text matches Trino. |
 
 ### Array
 

@@ -516,8 +516,8 @@ fn rewrite_cast(expr: &mut Expr) -> Result<(), GlauxSqlError> {
         DataType::Varbinary(_) | DataType::Binary(_) | DataType::Blob(_) => {
             Err(GlauxSqlError::unsupported(
                 "CAST(... AS VARBINARY)",
-                "Trino has no varchar → varbinary cast (use to_utf8 / from_hex), and glaux \
-                 does not map VARBINARY cast targets in v0.1",
+                "glaux does not map VARBINARY cast targets in v0.1; note that Trino has no \
+                 varchar → varbinary cast either",
             ))
         }
         DataType::BigInt(_)
