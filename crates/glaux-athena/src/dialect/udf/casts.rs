@@ -1,0 +1,380 @@
+//! `CAST` helpers the rewriter inserts so Trino's cast semantics survive
+//! DataFusion's Arrow-based casts.
+//!
+//! - `trino_round_for_cast(x)`: Trino rounds `double`/`decimal` → integer
+//!   HALF_UP (`CAST(2.5 AS BIGINT)` is `3`, `CAST(-2.5 AS BIGINT)` is `-3`);
+//!   Arrow truncates. The rewriter wraps the operand of every integer-target
+//!   `CAST` in this function, which rounds floating/decimal values and
+//!   passes everything else through unchanged, so the Arrow cast that
+//!   follows only ever sees integral values. Out-of-range values still fail
+//!   in that cast (`INVALID_CAST_ARGUMENT`) or become `NULL` under
+//!   `TRY_CAST`, as in Trino.
+//! - `trino_varchar(x[, n])`: `CAST(x AS VARCHAR[(n)])` with Trino's text
+//!   forms — timestamps as `2024-01-05 10:30:00.000`, doubles as Java
+//!   prints them — and truncation to `n` characters for bounded targets.
+
+use std::sync::Arc;
+
+use arrow::array::{Array, ArrayRef, AsArray, PrimitiveArray, StringArray, StringBuilder};
+use arrow::compute::cast;
+use arrow::datatypes::{
+    ArrowPrimitiveType, DataType, Decimal128Type, Float32Type, Float64Type, Int64Type,
+};
+use arrow::util::display::ArrayFormatter;
+use datafusion::common::{Result, plan_err};
+use datafusion::logical_expr::{
+    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility,
+};
+
+use super::{data_error, int64_array, user_err};
+use crate::results::{format_options, java_double_text, java_float_text};
+
+/// The cast UDFs.
+pub fn all() -> Vec<ScalarUDF> {
+    vec![
+        ScalarUDF::new_from_impl(TrinoRoundForCast::new()),
+        ScalarUDF::new_from_impl(TrinoVarchar::new()),
+    ]
+}
+
+/// `trino_round_for_cast(x)`: rounds floating-point and decimal values
+/// half away from zero (Java's `HALF_UP`) and returns every other type
+/// unchanged. See the module docs.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoRoundForCast {
+    signature: Signature,
+}
+
+impl Default for TrinoRoundForCast {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoRoundForCast {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+        }
+    }
+}
+
+fn round_floats<T>(array: &PrimitiveArray<T>) -> PrimitiveArray<T>
+where
+    T: ArrowPrimitiveType,
+    T::Native: num_traits_round::Round,
+{
+    array.unary(num_traits_round::Round::round_half_away)
+}
+
+/// Tiny local trait so the float rounding is generic over `f32`/`f64`
+/// without pulling in `num-traits`.
+mod num_traits_round {
+    pub trait Round: Copy {
+        fn round_half_away(self) -> Self;
+    }
+    impl Round for f64 {
+        fn round_half_away(self) -> Self {
+            // `f64::round` rounds half away from zero, which is Java's
+            // HALF_UP.
+            self.round()
+        }
+    }
+    impl Round for f32 {
+        fn round_half_away(self) -> Self {
+            self.round()
+        }
+    }
+}
+
+/// Round a scaled decimal integer `value` (with `scale` fractional digits)
+/// half away from zero to a whole number, keeping the scale.
+pub fn round_decimal_half_up(value: i128, scale: i8) -> Option<i128> {
+    if scale <= 0 {
+        return Some(value);
+    }
+    let factor = 10i128.checked_pow(u32::from(scale as u8))?;
+    let quotient = value / factor;
+    let remainder = value % factor;
+    let rounded = if remainder.unsigned_abs() * 2 >= factor.unsigned_abs() {
+        quotient + value.signum()
+    } else {
+        quotient
+    };
+    rounded.checked_mul(factor)
+}
+
+impl ScalarUDFImpl for TrinoRoundForCast {
+    fn name(&self) -> &str {
+        "trino_round_for_cast"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[0].clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let input = match &args.args[0] {
+            ColumnarValue::Array(a) => a.clone(),
+            scalar @ ColumnarValue::Scalar(_) => scalar.to_array(rows)?,
+        };
+        let out: ArrayRef = match input.data_type() {
+            DataType::Float64 => Arc::new(round_floats(input.as_primitive::<Float64Type>())),
+            DataType::Float32 => Arc::new(round_floats(input.as_primitive::<Float32Type>())),
+            DataType::Decimal128(precision, scale) => {
+                let (precision, scale) = (*precision, *scale);
+                let decimals = input.as_primitive::<Decimal128Type>();
+                let mut rounded = Vec::with_capacity(rows);
+                for i in 0..rows {
+                    if decimals.is_null(i) {
+                        rounded.push(None);
+                        continue;
+                    }
+                    match round_decimal_half_up(decimals.value(i), scale) {
+                        Some(v) => rounded.push(Some(v)),
+                        None => {
+                            return Err(data_error(
+                                "NUMERIC_VALUE_OUT_OF_RANGE",
+                                format!(
+                                    "cannot round {} to an integer: out of range",
+                                    decimals.value_as_string(i)
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Arc::new(
+                    PrimitiveArray::<Decimal128Type>::from(rounded)
+                        .with_precision_and_scale(precision, scale)?,
+                )
+            }
+            _ => input,
+        };
+        Ok(ColumnarValue::Array(out))
+    }
+}
+
+/// `trino_varchar(x[, n])`: `CAST(x AS VARCHAR[(n)])` in Trino's text forms.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoVarchar {
+    signature: Signature,
+}
+
+impl Default for TrinoVarchar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoVarchar {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::one_of(
+                vec![TypeSignature::Any(1), TypeSignature::Any(2)],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+/// Trino's name for an Arrow type in `Cannot cast` diagnostics.
+pub(crate) fn trino_type_name(data_type: &DataType) -> String {
+    match data_type {
+        DataType::Null => "unknown".into(),
+        DataType::Boolean => "boolean".into(),
+        DataType::Int8 => "tinyint".into(),
+        DataType::Int16 => "smallint".into(),
+        DataType::Int32 => "integer".into(),
+        DataType::Int64 => "bigint".into(),
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => "bigint".into(),
+        DataType::Float16 | DataType::Float32 => "real".into(),
+        DataType::Float64 => "double".into(),
+        DataType::Decimal128(p, s) | DataType::Decimal256(p, s) => format!("decimal({p},{s})"),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "varchar".into(),
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::FixedSizeBinary(_) => "varbinary".into(),
+        DataType::Date32 | DataType::Date64 => "date".into(),
+        DataType::Timestamp(_, None) => "timestamp".into(),
+        DataType::Timestamp(_, Some(_)) => "timestamp with time zone".into(),
+        DataType::Time32(_) | DataType::Time64(_) => "time".into(),
+        DataType::Interval(_) | DataType::Duration(_) => "interval".into(),
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f) => format!("array({})", trino_type_name(f.data_type())),
+        DataType::Struct(_) => "row".into(),
+        DataType::Map(_, _) => "map".into(),
+        DataType::Dictionary(_, v) => trino_type_name(v),
+        other => other.to_string(),
+    }
+}
+
+/// Convert any castable array to Trino's `varchar` text.
+fn to_varchar(input: &ArrayRef) -> Result<StringArray> {
+    let rows = input.len();
+    let text: StringArray = match input.data_type() {
+        DataType::Utf8 => input.as_string::<i32>().clone(),
+        DataType::LargeUtf8 | DataType::Utf8View => {
+            cast(input, &DataType::Utf8)?.as_string::<i32>().clone()
+        }
+        DataType::Null => StringArray::new_null(rows),
+        DataType::Float64 => {
+            let floats = input.as_primitive::<Float64Type>();
+            let mut out = StringBuilder::new();
+            for i in 0..rows {
+                if floats.is_null(i) {
+                    out.append_null();
+                } else {
+                    out.append_value(java_double_text(floats.value(i)));
+                }
+            }
+            out.finish()
+        }
+        DataType::Float32 => {
+            let floats = input.as_primitive::<Float32Type>();
+            let mut out = StringBuilder::new();
+            for i in 0..rows {
+                if floats.is_null(i) {
+                    out.append_null();
+                } else {
+                    out.append_value(java_float_text(floats.value(i)));
+                }
+            }
+            out.finish()
+        }
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _)
+        | DataType::Date32
+        | DataType::Date64 => cast(input, &DataType::Utf8)?.as_string::<i32>().clone(),
+        DataType::Timestamp(_, _) | DataType::Time32(_) | DataType::Time64(_) => {
+            let options = format_options();
+            let formatter = ArrayFormatter::try_new(input.as_ref(), &options)?;
+            let mut out = StringBuilder::new();
+            for i in 0..rows {
+                if input.is_null(i) {
+                    out.append_null();
+                } else {
+                    out.append_value(formatter.value(i).try_to_string()?);
+                }
+            }
+            out.finish()
+        }
+        other => {
+            return Err(data_error(
+                "INVALID_CAST_ARGUMENT",
+                format!("Cannot cast {} to varchar", trino_type_name(other)),
+            ));
+        }
+    };
+    Ok(text)
+}
+
+impl ScalarUDFImpl for TrinoVarchar {
+    fn name(&self) -> &str {
+        "trino_varchar"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        if matches!(
+            arg_types[0],
+            DataType::List(_)
+                | DataType::LargeList(_)
+                | DataType::FixedSizeList(_, _)
+                | DataType::Struct(_)
+                | DataType::Map(_, _)
+                | DataType::Binary
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::FixedSizeBinary(_)
+        ) {
+            return plan_err!("Cannot cast {} to varchar", trino_type_name(&arg_types[0]));
+        }
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let input = args.args[0].to_array(rows)?;
+        let text = to_varchar(&input)?;
+        let Some(limit) = args.args.get(1) else {
+            return Ok(ColumnarValue::Array(Arc::new(text)));
+        };
+        let limits: PrimitiveArray<Int64Type> = int64_array("CAST", "varchar length", limit, rows)?;
+        let mut out = StringBuilder::new();
+        for i in 0..rows {
+            if text.is_null(i) || limits.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            let n = limits.value(i);
+            if n < 0 {
+                return user_err!("CAST", "varchar length must not be negative, got {n}");
+            }
+            out.append_value(text.value(i).chars().take(n as usize).collect::<String>());
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::{Float64Array, TimestampMillisecondArray};
+
+    use super::*;
+
+    #[test]
+    fn decimal_rounding_is_half_away_from_zero() {
+        // 2.5 at scale 1 → 3.0; -2.5 → -3.0; 2.4 → 2.0; 120.5 at scale 1 → 121.0
+        assert_eq!(round_decimal_half_up(25, 1), Some(30));
+        assert_eq!(round_decimal_half_up(-25, 1), Some(-30));
+        assert_eq!(round_decimal_half_up(24, 1), Some(20));
+        assert_eq!(round_decimal_half_up(1205, 1), Some(1210));
+        assert_eq!(round_decimal_half_up(1234, 0), Some(1234));
+        assert_eq!(round_decimal_half_up(-149, 2), Some(-100));
+        assert_eq!(round_decimal_half_up(-150, 2), Some(-200));
+    }
+
+    #[test]
+    fn floats_round_half_away_from_zero() {
+        let rounded = round_floats(&Float64Array::from(vec![2.5, -2.5, 120.5, 0.49, -0.5]));
+        assert_eq!(rounded.values().as_ref(), &[3.0, -3.0, 121.0, 0.0, -1.0]);
+    }
+
+    #[test]
+    fn varchar_text_uses_athena_forms() {
+        let ts: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![
+            Some(1_704_450_600_000),
+            None,
+        ]));
+        let text = to_varchar(&ts).unwrap();
+        assert_eq!(text.value(0), "2024-01-05 10:30:00.000");
+        assert!(text.is_null(1));
+
+        let doubles: ArrayRef = Arc::new(Float64Array::from(vec![1.5, 1e20, 2.0]));
+        let text = to_varchar(&doubles).unwrap();
+        assert_eq!(
+            (0..3).map(|i| text.value(i)).collect::<Vec<_>>(),
+            ["1.5", "1.0E20", "2.0"]
+        );
+    }
+}

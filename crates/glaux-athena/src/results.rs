@@ -14,16 +14,102 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray};
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Float32Type, Float64Type, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 
 use crate::model::{ColumnInfo, Datum, Row};
 
 /// Athena's timestamp text form: `2024-01-31 12:34:56.789`.
-const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
+pub const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
 /// Athena's date text form.
-const DATE_FORMAT: &str = "%Y-%m-%d";
+pub const DATE_FORMAT: &str = "%Y-%m-%d";
+
+/// Render a `double` the way Trino (Java's `Double.toString`) does:
+/// plain decimal with at least one fractional digit for magnitudes in
+/// `[1e-3, 1e7)`, otherwise `d.dddE±n` scientific notation; the digits are
+/// the shortest that round-trip. `NaN`, `Infinity`, `-Infinity` as in Java.
+pub fn java_double_text(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    // Rust's `{:e}` prints the shortest round-trip digits: "1.5e0", "1e20".
+    java_style(
+        &format!("{value:e}"),
+        value == 0.0 && value.is_sign_negative(),
+    )
+}
+
+/// Render a `real` the way Trino (Java's `Float.toString`) does.
+pub fn java_float_text(value: f32) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    java_style(
+        &format!("{value:e}"),
+        value == 0.0 && value.is_sign_negative(),
+    )
+}
+
+/// Turn Rust's `[-]d[.ddd]e[-]n` into Java's `Double.toString` layout.
+fn java_style(sci: &str, negative_zero: bool) -> String {
+    if negative_zero {
+        return "-0.0".to_string();
+    }
+    let (negative, sci) = match sci.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, sci),
+    };
+    let (mantissa, exponent) = sci.split_once('e').expect("{:e} always has an exponent");
+    let exponent: i32 = exponent.parse().expect("{:e} exponent is an integer");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let digits = digits.trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    if (-3..7).contains(&exponent) {
+        // Plain notation: place the decimal point `exponent` digits in.
+        if exponent < 0 {
+            out.push_str("0.");
+            for _ in 0..(-exponent - 1) {
+                out.push('0');
+            }
+            out.push_str(digits);
+        } else {
+            let int_len = exponent as usize + 1;
+            if digits.len() <= int_len {
+                out.push_str(digits);
+                for _ in digits.len()..int_len {
+                    out.push('0');
+                }
+                out.push_str(".0");
+            } else {
+                out.push_str(&digits[..int_len]);
+                out.push('.');
+                out.push_str(&digits[int_len..]);
+            }
+        }
+    } else {
+        out.push_str(&digits[..1]);
+        out.push('.');
+        if digits.len() > 1 {
+            out.push_str(&digits[1..]);
+        } else {
+            out.push('0');
+        }
+        out.push('E');
+        out.push_str(&exponent.to_string());
+    }
+    out
+}
 
 /// Errors converting query output into Athena's result encoding.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -188,7 +274,9 @@ pub fn column_infos(schema: &SchemaRef) -> Result<Vec<ColumnInfo>, ResultError> 
         .collect()
 }
 
-fn format_options() -> FormatOptions<'static> {
+/// Arrow formatting options that produce Athena's text forms for
+/// temporal values (shared with the dialect layer's `CAST(... AS VARCHAR)`).
+pub fn format_options() -> FormatOptions<'static> {
     FormatOptions::new()
         .with_display_error(false)
         .with_null("null")
@@ -253,6 +341,8 @@ fn format_value(
                 .collect();
             format!("{{{}}}", parts.join(", "))
         }
+        DataType::Float64 => java_double_text(array.as_primitive::<Float64Type>().value(index)),
+        DataType::Float32 => java_float_text(array.as_primitive::<Float32Type>().value(index)),
         DataType::Binary
         | DataType::LargeBinary
         | DataType::BinaryView
@@ -485,6 +575,35 @@ mod tests {
                 data_type: "UInt64".into(),
             }
         );
+    }
+
+    #[test]
+    fn doubles_print_like_java() {
+        for (value, text) in [
+            (1.5, "1.5"),
+            (2.0, "2.0"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (100.0, "100.0"),
+            (1234567.0, "1234567.0"),
+            (1e7, "1.0E7"),
+            (12345678.9, "1.23456789E7"),
+            (1e20, "1.0E20"),
+            (0.001, "0.001"),
+            (0.0001, "1.0E-4"),
+            (-2.5e-5, "-2.5E-5"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+            (123.456, "123.456"),
+            (-7.0, "-7.0"),
+        ] {
+            assert_eq!(java_double_text(value), text, "{value}");
+        }
+        assert_eq!(java_float_text(1.5), "1.5");
+        assert_eq!(java_float_text(1e10), "1.0E10");
+        assert_eq!(java_float_text(0.1), "0.1");
     }
 
     #[test]
