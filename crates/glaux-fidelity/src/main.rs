@@ -75,6 +75,13 @@ async fn replay(args: &[String]) -> glaux_fidelity::Result<ExitCode> {
                     report.case.name
                 );
             }
+            CaseResult::MatchUnverifiedError { recorded, actual } => {
+                failed += 1;
+                println!(
+                    "UNVERIFIED-ERROR {} (both FAILED, no `-- error:` needle and no comparable error code)\n    recorded: {recorded}\n    glaux:    {actual}",
+                    report.case.name
+                );
+            }
             CaseResult::Mismatch(differences) => {
                 failed += 1;
                 println!("MISMATCH {}", report.case.name);
@@ -90,15 +97,26 @@ async fn replay(args: &[String]) -> glaux_fidelity::Result<ExitCode> {
     }
     let firehose_reports = firehose::replay(&snapshot_dir()).await?;
     for report in &firehose_reports {
-        if let CaseResult::Mismatch(differences) = &report.result {
-            failed += 1;
-            println!("MISMATCH {}", report.name);
-            for d in differences {
-                println!("    {d}");
+        match &report.result {
+            CaseResult::Match => {}
+            CaseResult::Mismatch(differences) => {
+                failed += 1;
+                println!("MISMATCH {}", report.name);
+                for d in differences {
+                    println!("    {d}");
+                }
             }
-        } else if report.result == CaseResult::MissingSnapshot {
-            failed += 1;
-            println!("MISSING  {}", report.name);
+            CaseResult::MissingSnapshot => {
+                failed += 1;
+                println!("MISSING  {}", report.name);
+            }
+            CaseResult::MatchUnverifiedError { recorded, actual } => {
+                failed += 1;
+                println!(
+                    "UNVERIFIED-ERROR {}\n    recorded: {recorded}\n    glaux:    {actual}",
+                    report.name
+                );
+            }
         }
     }
     let verified = reports
