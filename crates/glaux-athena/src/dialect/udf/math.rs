@@ -2,16 +2,20 @@
 //! different value from Trino's.
 //!
 //! - `round(double[, n])`: Trino computes `Math.round(x · 10ⁿ) / 10ⁿ` in
-//!   floating point (sign-flipped for negatives), so `round(2.675, 2)` is
-//!   `2.67` because `2.675 · 100` is `267.49999999999997`; DataFusion gives
-//!   `2.68`. Integer inputs keep their type (`round(bigint, -2)` rounds the
-//!   integer); decimals round HALF_UP exactly into Trino's result type.
+//!   floating point (sign-flipped for negatives, with a BigInteger fallback
+//!   when `Math.round` saturates), so the double product decides:
+//!   `round(2.675, 2)` is `2.68` (the product is exactly `267.5`) but
+//!   `round(1.005, 2)` is `1.0` (the product is `100.49999999999999`).
+//!   Integer inputs keep their type
+//!   (`round(bigint, -2)` rounds the integer); decimals round HALF_UP
+//!   exactly into Trino's result type.
 //! - `floor` / `ceil` / `truncate` / `sign`: the result has the argument's
 //!   type in Trino (`floor(5)` is the bigint `5`, `sign(2.5)` is
 //!   `decimal(1,0)`); DataFusion returns a double for integers and keeps
 //!   the scale for decimals.
-//! - `truncate(double, n)` truncates the shortest round-trip decimal text
-//!   (Java's `BigDecimal.valueOf(double).setScale(n, DOWN)`).
+//! - `truncate(double, n)` is refused: Trino (Athena engine v3) has no
+//!   two-argument truncate for DOUBLE/REAL, and Presto 0.217 (engine v2)
+//!   computed a different value; only the DECIMAL overload exists.
 
 use std::sync::Arc;
 
@@ -28,8 +32,8 @@ use datafusion::logical_expr::{
 };
 
 use super::casts::trino_type_name;
-use super::decimal::{MAX_PRECISION, double_to_unscaled};
-use super::{data_error, is_integer, type_mismatch};
+use super::decimal::MAX_PRECISION;
+use super::{data_error, is_integer, type_mismatch, unsupported_error};
 use crate::results::java_double_text;
 
 /// The math UDFs.
@@ -143,99 +147,77 @@ impl TrinoMath {
     }
 }
 
-/// Trino's `round(double, n)`: the exact binary value of the double rounded
-/// HALF_UP at `n` decimal places (`new BigDecimal(x).setScale(n, HALF_UP)`),
-/// converted back to the nearest double. `round(2.675, 2)` is therefore
-/// `2.67`: the double written `2.675` is `2.67499999999999982…`.
-pub(crate) fn trino_round_double(x: f64, decimals: i64) -> Result<f64> {
-    if !x.is_finite() || x == 0.0 {
-        return Ok(x);
-    }
-    if !(-60..=60).contains(&decimals) {
-        return Err(super::user_error(
-            "round",
-            format!("rounding a double to {decimals} decimal places is not supported (|n| <= 60)"),
-        ));
-    }
-    let scale = decimals.max(0) as u8;
-    let Some(unscaled) = double_to_unscaled(x, scale) else {
-        return Err(super::user_error(
-            "round",
-            format!(
-                "cannot round {} to {decimals} decimal places",
-                java_double_text(x)
-            ),
-        ));
-    };
-    let unscaled = if decimals < 0 {
-        let unit = pow10_i256((-decimals) as u32);
-        round_half_away(unscaled, unit).wrapping_mul(unit)
-    } else {
-        unscaled
-    };
-    // Parse the exact decimal text so the conversion to double rounds once.
-    let text = format!("{unscaled}e-{scale}");
-    text.parse::<f64>().map_err(|_| {
-        super::user_error(
-            "round",
-            format!(
-                "cannot round {} to {decimals} decimal places",
-                java_double_text(x)
-            ),
-        )
-    })
+/// Java's `Math.pow(10, n)`: the correctly rounded double for `10ⁿ`
+/// (`0` on underflow, infinity on overflow), which Rust's decimal parser
+/// also produces. `f64::powi` rounds at every step and can differ.
+fn pow10_f64(n: i64) -> f64 {
+    format!("1e{n}").parse::<f64>().unwrap_or(f64::INFINITY)
 }
 
-/// Trino's `truncate(double, n)`: `BigDecimal.valueOf(x).setScale(n, DOWN)`.
-pub(crate) fn trino_truncate_double(x: f64, decimals: i64) -> f64 {
+/// Java's `Math.round(double)`: `floor(a + ½)` on the exact real value,
+/// with ties rounding toward positive infinity, saturating at the `long`
+/// range and returning 0 for NaN.
+fn java_math_round(a: f64) -> i64 {
+    if a.is_nan() {
+        return 0;
+    }
+    if a.abs() < (1i64 << 52) as f64 {
+        // `a - floor(a)` is exact below 2⁵², so the tie test is exact —
+        // `java_math_round(0.49999999999999994)` is 0, where
+        // `floor(a + 0.5)` in doubles would round up to 1.
+        let t = a.floor();
+        let r = if a - t >= 0.5 { t + 1.0 } else { t };
+        r as i64
+    } else {
+        // Integral already; Rust's saturating cast matches Java's `(long)`.
+        a as i64
+    }
+}
+
+/// Trino's `round(double, n)` (MathFunctions.java, identical in 407 and
+/// master): `factor = Math.pow(10, n)`, `Math.round(|x| · factor) / factor`
+/// with the sign reapplied, so the rounding sees the double product, not
+/// the exact decimal: `round(2.675, 2)` is `2.68` (the product is exactly
+/// `267.5`, though the double `2.675` is below 2.675) but `round(1.005, 2)`
+/// is `1.0` (the product is `100.49999999999999`). When `Math.round`
+/// saturates Trino falls back to
+/// Guava's `DoubleMath.roundToBigInteger(…, HALF_UP)`, which is the exact
+/// division for a finite product and throws for an infinite one.
+pub(crate) fn trino_round_double(x: f64, decimals: i64) -> Result<f64> {
+    if x.is_nan() || x.is_infinite() {
+        return Ok(x);
+    }
+    let factor = pow10_f64(decimals);
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let rescaled = sign * x * factor;
+    let rounded = java_math_round(rescaled);
+    if rounded != i64::MAX {
+        return Ok(sign * (rounded as f64 / factor));
+    }
+    if rescaled.is_infinite() {
+        // Trino's fallback throws `ArithmeticException("input is infinite
+        // or NaN")` from Guava here; fail loudly the same way.
+        return Err(data_error(
+            "GENERIC_INTERNAL_ERROR",
+            format!(
+                "round: input is infinite or NaN ({} · 10^{decimals} overflows a double, an error on Trino too)",
+                java_double_text(x)
+            ),
+        ));
+    }
+    // A finite double >= 2^63 is integral, so the BigInteger round-trip in
+    // Trino's fallback returns it exactly and the result is the division.
+    Ok(sign * (rescaled / factor))
+}
+
+/// Trino's single-argument `truncate(double)`: round toward zero. The
+/// two-argument DOUBLE/REAL form does not exist on Trino and is refused in
+/// [`TrinoMath::return_type`].
+pub(crate) fn trino_truncate_double(x: f64) -> f64 {
     if !x.is_finite() {
         return x;
     }
-    if decimals == 0 {
-        return x.signum() * x.abs().floor();
-    }
-    let text = java_double_text(x);
-    // Expand Java's shortest text to plain digits: sign, integer digits,
-    // fraction digits.
-    let (negative, text) = match text.strip_prefix('-') {
-        Some(rest) => (true, rest.to_string()),
-        None => (false, text),
-    };
-    let (mantissa, exponent) = match text.split_once('E') {
-        Some((m, e)) => (m.to_string(), e.parse::<i32>().unwrap_or(0)),
-        None => (text, 0),
-    };
-    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((&mantissa, ""));
-    let mut digits: Vec<u8> = format!("{int_part}{frac_part}").into_bytes();
-    let mut point = int_part.len() as i32 + exponent;
-    while point < 0 {
-        digits.insert(0, b'0');
-        point += 1;
-    }
-    while (point as usize) > digits.len() {
-        digits.push(b'0');
-    }
-    let keep = (point as i64 + decimals).clamp(0, digits.len() as i64) as usize;
-    for d in &mut digits[keep..] {
-        *d = b'0';
-    }
-    let int_digits: String = String::from_utf8_lossy(&digits[..point as usize]).into_owned();
-    let frac_digits: String = String::from_utf8_lossy(&digits[point as usize..]).into_owned();
-    let plain = format!(
-        "{}{}.{}",
-        if negative { "-" } else { "" },
-        if int_digits.is_empty() {
-            "0"
-        } else {
-            &int_digits
-        },
-        if frac_digits.is_empty() {
-            "0"
-        } else {
-            &frac_digits
-        }
-    );
-    plain.parse().unwrap_or(x)
+    x.signum() * x.abs().floor()
 }
 
 fn pow10_i256(n: u32) -> i256 {
@@ -393,6 +375,17 @@ impl ScalarUDFImpl for TrinoMath {
                 self.op.trino_name()
             )));
         }
+        if self.op == MathOp::Truncate
+            && arg_types.len() > 1
+            && matches!(arg_types[0], DataType::Float32 | DataType::Float64)
+        {
+            return Err(unsupported_error(
+                "truncate(double, n)",
+                "Trino (Athena engine v3) has no two-argument truncate for DOUBLE / REAL \
+                 (only DECIMAL), and Presto 0.217 (engine v2) computed a different value; \
+                 truncate a DECIMAL, or use the one-argument truncate(x)",
+            ));
+        }
         match &arg_types[0] {
             t @ (DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64) => {
                 Ok(t.clone())
@@ -422,7 +415,7 @@ impl ScalarUDFImpl for TrinoMath {
                     (MathOp::Round, n) => trino_round_double(x, n.unwrap_or(0))?,
                     (MathOp::Floor, _) => x.floor(),
                     (MathOp::Ceil, _) => x.ceil(),
-                    (MathOp::Truncate, n) => trino_truncate_double(x, n.unwrap_or(0)),
+                    (MathOp::Truncate, _) => trino_truncate_double(x),
                     (MathOp::Sign, _) => {
                         if x.is_nan() {
                             x
@@ -438,7 +431,7 @@ impl ScalarUDFImpl for TrinoMath {
                     (MathOp::Round, n) => trino_round_double(x, n.unwrap_or(0))? as f32,
                     (MathOp::Floor, _) => x.floor() as f32,
                     (MathOp::Ceil, _) => x.ceil() as f32,
-                    (MathOp::Truncate, n) => trino_truncate_double(x, n.unwrap_or(0)) as f32,
+                    (MathOp::Truncate, _) => trino_truncate_double(x) as f32,
                     (MathOp::Sign, _) => {
                         if x.is_nan() {
                             x as f32
@@ -492,37 +485,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_double_rounds_the_exact_binary_value() {
+    fn round_double_matches_trino_math_round() {
         let round = |x, n| trino_round_double(x, n).unwrap();
-        assert_eq!(round(2.675, 2), 2.67);
-        assert_eq!(round(1.115, 2), 1.11);
-        assert_eq!(round(-2.675, 2), -2.67);
-        assert_eq!(round(0.285, 2), 0.28);
-        assert_eq!(round(1.005, 2), 1.0);
+        // The double product re-rounds: 2.675 · 100 is exactly 267.5.
+        assert_eq!(round(2.675, 2), 2.68);
+        assert_eq!(round(1.115, 2), 1.12);
+        assert_eq!(round(-2.675, 2), -2.68);
+        assert_eq!(round(0.015, 2), 0.02); // 0.015 · 100 is exactly 1.5; the tie rounds up
+        assert_eq!(round(0.285, 2), 0.28); // 0.285 · 100 = 28.499999999999996
+        assert_eq!(round(1.005, 2), 1.0); // 1.005 · 100 = 100.49999999999999
         assert_eq!(round(2.5, 0), 3.0);
         assert_eq!(round(-2.5, 0), -3.0);
         assert_eq!(round(0.125, 2), 0.13);
+        // Math.round's tie test is exact, not `floor(x + 0.5)` in doubles.
         assert_eq!(round(0.49999999999999994, 0), 0.0);
         assert_eq!(round(1234.5, -2), 1200.0);
         assert_eq!(round(1250.0, -2), 1300.0);
+        // Math.round saturates at 2^63; the BigInteger fallback divides.
         assert_eq!(round(1.0e20, 2), 1.0e20);
+        assert_eq!(round(1.5, 99), 1.4999999999999998);
         assert_eq!(round(123.456, 10), 123.456);
+        assert_eq!(round(0.0, 400), 0.0); // 0 · Infinity is NaN; Math.round(NaN) = 0
         assert!(round(f64::NAN, 2).is_nan());
-        assert!(trino_round_double(1.5, 99).is_err());
+        assert_eq!(round(f64::INFINITY, 2), f64::INFINITY);
+        // An infinite product raises Guava's ArithmeticException on Trino.
+        assert!(trino_round_double(1.0e308, 2).is_err());
     }
 
     #[test]
-    fn truncate_double_cuts_the_shortest_text() {
-        assert_eq!(trino_truncate_double(2.789, 2), 2.78);
-        assert_eq!(trino_truncate_double(0.29, 2), 0.29);
-        assert_eq!(trino_truncate_double(-2.789, 1), -2.7);
-        assert_eq!(trino_truncate_double(2.7, 0), 2.0);
-        assert_eq!(trino_truncate_double(-2.7, 0), -2.0);
-        assert_eq!(trino_truncate_double(1234.5678, -2), 1200.0);
-        assert_eq!(trino_truncate_double(1.5e-5, 6), 1.5e-5);
-        assert_eq!(trino_truncate_double(1.5e-5, 5), 1.0e-5);
-        assert_eq!(trino_truncate_double(1.0e20, 2), 1.0e20);
-        assert_eq!(trino_truncate_double(2.789, 5), 2.789);
+    fn truncate_double_rounds_toward_zero() {
+        assert_eq!(trino_truncate_double(2.7), 2.0);
+        assert_eq!(trino_truncate_double(-2.7), -2.0);
+        assert_eq!(trino_truncate_double(0.0), 0.0);
+        assert_eq!(trino_truncate_double(1.0e20), 1.0e20);
+        assert!(trino_truncate_double(f64::NAN).is_nan());
     }
 
     #[test]
