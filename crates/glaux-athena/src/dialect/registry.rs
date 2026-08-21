@@ -609,7 +609,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "regexp_extract(varchar, pattern[, group]) → varchar",
         "Regular expression",
         Rewrite,
-        "Rust UDF `trino_regexp_extract`: `group` must be a literal and is checked against the pattern's capture groups (`Pattern has 1 groups. Cannot access group 2`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b` are ASCII-only and `$` also matches before a final newline, as in Trino's engine (Rust's Unicode-aware defaults would differ); look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors.",
+        "Rust UDF `trino_regexp_extract`: `group` must be a literal and is checked against the pattern's capture groups (`Pattern has 1 groups. Cannot access group 2`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b`, and `(?i)` are Unicode-aware (Trino runs Joni with Unicode character tables, which Rust's defaults match: `regexp_like('٣', '\\d')` is true) and `$` also matches before a final newline, as in Trino's engine; `\\h` / `\\v` (which Joni reads differently from `java.util.regex`), look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors.",
         ["trino_regexp_extract"]
     ),
     shim!(
@@ -625,7 +625,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "regexp_like(varchar, pattern) → boolean",
         "Regular expression",
         Rewrite,
-        "Rust UDF `trino_regexp_like`. Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b` are ASCII-only and `$` also matches before a final newline, as in Trino's engine (Rust's Unicode-aware defaults would differ); look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors.",
+        "Rust UDF `trino_regexp_like`. Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b`, and `(?i)` are Unicode-aware (Trino runs Joni with Unicode character tables, which Rust's defaults match: `regexp_like('٣', '\\d')` is true) and `$` also matches before a final newline, as in Trino's engine; `\\h` / `\\v` (which Joni reads differently from `java.util.regex`), look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors.",
         ["trino_regexp_like"]
     ),
     shim!(
@@ -633,7 +633,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "regexp_replace(varchar, pattern[, replacement]) → varchar",
         "Regular expression",
         Rewrite,
-        "Rust UDF `trino_regexp_replace`: every match is replaced, the replacement uses Java syntax (`$1x` is group 1 then `x`, `${name}` a named group, `\\$` a literal dollar) and every group reference is validated against the pattern (`No group 2`, `No group with name {y}`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b` are ASCII-only and `$` also matches before a final newline, as in Trino's engine (Rust's Unicode-aware defaults would differ); look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors. The lambda form is refused.",
+        "Rust UDF `trino_regexp_replace`: every match is replaced, the replacement uses Java syntax (`$1x` is group 1 then `x`, `${name}` a named group, `\\$` a literal dollar) and every group reference is validated against the pattern (`No group 2`, `No group with name {y}`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\\d`, `\\w`, `\\s`, `\\b`, and `(?i)` are Unicode-aware (Trino runs Joni with Unicode character tables, which Rust's defaults match: `regexp_like('٣', '\\d')` is true) and `$` also matches before a final newline, as in Trino's engine; `\\h` / `\\v` (which Joni reads differently from `java.util.regex`), look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors. The lambda form is refused.",
         ["trino_regexp_replace"]
     ),
     shim!(

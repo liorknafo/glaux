@@ -9,9 +9,10 @@
 //! back-references are compile errors, reported as user errors), validate
 //! every group reference against the compiled pattern, and replace all
 //! matches as Trino does. Patterns are translated from Java syntax first
-//! ([`translate_java_pattern`]): Trino's engine reads `\d`, `\w`, `\s`,
-//! and `\b` as ASCII classes and `$` as "end of text or before a final
-//! newline", where Rust's defaults are Unicode-aware and strict.
+//! ([`translate_java_pattern`]): Trino's engine (Joni, in Java syntax with
+//! Unicode character tables) reads `$` as "end of text or before a final
+//! newline", where Rust's default is strict; its `\d`, `\w`, `\s`, and
+//! `\b` are Unicode-aware, as Rust's are, and pass through unchanged.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,24 +63,15 @@ fn invalid(function: &str, message: impl Into<String>) -> DataFusionError {
     )
 }
 
-/// Java's ASCII character classes, as Trino's regex engine (Joni in Java
-/// syntax) reads them. Rust's `regex` crate makes `\d`, `\w`, `\s`, and
-/// `\b` Unicode-aware, so `regexp_like('٣', '\d')` would be true and
-/// `regexp_replace('José', '\W', '')` would keep the `é`.
-const ASCII_DIGIT: &str = "0-9";
-const ASCII_WORD: &str = "a-zA-Z0-9_";
-const ASCII_SPACE: &str = " \\t\\n\\x0B\\f\\r";
-/// Java's `\h` (horizontal whitespace) and `\v` (vertical whitespace)
-/// classes; Rust reads `\v` as a single `U+000B`.
-const HORIZONTAL_SPACE: &str =
-    " \\t\\xA0\\x{1680}\\x{180e}\\x{2000}-\\x{200a}\\x{202f}\\x{205f}\\x{3000}";
-const VERTICAL_SPACE: &str = "\\n\\x0B\\f\\r\\x85\\x{2028}\\x{2029}";
-
 /// Translate a Java-syntax pattern (what Trino accepts) to the equivalent
 /// Rust `regex` pattern, or refuse constructs whose meaning would differ:
 ///
-/// - `\d \w \s \h \v` and their negations become explicit ASCII classes
-///   (inside a bracket class too), `\b` / `\B` the ASCII word boundary;
+/// - `\d \w \s \b` and their negations pass through: Trino runs Joni with
+///   Unicode character tables (`regexp_like('٣', '\d')` is true, `(?i)` is
+///   Unicode-aware), which is what Rust's `regex` does by default;
+/// - `\h \H \v \V` are refused: Joni does not read them as
+///   `java.util.regex`'s whitespace classes (`\v` is a vertical tab, `\h`
+///   a literal `h`), so neither reading can be trusted;
 /// - `$` outside a class (and `\Z`) matches at the end of the text or
 ///   before a final newline, as Joni's does in single-line mode; `\A`, `\z`,
 ///   and `^` already agree;
@@ -132,32 +124,13 @@ pub fn translate_java_pattern(pattern: &str) -> std::result::Result<String, Stri
                     return Err("pattern ends with a dangling backslash".to_string());
                 };
                 let in_class = depth > 0;
-                let class = |set: &str, negated: bool| {
-                    if in_class {
-                        if negated {
-                            format!("[^{set}]")
-                        } else {
-                            set.to_string()
-                        }
-                    } else if negated {
-                        format!("[^{set}]")
-                    } else {
-                        format!("[{set}]")
-                    }
-                };
                 match escaped {
-                    'd' => out.push_str(&class(ASCII_DIGIT, false)),
-                    'D' => out.push_str(&class(ASCII_DIGIT, true)),
-                    'w' => out.push_str(&class(ASCII_WORD, false)),
-                    'W' => out.push_str(&class(ASCII_WORD, true)),
-                    's' => out.push_str(&class(ASCII_SPACE, false)),
-                    'S' => out.push_str(&class(ASCII_SPACE, true)),
-                    'h' => out.push_str(&class(HORIZONTAL_SPACE, false)),
-                    'H' => out.push_str(&class(HORIZONTAL_SPACE, true)),
-                    'v' => out.push_str(&class(VERTICAL_SPACE, false)),
-                    'V' => out.push_str(&class(VERTICAL_SPACE, true)),
-                    'b' if !in_class => out.push_str("(?-u:\\b)"),
-                    'B' if !in_class => out.push_str("(?-u:\\B)"),
+                    'h' | 'H' | 'v' | 'V' => {
+                        return Err(format!(
+                            "\\{escaped} is read differently by Trino's regex engine (Joni) and \
+                             java.util.regex; write the whitespace characters explicitly"
+                        ));
+                    }
                     'Z' if !in_class => out.push_str("(?:\\n?\\z)"),
                     'p' | 'P' => {
                         // `\p{Alpha}` etc. are Java's POSIX names (ASCII);
@@ -656,14 +629,12 @@ mod tests {
     }
 
     #[test]
-    fn java_classes_become_ascii_and_dollar_allows_a_final_newline() {
+    fn java_classes_stay_unicode_and_dollar_allows_a_final_newline() {
         let t = |p: &str| translate_java_pattern(p).unwrap();
-        assert_eq!(t(r"\d+"), "[0-9]+");
-        assert_eq!(t(r"[\d_]"), "[0-9_]");
-        assert_eq!(t(r"[^\w]"), "[^a-zA-Z0-9_]");
-        assert_eq!(t(r"\W"), "[^a-zA-Z0-9_]");
-        assert_eq!(t(r"[\D]"), "[[^0-9]]");
-        assert_eq!(t(r"\bx\b"), r"(?-u:\b)x(?-u:\b)");
+        assert_eq!(t(r"\d+"), r"\d+");
+        assert_eq!(t(r"[\d_]"), r"[\d_]");
+        assert_eq!(t(r"[^\w]"), r"[^\w]");
+        assert_eq!(t(r"\bx\b"), r"\bx\b");
         assert_eq!(t(r"b$"), r"b(?:\n?\z)");
         assert_eq!(t(r"[$]"), "[$]");
         assert_eq!(t(r"\$"), r"\$");
@@ -671,23 +642,32 @@ mod tests {
         assert_eq!(t(r"(?i)ab"), "(?i)ab");
         assert_eq!(t(r"[]a]"), r"[\]a]");
         assert_eq!(t(r"\p{L}+"), r"\p{L}+");
-        for bad in [r"(?u)a", r"(?U)a", r"\p{Alpha}", r"\p{IsAlphabetic}", r"a\"] {
+        for bad in [
+            r"(?u)a",
+            r"(?U)a",
+            r"\p{Alpha}",
+            r"\p{IsAlphabetic}",
+            r"a\",
+            r"\h",
+            r"[\v]",
+        ] {
             assert!(translate_java_pattern(bad).is_err(), "{bad}");
         }
         let re = Regex::new(&t(r"b$")).unwrap();
         assert!(re.is_match("ab\n"));
         assert!(!re.is_match("ab\n\n"));
-        assert!(Regex::new(&t(r"\d")).unwrap().is_match("3"));
-        assert!(!Regex::new(&t(r"\d")).unwrap().is_match("٣"));
-        assert!(!Regex::new(&t(r"\w")).unwrap().is_match("é"));
-        assert!(!Regex::new(&t(r"\s")).unwrap().is_match("\u{a0}"));
+        // Joni with Unicode tables: Arabic-Indic digits, accented letters,
+        // and NBSP are digits, word characters, and whitespace.
+        assert!(Regex::new(&t(r"\d")).unwrap().is_match("٣"));
+        assert!(Regex::new(&t(r"\w")).unwrap().is_match("é"));
+        assert!(Regex::new(&t(r"\s")).unwrap().is_match("\u{a0}"));
         assert_eq!(
             Regex::new(&t(r"\b")).unwrap().replace_all("aé b", "|"),
-            "|a|é |b|"
+            "|aé| |b|"
         );
         assert_eq!(
             Regex::new(&t(r"\W")).unwrap().replace_all("José", ""),
-            "Jos"
+            "José"
         );
     }
 
