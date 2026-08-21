@@ -830,6 +830,15 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     return Ok(Transformed::yes(replacement));
                 }
             }
+            // A correlated scalar subquery Trino runs but DataFusion's
+            // decorrelation needs an aggregate for (see `udf::subquery`).
+            Expr::ScalarSubquery(subquery) => {
+                if let Some(replacement) =
+                    super::subquery::aggregate_correlated_scalar_subquery(subquery)?
+                {
+                    return Ok(Transformed::yes(replacement));
+                }
+            }
             // A computed `LIKE` pattern: Trino has no default escape
             // character (`\` is a literal backslash), where DataFusion
             // always treats `\` as the escape. Literal patterns were

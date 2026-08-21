@@ -33,6 +33,7 @@ pub mod math;
 pub mod nullable;
 pub mod regex;
 pub mod strings;
+pub mod subquery;
 pub mod tdigest;
 pub mod timestamps;
 
@@ -121,6 +122,7 @@ pub fn all() -> Vec<ScalarUDF> {
     udfs.extend(nullable::all());
     udfs.extend(regex::all());
     udfs.extend(arithmetic::scalar_udfs());
+    udfs.extend(subquery::all());
     udfs
 }
 
@@ -129,6 +131,7 @@ pub fn all_aggregates() -> Vec<AggregateUDF> {
     let mut udafs = arithmetic::aggregate_udfs();
     udafs.extend(decimal::aggregate_udfs());
     udafs.extend(floats::aggregate_udfs());
+    udafs.extend(subquery::aggregate_udfs());
     udafs.extend(tdigest::aggregate_udfs());
     udafs
 }

@@ -432,6 +432,7 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
             Ok(())
         }
         Expr::InSubquery(in_subquery) => {
+            check_correlation_names(&in_subquery.subquery.subquery)?;
             let Ok(left) = in_subquery.expr.get_type(schema) else {
                 return Ok(());
             };
@@ -487,6 +488,8 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
             }
             check_common_type("CASE results", &results, schema)
         }
+        Expr::ScalarSubquery(subquery) => check_correlation_names(&subquery.subquery),
+        Expr::Exists(exists) => check_correlation_names(&exists.subquery.subquery),
         Expr::Cast(cast) => check_cast(&cast.expr, cast.field.data_type(), schema),
         Expr::TryCast(cast) => check_cast(&cast.expr, cast.field.data_type(), schema),
         // `sum(varchar)` / `bool_and(bigint)`: Trino has no such overload
@@ -695,6 +698,64 @@ fn check_subquery_position(node: &LogicalPlan, expr: &Expr) -> Result<(), GlauxS
         "DataFusion only decorrelates IN / EXISTS subqueries used as WHERE / HAVING predicates; \
          use them there, or rewrite with a JOIN",
     ))
+}
+
+/// Correlated inner columns that share a bare name across relations.
+///
+/// DataFusion decorrelates a correlated subquery into a left join and
+/// re-qualifies every correlated inner column onto the join's subquery
+/// alias **by its bare name**
+/// (`scalar_subquery_to_join::build_join` → `replace_qualified_name`). Two
+/// correlated columns called `id` that come from different relations
+/// therefore collapse onto the same join key: `... FROM customers c JOIN
+/// orders x ON x.customer_id = c.id WHERE c.id = o.customer_id AND x.id =
+/// o.id` plans as `o.customer_id = sq.id AND o.id = sq.id` and answers
+/// every row with `0` / `NULL`. Trino runs the query, so a wrong answer is
+/// the one outcome that is never allowed: refuse it by name.
+fn check_correlation_names(plan: &LogicalPlan) -> Result<(), GlauxSqlError> {
+    let mut correlated: Vec<datafusion::common::Column> = Vec::new();
+    let visit = plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            expr.apply(|e| {
+                if let Expr::BinaryExpr(binary) = e {
+                    let (left, right) = (binary.left.as_ref(), binary.right.as_ref());
+                    let partner = match (left.contains_outer(), right.contains_outer()) {
+                        (true, false) => right,
+                        (false, true) => left,
+                        _ => return Ok(TreeNodeRecursion::Continue),
+                    };
+                    let _ = partner.apply(|inner| {
+                        if let Expr::Column(column) = inner {
+                            correlated.push(column.clone());
+                        }
+                        Ok(TreeNodeRecursion::Continue)
+                    });
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+    });
+    debug_assert!(visit.is_ok());
+    for (i, column) in correlated.iter().enumerate() {
+        if let Some(clash) = correlated[i + 1..]
+            .iter()
+            .find(|other| other.name == column.name && other.relation != column.relation)
+        {
+            return Err(GlauxSqlError::unsupported(
+                format!("correlated subquery over two `{}` columns", column.name),
+                format!(
+                    "the correlation conditions reference both `{}` and `{}`, and DataFusion's \
+                     decorrelation re-qualifies correlated columns by their bare name, so the two \
+                     would collapse onto one join key and the query would return wrong rows; give \
+                     one of them a distinct name in a derived table, or rewrite the subquery as a \
+                     JOIN",
+                    column.flat_name(),
+                    clash.flat_name()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reject operator applications Trino refuses. Run on the freshly planned

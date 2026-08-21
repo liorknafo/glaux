@@ -374,6 +374,35 @@ fn classify(err: DataFusionError) -> EngineError {
                     trino_type_list(args)
                 ));
             }
+            // A correlated subquery DataFusion's decorrelation could not
+            // turn into a join (an `ORDER BY` or `LIMIT` inside it, or a
+            // correlation equality glaux routed through its IEEE double
+            // comparison). The expression survives into physical planning,
+            // where DataFusion dumps the `Debug` of the logical expression.
+            if root_message.contains("Physical plan does not support logical expression")
+                && root_message.contains("ScalarSubquery")
+            {
+                return EngineError::Unsupported {
+                    construct: "correlated scalar subquery".to_string(),
+                    message: "DataFusion could not rewrite this one into a join: an ORDER BY or \
+                              LIMIT inside a correlated subquery, or a correlation condition over \
+                              DOUBLE / REAL (which Trino compares with IEEE equality), stops it. \
+                              Rewrite the subquery as a JOIN"
+                        .to_string(),
+                };
+            }
+            if root_message.contains(
+                "Correlated scalar subquery can only be used in Projection, Filter, Aggregate",
+            ) {
+                return EngineError::Unsupported {
+                    construct: "correlated scalar subquery in this clause".to_string(),
+                    message: "DataFusion decorrelates a scalar subquery only in the SELECT list, \
+                              a WHERE / HAVING predicate, or a GROUP BY; Trino also allows it in \
+                              ORDER BY and a JOIN condition. Compute it in a derived table (or \
+                              select it and sort by the output column) instead"
+                        .to_string(),
+                };
+            }
             // A window function written without `OVER`: DataFusion cannot
             // resolve it as a scalar or aggregate and says `Invalid
             // function 'rank'.`. Every name that reaches the planner is in
