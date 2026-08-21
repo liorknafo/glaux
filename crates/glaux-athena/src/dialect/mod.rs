@@ -166,7 +166,56 @@ fn preprocess_tokens(sql: &str) -> Result<Vec<sqlparser::tokenizer::TokenWithSpa
         })?;
     reject_digit_identifiers(&tokens)?;
     let tokens = convert_array_type_parens(tokens)?;
+    let tokens = rewrite_bare_trim_specification(tokens);
     Ok(wrap_bare_values_rows(tokens))
+}
+
+/// The trim function a bare `TRIM(<specification> FROM x)` is: Trino's
+/// default trim characters are whitespace, which is exactly `ltrim` /
+/// `rtrim` / `trim`.
+fn bare_trim_function(token: &Token) -> Option<&'static str> {
+    match token {
+        Token::Word(w) if w.quote_style.is_none() => match w.value.to_ascii_lowercase().as_str() {
+            "leading" => Some("ltrim"),
+            "trailing" => Some("rtrim"),
+            "both" => Some("trim"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `TRIM(LEADING FROM x)` — valid Trino, and the only `TRIM` spelling
+/// sqlparser cannot parse (`Expected: ), found: ...`; the
+/// `TRIM(LEADING 'x' FROM y)` form with trim characters parses fine). The
+/// specification and `FROM` are dropped and `TRIM` becomes the equivalent
+/// `ltrim` / `rtrim` / `trim` call, which trims whitespace exactly as
+/// Trino's default does.
+fn rewrite_bare_trim_specification(
+    tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    let mut out: Vec<sqlparser::tokenizer::TokenWithSpan> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        if is_keyword(&tokens[i].token, "trim")
+            && let Some(lparen) = next_significant(&tokens, i)
+            && matches!(tokens[lparen].token, Token::LParen)
+            && let Some(spec) = next_significant(&tokens, lparen)
+            && let Some(name) = bare_trim_function(&tokens[spec].token)
+            && let Some(from) = next_significant(&tokens, spec)
+            && is_keyword(&tokens[from].token, "from")
+        {
+            let mut renamed = tokens[i].clone();
+            renamed.token = Token::make_word(name, None);
+            out.push(renamed);
+            out.extend(tokens[i + 1..=lparen].iter().cloned());
+            i = from + 1;
+            continue;
+        }
+        out.push(tokens[i].clone());
+        i += 1;
+    }
+    out
 }
 
 /// Trino lexes a digit run glued to identifier characters (`1_000`, `1AS`,

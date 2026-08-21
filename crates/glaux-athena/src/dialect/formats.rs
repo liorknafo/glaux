@@ -83,7 +83,8 @@ pub fn mysql_to_chrono(
             'W' => "%A", // weekday name
             'a' => "%a", // abbreviated weekday name
             'w' => "%w", // day of week 0=Sunday
-            'v' => "%V", // ISO week number
+            'v' => "%V", // week 01-53, Monday-first (ISO)
+            'x' => "%G", // the week-year %v belongs to (Joda's `xxxx`)
             '%' => "%%",
             other => {
                 return Err(GlauxSqlError::invalid_arguments(
@@ -91,7 +92,7 @@ pub fn mysql_to_chrono(
                     format!(
                         "format specifier %{other} in {format:?} is not supported by glaux \
                          (supported: %Y %y %m %c %M %b %d %e %j %H %k %h %I %l %i %s %S %f %p \
-                         %r %T %W %a %w %v %%)"
+                         %r %T %W %a %w %v %x %%)"
                     ),
                 ));
             }

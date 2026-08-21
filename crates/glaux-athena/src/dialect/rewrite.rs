@@ -635,6 +635,17 @@ fn rewrite_select(select: &mut Select) -> Result<(), GlauxSqlError> {
     if let Some((construct, message)) = refused {
         return Err(GlauxSqlError::unsupported(construct, message));
     }
+    // Trino's `GROUP BY ()` is the empty grouping set — one global group,
+    // exactly what no GROUP BY means. sqlparser parses it as an empty tuple
+    // expression, which DataFusion refuses with `This feature is not
+    // implemented: Empty tuple not supported yet`.
+    if let GroupByExpr::Expressions(keys, _) = &mut select.group_by {
+        for key in keys.iter_mut() {
+            if matches!(key, Expr::Tuple(items) if items.is_empty()) {
+                *key = Expr::GroupingSets(vec![vec![]]);
+            }
+        }
+    }
     for table in &select.from {
         for join in &table.joins {
             check_join(&join.join_operator)?;

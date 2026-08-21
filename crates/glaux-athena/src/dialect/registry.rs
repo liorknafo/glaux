@@ -706,7 +706,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "date_format(timestamp, format) → varchar",
         "Date and time",
         Rewrite,
-        "`to_char(x, <strftime>)` with the MySQL-style format translated specifier by specifier; the format must be a literal and unknown specifiers are refused.",
+        "`to_char(x, <strftime>)` with the MySQL-style format translated specifier by specifier; the format must be a literal and unknown specifiers are refused. `%v` (Monday-first week) and `%x` (the week-year it belongs to) map onto chrono's ISO `%V` / `%G`.",
         ["to_char"]
     ),
     shim!(
@@ -1438,7 +1438,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "GROUP BY / HAVING / ROLLUP / CUBE / GROUPING SETS",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "`GROUP BY` and `HAVING` resolve against the source columns only, as on Trino: `SELECT status s, count(*) FROM t GROUP BY s` and `HAVING c > 1` over an alias `c` are `Column cannot be resolved` unless the source has a column of that name (DataFusion would resolve the output alias). `ORDER BY` may use output aliases.",
+        notes: "`GROUP BY` and `HAVING` resolve against the source columns only, as on Trino: `SELECT status s, count(*) FROM t GROUP BY s` and `HAVING c > 1` over an alias `c` are `Column cannot be resolved` unless the source has a column of that name (DataFusion would resolve the output alias). `ORDER BY` may use output aliases. `GROUP BY ()` — Trino's empty grouping set, one global group — is planned as `GROUPING SETS (())`; sqlparser parses it as an empty tuple, which DataFusion refused with `Empty tuple not supported yet`.",
         corpus_marker: "ROLLUP",
     },
     Construct {
@@ -1515,7 +1515,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "EXTRACT(field FROM x) / POSITION / SUBSTRING / TRIM syntax",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "`EXTRACT` fields: YEAR, QUARTER, MONTH, WEEK, DAY, DAY_OF_MONTH, DAY_OF_WEEK/DOW (1 = Monday … 7 = Sunday, Trino numbering), DAY_OF_YEAR/DOY, HOUR, MINUTE, SECOND; other fields are refused by name. `SUBSTRING` follows `substr`'s rules; `POSITION` returns bigint.",
+        notes: "`EXTRACT` fields: YEAR, QUARTER, MONTH, WEEK, DAY, DAY_OF_MONTH, DAY_OF_WEEK/DOW (1 = Monday … 7 = Sunday, Trino numbering), DAY_OF_YEAR/DOY, HOUR, MINUTE, SECOND; other fields are refused by name. `SUBSTRING` follows `substr`'s rules; `POSITION` returns bigint. `TRIM(LEADING | TRAILING | BOTH FROM x)` without trim characters (valid Trino, and the one `TRIM` spelling sqlparser cannot parse) is turned into the equivalent `ltrim` / `rtrim` / `trim` call at the token level.",
         corpus_marker: "EXTRACT(",
     },
     Construct {
