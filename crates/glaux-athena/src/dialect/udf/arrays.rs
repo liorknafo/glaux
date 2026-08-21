@@ -58,6 +58,7 @@ pub fn all() -> Vec<ScalarUDF> {
         ScalarUDF::new_from_impl(TrinoArrayCompare::new(ArrayCmp::Gt)),
         ScalarUDF::new_from_impl(TrinoArrayCompare::new(ArrayCmp::GtEq)),
         ScalarUDF::new_from_impl(TrinoArraySortKey::new()),
+        ScalarUDF::new_from_impl(TrinoArraySortKey::for_elements()),
     ]
 }
 
@@ -584,6 +585,13 @@ impl ScalarUDFImpl for TrinoArrayExtreme {
                 positions.push(None);
                 continue;
             }
+            // Ranking *arrays* uses Trino's array ordering operator, which
+            // raises once a shared prefix forces it to read a NULL element
+            // (`array_max(ARRAY[ARRAY['a', 'b'], ARRAY['a', NULL]])`);
+            // Arrow's sort would rank the NULL and answer.
+            if element_type(slice.data_type()).is_some() && has_null_element_below(slice.as_ref()) {
+                return Err(null_element_error());
+            }
             // Trino's `array_max` ranks NaN smallest (`COMPARISON_UNORDERED_
             // FIRST`), so it is the result only when every element is NaN;
             // Arrow's sort ranks NaN largest. (`array_min` agrees between
@@ -1052,6 +1060,18 @@ fn has_null_element(array: &dyn Array) -> bool {
     false
 }
 
+/// Whether any element of a *non-null* entry of `array` (an array of
+/// arrays) is NULL at any depth — i.e. a NULL strictly below `array`'s own
+/// elements. `array`'s own NULL entries do not count: Trino orders those
+/// last rather than refusing.
+fn has_null_element_below(array: &dyn Array) -> bool {
+    let DataType::List(_) = array.data_type() else {
+        return false;
+    };
+    let list = array.as_list::<i32>();
+    (0..list.len()).any(|i| !list.is_null(i) && has_null_element(list.value(i).as_ref()))
+}
+
 /// Trino's lexicographic array ordering; an error on NULL elements.
 fn array_ordering(left: &dyn Array, right: &dyn Array) -> Result<std::cmp::Ordering> {
     use std::cmp::Ordering;
@@ -1192,11 +1212,20 @@ impl ScalarUDFImpl for TrinoArrayCompare {
 }
 
 /// `trino_array_sort_key(arr)`: the array unchanged, after checking that no
-/// element is NULL — `ORDER BY` on an array sorts by Trino's ordering
-/// operator, which raises on NULL elements where DataFusion would sort them.
+/// element is NULL — `ORDER BY` on an array (and `max` / `min` / `greatest`
+/// / `least` over arrays, which rank by the same operator) sorts by Trino's
+/// ordering operator, which raises on NULL elements where DataFusion would
+/// sort them.
+///
+/// `trino_array_element_sort_key(arr)` is the variant for functions that
+/// rank the *elements* of `arr` (`array_sort`): a NULL element is fine
+/// there — Trino sorts those last — but an element that is itself an array
+/// with a NULL inside is not, because ranking two such elements goes
+/// through the array ordering operator again.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TrinoArraySortKey {
     signature: Signature,
+    elements: bool,
 }
 
 impl Default for TrinoArraySortKey {
@@ -1206,17 +1235,30 @@ impl Default for TrinoArraySortKey {
 }
 
 impl TrinoArraySortKey {
-    /// New instance.
+    /// A guard for ranking the array values themselves.
     pub fn new() -> Self {
         Self {
             signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+            elements: false,
+        }
+    }
+
+    /// A guard for ranking the array's elements.
+    pub fn for_elements() -> Self {
+        Self {
+            elements: true,
+            ..Self::new()
         }
     }
 }
 
 impl ScalarUDFImpl for TrinoArraySortKey {
     fn name(&self) -> &str {
-        "trino_array_sort_key"
+        if self.elements {
+            "trino_array_element_sort_key"
+        } else {
+            "trino_array_sort_key"
+        }
     }
 
     fn signature(&self) -> &Signature {
@@ -1229,9 +1271,22 @@ impl ScalarUDFImpl for TrinoArraySortKey {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let input = args.args[0].to_array(args.number_rows)?;
-        let list = as_list("ORDER BY", Arc::clone(&input))?;
+        // Not an array: nothing this guard has an opinion about (the
+        // element-wise form is applied without knowing the element type).
+        let Ok(list) = as_list("ORDER BY", Arc::clone(&input)) else {
+            return Ok(ColumnarValue::Array(input));
+        };
         for i in 0..list.len() {
-            if !list.is_null(i) && has_null_element(list.value(i).as_ref()) {
+            if list.is_null(i) {
+                continue;
+            }
+            let value = list.value(i);
+            let offending = if self.elements {
+                element_type(value.data_type()).is_some() && has_null_element_below(value.as_ref())
+            } else {
+                has_null_element(value.as_ref())
+            };
+            if offending {
                 return Err(null_element_error());
             }
         }

@@ -2304,8 +2304,14 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
                 ));
             }
             arity(name, &args, &[1])?;
-            // Trino sorts NULL elements last; DataFusion's default is first.
-            let mut full = args;
+            // Trino sorts NULL elements last; DataFusion's default is
+            // first. Elements that are themselves arrays rank through
+            // Trino's array ordering operator, which refuses NULLs inside
+            // them, so the argument goes through the guard first.
+            let mut full = vec![func(
+                "trino_array_element_sort_key",
+                vec![args.into_iter().next().expect("arity checked")],
+            )];
             full.push(str_lit("ASC"));
             full.push(str_lit("NULLS LAST"));
             func("array_sort", full)
@@ -2521,7 +2527,7 @@ mod tests {
         );
         assert_eq!(
             rewrite("SELECT array_sort(a) AS s, reverse(a) AS r, contains(a, 1) AS c, arrays_overlap(a, b) AS o, split(s, ',') AS p FROM t").unwrap(),
-            "SELECT array_sort(a, 'ASC', 'NULLS LAST') AS s, trino_reverse(a) AS r, trino_contains(a, 1) AS c, trino_arrays_overlap(a, b) AS o, trino_split(s, ',') AS p FROM t"
+            "SELECT array_sort(trino_array_element_sort_key(a), 'ASC', 'NULLS LAST') AS s, trino_reverse(a) AS r, trino_contains(a, 1) AS c, trino_arrays_overlap(a, b) AS o, trino_split(s, ',') AS p FROM t"
         );
         let err = rewrite("SELECT array_sort(a, (x, y) -> 1) FROM t").unwrap_err();
         assert!(err.to_string().contains("lambda"), "{err}");

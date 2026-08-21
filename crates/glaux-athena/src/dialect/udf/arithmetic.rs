@@ -760,6 +760,56 @@ fn trino_aggregate(name: &str, t: &DataType) -> Option<AggregateUDF> {
     })
 }
 
+/// Wrap an expression in the guard that refuses arrays with NULL elements
+/// before they are ranked (a no-op for every other type).
+fn array_sort_key(expr: &Expr) -> Expr {
+    udf_call(TrinoArraySortKey::new(), vec![expr.clone()])
+}
+
+fn is_array_sort_key(expr: &Expr) -> bool {
+    matches!(expr, Expr::ScalarFunction(call) if call.func.name() == "trino_array_sort_key")
+}
+
+/// An aggregate whose array arguments or `ORDER BY` keys rank through
+/// Trino's array ordering operator, with the NULL-element guard applied.
+fn guard_array_ordering(
+    agg: &datafusion::logical_expr::expr::AggregateFunction,
+    schema: &DFSchema,
+) -> Option<datafusion::logical_expr::expr::AggregateFunction> {
+    let ranks_argument = matches!(agg.func.name(), "max" | "min");
+    let is_array = |e: &Expr| e.get_type(schema).is_ok_and(|t| is_list(&t));
+    let guard_needed = |e: &Expr| is_array(e) && !is_array_sort_key(e);
+    let order_by = agg.params.order_by.as_slice();
+    let argument_needs = ranks_argument && agg.params.args.iter().any(guard_needed);
+    let order_needs = order_by.iter().any(|s| guard_needed(&s.expr));
+    if !argument_needs && !order_needs {
+        return None;
+    }
+    let mut replacement = agg.clone();
+    if argument_needs {
+        replacement.params.args = agg
+            .params
+            .args
+            .iter()
+            .map(|a| {
+                if is_array(a) {
+                    array_sort_key(a)
+                } else {
+                    a.clone()
+                }
+            })
+            .collect();
+    }
+    if order_needs {
+        for sort in &mut replacement.params.order_by {
+            if is_array(&sort.expr) {
+                sort.expr = array_sort_key(&sort.expr);
+            }
+        }
+    }
+    Some(replacement)
+}
+
 fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     expr.transform_up(|e| {
         match &e {
@@ -803,8 +853,18 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     return Ok(Transformed::yes(Expr::Like(replacement)));
                 }
             }
-            Expr::AggregateFunction(agg) if matches!(agg.func.name(), "sum" | "avg" | "max") => {
-                if let [arg] = agg.params.args.as_slice()
+            // `max` / `min` over arrays rank by Trino's array ordering
+            // operator, which refuses NULL elements — as `ORDER BY` on an
+            // array already does. Arrow's kernels would answer instead, and
+            // disagree with `array_max` / `array_min` while they were at it.
+            // An aggregate's own `ORDER BY` (`array_agg(x ORDER BY x)`) is
+            // the same ordering and gets the same guard.
+            Expr::AggregateFunction(agg) => {
+                if let Some(replacement) = guard_array_ordering(agg, schema) {
+                    return Ok(Transformed::yes(Expr::AggregateFunction(replacement)));
+                }
+                if matches!(agg.func.name(), "sum" | "avg" | "max")
+                    && let [arg] = agg.params.args.as_slice()
                     && let Ok(t) = arg.get_type(schema)
                     && let Some(func) = trino_aggregate(agg.func.name(), &t)
                 {
@@ -814,6 +874,37 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                 }
             }
             Expr::WindowFunction(window) => {
+                // The window forms of `max` / `min` and the window
+                // `ORDER BY` rank arrays through Trino's array ordering
+                // operator, same as their aggregate counterparts.
+                let ranks_argument = matches!(
+                    &window.fun,
+                    WindowFunctionDefinition::AggregateUDF(f) if matches!(f.name(), "max" | "min")
+                );
+                let is_array = |e: &Expr| e.get_type(schema).is_ok_and(|t| is_list(&t));
+                let guard_needed = |e: &Expr| is_array(e) && !is_array_sort_key(e);
+                let argument_needs = ranks_argument && window.params.args.iter().any(guard_needed);
+                let order_needs = window.params.order_by.iter().any(|s| guard_needed(&s.expr));
+                if argument_needs || order_needs {
+                    let mut replacement: WindowFunction = window.as_ref().clone();
+                    if argument_needs {
+                        for arg in &mut replacement.params.args {
+                            if is_array(arg) {
+                                *arg = array_sort_key(arg);
+                            }
+                        }
+                    }
+                    if order_needs {
+                        for sort in &mut replacement.params.order_by {
+                            if is_array(&sort.expr) {
+                                sort.expr = array_sort_key(&sort.expr);
+                            }
+                        }
+                    }
+                    return Ok(Transformed::yes(Expr::WindowFunction(Box::new(
+                        replacement,
+                    ))));
+                }
                 if let WindowFunctionDefinition::AggregateUDF(func) = &window.fun
                     && matches!(func.name(), "sum" | "avg" | "max")
                     && let [arg] = window.params.args.as_slice()
@@ -900,6 +991,21 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                         };
                         return Ok(Transformed::yes(Expr::Case(case)));
                     }
+                }
+                // `greatest` / `least` over arrays rank by Trino's array
+                // ordering operator too: NULL elements are an error, not a
+                // silent (and self-contradictory) winner.
+                if matches!(name.as_str(), "greatest" | "least")
+                    && call
+                        .args
+                        .iter()
+                        .filter_map(|a| a.get_type(schema).ok())
+                        .any(|t| is_list(&t))
+                    && !call.args.iter().any(is_array_sort_key)
+                {
+                    let mut replacement = call.clone();
+                    replacement.args = args.iter().map(array_sort_key).collect();
+                    return Ok(Transformed::yes(Expr::ScalarFunction(replacement)));
                 }
                 // Trino's `greatest` ranks NaN smallest; DataFusion's ranks
                 // it largest. (`least` agrees between the two.)
@@ -1000,6 +1106,24 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                         between.expr.as_ref().clone(),
                         between.high.as_ref().clone(),
                     ));
+                    let replacement = if between.negated {
+                        Expr::Not(Box::new(conjunction))
+                    } else {
+                        conjunction
+                    };
+                    return Ok(Transformed::yes(replacement));
+                }
+                // Over arrays it expands to Trino's array `>=` / `<=`, so
+                // the NULL-element rules apply here too (`ARRAY['a', 'b']
+                // BETWEEN ARRAY['a', NULL] AND ARRAY['z']` used to answer
+                // true while the bare `>=` errored).
+                if types.len() == 3 && types.iter().all(is_list) {
+                    let bound = |op, other: &Expr| {
+                        rewrite_binary(&between.expr, op, other, schema)
+                            .expect("array operands rewrite")
+                    };
+                    let conjunction = bound(Operator::GtEq, &between.low)
+                        .and(bound(Operator::LtEq, &between.high));
                     let replacement = if between.negated {
                         Expr::Not(Box::new(conjunction))
                     } else {

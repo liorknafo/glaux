@@ -216,7 +216,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "max(x)",
         "Aggregate",
         Passthrough,
-        "DataFusion `max`; over DOUBLE / REAL inputs glaux substitutes its own aggregate ranking NaN smallest (`max` of `{1.0, NaN}` is `1.0`, NaN only when every value is NaN), matching Trino's `COMPARISON_UNORDERED_FIRST`; Arrow's `max` would return NaN. `min` needs no substitute: both engines rank NaN largest there.",
+        "DataFusion `max`; over DOUBLE / REAL inputs glaux substitutes its own aggregate ranking NaN smallest (`max` of `{1.0, NaN}` is `1.0`, NaN only when every value is NaN), matching Trino's `COMPARISON_UNORDERED_FIRST`; Arrow's `max` would return NaN. `min` needs no substitute: both engines rank NaN largest there. Over arrays it goes through Trino's array ordering operator, which raises `ARRAY comparison not supported for arrays with null elements` once a shared prefix forces it to read a NULL element (Arrow's kernels would rank the NULL and answer). The same holds for the window form and for an aggregate's own `ORDER BY` (`array_agg(x ORDER BY x)`).",
         ["max"]
     ),
     shim!(
@@ -232,7 +232,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "min(x)",
         "Aggregate",
         Passthrough,
-        "DataFusion `min`",
+        "DataFusion `min`. Over arrays it goes through Trino's array ordering operator, which raises `ARRAY comparison not supported for arrays with null elements` once a shared prefix forces it to read a NULL element (Arrow's kernels would rank the NULL and answer).",
         ["min"]
     ),
     shim!(
@@ -979,7 +979,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "greatest(a, b, ...)",
         "Math",
         Rewrite,
-        "`CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE greatest(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type. Over DOUBLE / REAL arguments glaux substitutes its own function ranking NaN smallest (`greatest(1e0, NaN)` is `1.0`), matching Trino's `COMPARISON_UNORDERED_FIRST`; `least` needs no substitute (both engines rank NaN largest there).",
+        "`CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE greatest(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type. Over DOUBLE / REAL arguments glaux substitutes its own function ranking NaN smallest (`greatest(1e0, NaN)` is `1.0`), matching Trino's `COMPARISON_UNORDERED_FIRST`; `least` needs no substitute (both engines rank NaN largest there). Over arrays it goes through Trino's array ordering operator, which raises `ARRAY comparison not supported for arrays with null elements` once a shared prefix forces it to read a NULL element (Arrow's kernels would rank the NULL and answer).",
         ["greatest"]
     ),
     shim!(
@@ -987,7 +987,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "least(a, b, ...)",
         "Math",
         Rewrite,
-        "`CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE least(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type.",
+        "`CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE least(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type. Over arrays it goes through Trino's array ordering operator, which raises `ARRAY comparison not supported for arrays with null elements` once a shared prefix forces it to read a NULL element (Arrow's kernels would rank the NULL and answer).",
         ["least"]
     ),
     shim!(
@@ -1133,7 +1133,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "array_max(array)",
         "Array",
         Rewrite,
-        "Rust UDF `trino_array_max`: NULL when the array is empty or has a NULL element, as in Trino (DataFusion skips NULL elements); NaN ranks smallest (`array_max(ARRAY[1e0, NaN])` is `1.0`), matching Trino's `COMPARISON_UNORDERED_FIRST`.",
+        "Rust UDF `trino_array_max`: NULL when the array is empty or has a NULL element, as in Trino (DataFusion skips NULL elements); NaN ranks smallest (`array_max(ARRAY[1e0, NaN])` is `1.0`), matching Trino's `COMPARISON_UNORDERED_FIRST`. Ranking elements that are themselves arrays uses Trino's array ordering operator, so a NULL *inside* one of them raises `ARRAY comparison not supported for arrays with null elements`.",
         ["trino_array_max"]
     ),
     shim!(
@@ -1141,7 +1141,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "array_min(array)",
         "Array",
         Rewrite,
-        "Rust UDF `trino_array_min`: NULL when the array is empty or has a NULL element, as in Trino (DataFusion skips NULL elements).",
+        "Rust UDF `trino_array_min`: NULL when the array is empty or has a NULL element, as in Trino (DataFusion skips NULL elements). Ranking elements that are themselves arrays uses Trino's array ordering operator, so a NULL *inside* one of them raises `ARRAY comparison not supported for arrays with null elements`.",
         ["trino_array_min"]
     ),
     shim!(
@@ -1165,7 +1165,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "array_sort(array) → array",
         "Array",
         Rewrite,
-        "`array_sort(x, 'ASC', 'NULLS LAST')`: ascending with NULL elements last, as in Trino (DataFusion's default puts them first). The comparator-lambda form is refused.",
+        "`array_sort(x, 'ASC', 'NULLS LAST')`: ascending with NULL elements last, as in Trino (DataFusion's default puts them first). Sorting elements that are themselves arrays uses Trino's array ordering operator, so a NULL *inside* one of them raises `ARRAY comparison not supported for arrays with null elements`. The comparator-lambda form is refused.",
         ["array_sort"]
     ),
     shim!(
@@ -1501,7 +1501,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "BETWEEN / IN (list) / LIKE / IS [NOT] NULL / IS DISTINCT FROM",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "`LIKE` has no default escape character, as in Trino: a backslash in the pattern is literal (`'a_c' LIKE 'a\\_c'` is false) unless an `ESCAPE` clause names it; the escape character must precede `%`, `_`, or itself. `ILIKE`, `SIMILAR TO`, `LIKE ANY`, and the `IS [NOT] TRUE` / `IS [NOT] FALSE` / `IS [NOT] UNKNOWN` predicates (not in Trino's grammar; DataFusion would evaluate them) are refused as non-Trino syntax. Array comparison follows Trino's NULL-element rules: `ARRAY[1, NULL] = ARRAY[1, NULL]` is NULL (a definite element mismatch or a length mismatch is `false`), and ordering arrays with NULL elements (`<`, `ORDER BY`) is an error, `ARRAY comparison not supported for arrays with null elements`.",
+        notes: "`LIKE` has no default escape character, as in Trino: a backslash in the pattern is literal (`'a_c' LIKE 'a\\_c'` is false) unless an `ESCAPE` clause names it; the escape character must precede `%`, `_`, or itself. `ILIKE`, `SIMILAR TO`, `LIKE ANY`, and the `IS [NOT] TRUE` / `IS [NOT] FALSE` / `IS [NOT] UNKNOWN` predicates (not in Trino's grammar; DataFusion would evaluate them) are refused as non-Trino syntax. Array comparison follows Trino's NULL-element rules: `ARRAY[1, NULL] = ARRAY[1, NULL]` is NULL (a definite element mismatch or a length mismatch is `false`), and ordering arrays with NULL elements is an error, `ARRAY comparison not supported for arrays with null elements`. Every path that ranks arrays raises it: `<` / `<=` / `>` / `>=`, `BETWEEN`, `ORDER BY`, `max` / `min` (aggregate and window), `greatest` / `least`, `array_max` / `array_min`, `array_sort`, and an aggregate's own `ORDER BY`.",
         corpus_marker: "IS DISTINCT FROM",
     },
     Construct {
