@@ -24,6 +24,16 @@ EventBridge → SQS → your service → Firehose → Parquet in S3 → Athena S
 
 The engine crates (`glaux-athena`, `glaux-firehose`, `glaux-catalog`) are Apache-2.0 and have no fakecloud dependency.
 
+## Quick start (standalone)
+
+```sh
+cargo run -p glaux-server -- --s3-endpoint http://127.0.0.1:4566 --glue-endpoint http://127.0.0.1:4566
+aws --endpoint-url http://127.0.0.1:4570 athena list-work-groups
+aws --endpoint-url http://127.0.0.1:4570 firehose list-delivery-streams
+```
+
+`glaux-server` refuses to start without explicit S3 and Glue endpoints (or `--aws`), and refuses to start when an endpoint it was given does not answer. Configuration comes from a TOML file (`--config`), `GLAUX_*` environment variables, and flags, in that order; `GET /health` reports what it is running against. A docker-compose pairing with fakecloud and a full CLI walkthrough live in [`examples/`](examples/README.md).
+
 ## Status
 
 v0.1 in progress. The all-in-one `glaux` binary runs: an embedded fakecloud control plane (S3, Glue, SQS, SNS, IAM/STS, SSM, Secrets Manager, KMS, Logs) plus glaux's Athena and Firehose on one port, with the engines reading fakecloud's S3/Glue state in-process — see [`crates/glaux/README.md`](crates/glaux/README.md). The v0.1 design spec lives in [`docs/specs/2026-08-15-glaux-v0.1-design.md`](docs/specs/2026-08-15-glaux-v0.1-design.md). Feasibility spikes (ranged S3 reads against fakecloud, embedding custom services on fakecloud's dispatcher) passed on 2026-08-15.
