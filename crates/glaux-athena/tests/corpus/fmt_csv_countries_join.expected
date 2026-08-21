@@ -1,0 +1,10 @@
+types: varchar, varchar, varchar, bigint, bigint, double
++------+----------------+---------------+-----------+------------+---------+
+| code | country_name   | continent     | customers | population | gdp     |
++------+----------------+---------------+-----------+------------+---------+
+| DE   | Germany        | Europe        | 2         | 84500000   | 52745.8 |
+| US   | United States  | North America | 2         | 334900000  | 81695.2 |
+| FR   | France         | Europe        | 1         | 68200000   | 44460.8 |
+| GB   | United Kingdom | Europe        | 0         | 67700000   | 48866.6 |
+| JP   | Japan          | Asia          | 0         | 124500000  | 33834.4 |
++------+----------------+---------------+-----------+------------+---------+
