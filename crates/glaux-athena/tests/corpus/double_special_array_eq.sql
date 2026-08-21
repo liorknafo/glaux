@@ -1,0 +1,3 @@
+SELECT ARRAY[CAST('NaN' AS DOUBLE)] = ARRAY[CAST('NaN' AS DOUBLE)] AS eq_nan,
+       ARRAY[CAST('NaN' AS DOUBLE)] <> ARRAY[CAST('NaN' AS DOUBLE)] AS neq_nan,
+       ARRAY[0e0] = ARRAY[-0e0] AS eq_zero

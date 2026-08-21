@@ -343,7 +343,27 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
                     trino_type_name(&left),
                     trino_type_name(field.data_type())
                 ))
-            })
+            })?;
+            // Trino evaluates `IN (subquery)` with the EQUAL operator (NaN
+            // matches nothing); DataFusion decorrelates it into a hash
+            // semi-join whose key equality is Arrow's (NaN matches NaN),
+            // and the join is built after this check runs, so a float
+            // operand is refused rather than risked.
+            if matches!(
+                left,
+                DataType::Float16 | DataType::Float32 | DataType::Float64
+            ) || matches!(
+                field.data_type(),
+                DataType::Float16 | DataType::Float32 | DataType::Float64
+            ) {
+                return Err(GlauxSqlError::unsupported(
+                    "IN (subquery) over DOUBLE / REAL",
+                    "Trino compares double values with IEEE equality (NaN never matches), which \
+                     DataFusion's semi-join does not reproduce; use a JOIN with an explicit ON \
+                     equality instead",
+                ));
+            }
+            Ok(())
         }
         Expr::Between(between) => {
             check_operands(&between.expr, Operator::GtEq, &between.low, schema)?;
@@ -454,6 +474,27 @@ fn check_plan_node(node: &LogicalPlan, schema: &DFSchema) -> Result<(), GlauxSql
     }
 }
 
+/// `IN (subquery)` / `EXISTS` used as a *value* (in the select list, a sort
+/// key, a join condition — anywhere but a `WHERE` / `HAVING` predicate,
+/// which plans as a `Filter`): DataFusion cannot evaluate the expression
+/// (`Physical plan does not support logical expression InSubquery`), so it
+/// is refused by name here instead of leaking that error.
+fn check_subquery_position(node: &LogicalPlan, expr: &Expr) -> Result<(), GlauxSqlError> {
+    if matches!(node, LogicalPlan::Filter(_)) {
+        return Ok(());
+    }
+    let construct = match expr {
+        Expr::InSubquery(_) => "IN (subquery) as a value",
+        Expr::Exists(_) => "EXISTS as a value",
+        _ => return Ok(()),
+    };
+    Err(GlauxSqlError::unsupported(
+        construct,
+        "DataFusion only decorrelates IN / EXISTS subqueries used as WHERE / HAVING predicates; \
+         use them there, or rewrite with a JOIN",
+    ))
+}
+
 /// Reject operator applications Trino refuses. Run on the freshly planned
 /// (not yet analyzed/optimized) plan so operand types are still the
 /// original ones.
@@ -466,11 +507,15 @@ pub fn check(plan: &LogicalPlan) -> Result<(), GlauxSqlError> {
             return Ok(TreeNodeRecursion::Stop);
         }
         node.apply_expressions(|expr| {
-            expr.apply(|e| match check_expr(e, &schema) {
-                Ok(()) => Ok(TreeNodeRecursion::Continue),
-                Err(err) => {
-                    failure = Some(err);
-                    Ok(TreeNodeRecursion::Stop)
+            expr.apply(|e| {
+                let checked =
+                    check_subquery_position(node, e).and_then(|()| check_expr(e, &schema));
+                match checked {
+                    Ok(()) => Ok(TreeNodeRecursion::Continue),
+                    Err(err) => {
+                        failure = Some(err);
+                        Ok(TreeNodeRecursion::Stop)
+                    }
                 }
             })
         })

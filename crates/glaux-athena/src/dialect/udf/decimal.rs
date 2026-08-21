@@ -348,9 +348,11 @@ pub(crate) fn rescale(value: i256, from: i8, to: i8) -> Option<i256> {
 }
 
 /// Parse a decimal string (`[+-]digits[.digits][e[+-]digits]`) to an
-/// unscaled value at `scale`, rounding half away from zero.
+/// unscaled value at `scale`, rounding half away from zero. Surrounding
+/// whitespace is rejected: Trino's varchar → decimal cast goes through
+/// Java's `new BigDecimal(String)`, which refuses `' 1.5 '` (unlike its
+/// integer and date casts, which trim).
 fn parse_decimal_text(text: &str, scale: u8) -> Option<i256> {
-    let text = text.trim();
     let (mantissa_text, exponent) = match text.split_once(['e', 'E']) {
         Some((m, e)) => (m, e.parse::<i32>().ok()?),
         None => (text, 0),
@@ -936,7 +938,11 @@ mod tests {
     #[test]
     fn decimal_text_parses_exactly() {
         assert_eq!(parse_decimal_text("1.5", 2), Some(d(150)));
-        assert_eq!(parse_decimal_text(" -1.25 ", 1), Some(d(-13)));
+        assert_eq!(parse_decimal_text("-1.25", 1), Some(d(-13)));
+        // Trino's varchar → decimal cast rejects surrounding whitespace
+        // (java.math.BigDecimal), unlike its integer casts, which trim.
+        assert_eq!(parse_decimal_text(" 1.5 ", 2), None);
+        assert_eq!(parse_decimal_text(" -1.25 ", 1), None);
         assert_eq!(parse_decimal_text("1e2", 0), Some(d(100)));
         assert_eq!(parse_decimal_text("1.5E-1", 3), Some(d(150)));
         assert_eq!(parse_decimal_text("abc", 1), None);

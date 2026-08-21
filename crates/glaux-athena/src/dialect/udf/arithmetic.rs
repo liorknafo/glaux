@@ -58,8 +58,9 @@ use super::decimal::{
     DecimalAgg, TrinoDecimalAgg, TrinoDecimalDiv, decimal_binary, decimal_result_type,
     decimal_type_of, is_exact_numeric,
 };
+use super::floats::{TrinoFloatGreatest, TrinoFloatMax, TrinoIeeeCmp};
 use super::timestamps::{TrinoDateInterval, TrinoTimestampMillis};
-use super::{data_error, is_integer, type_mismatch};
+use super::{data_error, is_integer, type_mismatch, unsupported_error};
 
 /// The checked scalar UDFs (`trino_checked_add` / `_sub` / `_mul`).
 pub fn scalar_udfs() -> Vec<ScalarUDF> {
@@ -622,6 +623,47 @@ fn is_list(t: &DataType) -> bool {
     )
 }
 
+/// A type Trino compares with a double (the IEEE comparison UDF casts it).
+fn numeric_or_null(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::Null
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(..)
+    )
+}
+
+/// Whether a `=` / `<` … between these types must use IEEE double
+/// semantics (Trino's `DoubleType` operators) instead of Arrow's
+/// total-order kernels: any comparison with a float operand.
+fn needs_ieee_comparison(l: &DataType, r: &DataType) -> bool {
+    (is_float(l) || is_float(r)) && numeric_or_null(l) && numeric_or_null(r)
+}
+
+fn ieee_comparison_op(op: Operator) -> Option<Operator> {
+    matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+    )
+    .then_some(op)
+}
+
+/// `trino_ieee_<op>(left, right)`.
+fn ieee_cmp(op: Operator, left: Expr, right: Expr) -> Expr {
+    udf_call(TrinoIeeeCmp::new(op), vec![left, right])
+}
+
 fn rewrite_binary(left: &Expr, op: Operator, right: &Expr, schema: &DFSchema) -> Option<Expr> {
     let (Ok(l), Ok(r)) = (left.get_type(schema), right.get_type(schema)) else {
         return None;
@@ -641,6 +683,14 @@ fn rewrite_binary(left: &Expr, op: Operator, right: &Expr, schema: &DFSchema) ->
             TrinoArrayCompare::new(cmp),
             vec![left.clone(), right.clone()],
         ));
+    }
+    // Comparisons with a float operand: Trino's operators are Java's
+    // primitive double operators (NaN compares false, `-0.0 = 0.0` is
+    // true); Arrow's kernels use a total order where NaN equals NaN.
+    if let Some(op) = ieee_comparison_op(op)
+        && needs_ieee_comparison(&l, &r)
+    {
+        return Some(ieee_cmp(op, left.clone(), right.clone()));
     }
     if let Some(widened) = widen_exact_to_double(&[left, right], schema) {
         let mut it = widened.into_iter();
@@ -686,10 +736,11 @@ fn rewrite_binary(left: &Expr, op: Operator, right: &Expr, schema: &DFSchema) ->
     }
 }
 
-/// The Trino substitute for `sum` / `avg` over an argument of type `t`:
-/// overflow-checked for integers, Trino's decimal typing for decimals, a
-/// `real` result for `real` inputs. `None` keeps DataFusion's aggregate.
-fn trino_sum_avg(name: &str, t: &DataType) -> Option<AggregateUDF> {
+/// The Trino substitute for `sum` / `avg` / `max` over an argument of type
+/// `t`: overflow-checked for integers, Trino's decimal typing for decimals,
+/// a `real` result for `real` inputs, NaN-smallest `max` for floats. `None`
+/// keeps DataFusion's aggregate.
+fn trino_aggregate(name: &str, t: &DataType) -> Option<AggregateUDF> {
     Some(match (name, t) {
         ("sum", t) if is_integer(t) => AggregateUDF::new_from_impl(CheckedIntSum::new()),
         ("sum", DataType::Decimal128(..)) => {
@@ -700,6 +751,11 @@ fn trino_sum_avg(name: &str, t: &DataType) -> Option<AggregateUDF> {
         }
         ("sum", DataType::Float32) => AggregateUDF::new_from_impl(RealAgg::new(false)),
         ("avg", DataType::Float32) => AggregateUDF::new_from_impl(RealAgg::new(true)),
+        // Trino's `max` ranks NaN smallest (`COMPARISON_UNORDERED_FIRST`);
+        // Arrow's ranks it largest. `min` agrees between the two.
+        ("max", DataType::Float32 | DataType::Float64) => {
+            AggregateUDF::new_from_impl(TrinoFloatMax::new())
+        }
         _ => return None,
     })
 }
@@ -724,10 +780,10 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     return Ok(Transformed::yes(replacement));
                 }
             }
-            Expr::AggregateFunction(agg) if matches!(agg.func.name(), "sum" | "avg") => {
+            Expr::AggregateFunction(agg) if matches!(agg.func.name(), "sum" | "avg" | "max") => {
                 if let [arg] = agg.params.args.as_slice()
                     && let Ok(t) = arg.get_type(schema)
-                    && let Some(func) = trino_sum_avg(agg.func.name(), &t)
+                    && let Some(func) = trino_aggregate(agg.func.name(), &t)
                 {
                     let mut replacement = agg.clone();
                     replacement.func = Arc::new(func);
@@ -736,10 +792,10 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
             }
             Expr::WindowFunction(window) => {
                 if let WindowFunctionDefinition::AggregateUDF(func) = &window.fun
-                    && matches!(func.name(), "sum" | "avg")
+                    && matches!(func.name(), "sum" | "avg" | "max")
                     && let [arg] = window.params.args.as_slice()
                     && let Ok(t) = arg.get_type(schema)
-                    && let Some(func) = trino_sum_avg(func.name(), &t)
+                    && let Some(func) = trino_aggregate(func.name(), &t)
                 {
                     let mut replacement: WindowFunction = window.as_ref().clone();
                     replacement.fun = WindowFunctionDefinition::AggregateUDF(Arc::new(func));
@@ -749,32 +805,197 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                 }
             }
             // Trino's common supertype of double and an exact number is
-            // double; DataFusion widens both into a decimal.
+            // double; DataFusion widens both into a decimal. `nullif` and
+            // `greatest` additionally need IEEE / NaN-smallest semantics
+            // when a float is involved (see `floats`).
             Expr::ScalarFunction(call)
                 if matches!(
                     call.func.name(),
                     "greatest" | "least" | "coalesce" | "nullif"
                 ) =>
             {
-                let args: Vec<&Expr> = call.args.iter().collect();
-                if let Some(widened) = widen_exact_to_double(&args, schema) {
+                let name = call.func.name().to_string();
+                let arg_refs: Vec<&Expr> = call.args.iter().collect();
+                let widened = widen_exact_to_double(&arg_refs, schema);
+                let args: Vec<Expr> = widened.clone().unwrap_or_else(|| call.args.to_vec());
+                let any_float = call
+                    .args
+                    .iter()
+                    .filter_map(|a| a.get_type(schema).ok())
+                    .any(|t| is_float(&t));
+                // Trino's `nullif(a, b)` uses the EQUAL operator, so
+                // `nullif(0e0, -0e0)` is NULL and `nullif(NaN, NaN)` is NaN;
+                // DataFusion's kernel compares bit patterns.
+                if name == "nullif" && args.len() == 2 && any_float {
+                    let case = datafusion::logical_expr::expr::Case {
+                        expr: None,
+                        when_then_expr: vec![(
+                            Box::new(ieee_cmp(Operator::Eq, args[0].clone(), args[1].clone())),
+                            Box::new(Expr::Literal(ScalarValue::Null, None)),
+                        )],
+                        else_expr: Some(Box::new(args[0].clone())),
+                    };
+                    return Ok(Transformed::yes(Expr::Case(case)));
+                }
+                // Trino's `greatest` ranks NaN smallest; DataFusion's ranks
+                // it largest. (`least` agrees between the two.)
+                if name == "greatest" && any_float {
+                    return Ok(Transformed::yes(udf_call(TrinoFloatGreatest::new(), args)));
+                }
+                if let Some(widened) = widened {
                     let mut replacement = call.clone();
                     replacement.args = widened;
                     return Ok(Transformed::yes(Expr::ScalarFunction(replacement)));
                 }
             }
+            // Trino's `||` on arrays is NULL-propagating for the *array*
+            // operands (`ARRAY[1] || NULL-array` is NULL, while `ARRAY[1] ||
+            // NULL-element` appends a NULL element); DataFusion's
+            // `array_concat` treats a NULL array as empty.
+            Expr::ScalarFunction(call)
+                if matches!(
+                    call.func.name(),
+                    "array_concat" | "array_append" | "array_prepend"
+                ) =>
+            {
+                let array_args: Vec<&Expr> = match call.func.name() {
+                    "array_append" => call.args.first().into_iter().collect(),
+                    "array_prepend" => call.args.get(1).into_iter().collect(),
+                    _ => call.args.iter().collect(),
+                };
+                let condition = array_args
+                    .into_iter()
+                    .map(|a| Expr::IsNull(Box::new(a.clone())))
+                    .reduce(Expr::or);
+                if let Some(condition) = condition {
+                    let case = datafusion::logical_expr::expr::Case {
+                        expr: None,
+                        when_then_expr: vec![(
+                            Box::new(condition),
+                            Box::new(Expr::Literal(ScalarValue::Null, None)),
+                        )],
+                        else_expr: Some(Box::new(e.clone())),
+                    };
+                    return Ok(Transformed::yes(Expr::Case(case)));
+                }
+            }
+            // `x IN (a, b)` over floats: Trino evaluates it with the EQUAL
+            // operator; Arrow's `InList` kernel would treat NaN as equal to
+            // NaN. Expanded to an OR of IEEE equalities (three-valued logic
+            // included).
+            Expr::InList(in_list) => {
+                let mut types: Vec<DataType> = Vec::new();
+                for item in std::iter::once(&in_list.expr)
+                    .map(|b| b.as_ref())
+                    .chain(in_list.list.iter())
+                {
+                    let Ok(t) = item.get_type(schema) else {
+                        types.clear();
+                        break;
+                    };
+                    types.push(t);
+                }
+                if !types.is_empty()
+                    && types.iter().any(is_float)
+                    && types.iter().all(numeric_or_null)
+                {
+                    let chain = in_list
+                        .list
+                        .iter()
+                        .map(|item| {
+                            ieee_cmp(Operator::Eq, in_list.expr.as_ref().clone(), item.clone())
+                        })
+                        .reduce(Expr::or)
+                        .expect("IN lists are non-empty");
+                    let replacement = if in_list.negated {
+                        Expr::Not(Box::new(chain))
+                    } else {
+                        chain
+                    };
+                    return Ok(Transformed::yes(replacement));
+                }
+            }
+            // `x BETWEEN a AND b` over floats: expanded to IEEE `>=` / `<=`
+            // (exactly Trino's definition), so NaN bounds compare false.
+            Expr::Between(between) => {
+                let types: Vec<DataType> = [&between.expr, &between.low, &between.high]
+                    .iter()
+                    .filter_map(|b| b.get_type(schema).ok())
+                    .collect();
+                if types.len() == 3
+                    && types.iter().any(is_float)
+                    && types.iter().all(numeric_or_null)
+                {
+                    let conjunction = ieee_cmp(
+                        Operator::GtEq,
+                        between.expr.as_ref().clone(),
+                        between.low.as_ref().clone(),
+                    )
+                    .and(ieee_cmp(
+                        Operator::LtEq,
+                        between.expr.as_ref().clone(),
+                        between.high.as_ref().clone(),
+                    ));
+                    let replacement = if between.negated {
+                        Expr::Not(Box::new(conjunction))
+                    } else {
+                        conjunction
+                    };
+                    return Ok(Transformed::yes(replacement));
+                }
+            }
             Expr::Case(case) => {
-                let mut results: Vec<&Expr> = case
+                // A simple CASE whose operand involves floats compares with
+                // the EQUAL operator on Trino; converted to the searched
+                // form over IEEE equality.
+                let mut converted: Option<datafusion::logical_expr::expr::Case> = None;
+                if let Some(operand) = &case.expr {
+                    let mut types: Vec<DataType> = Vec::new();
+                    for item in std::iter::once(operand.as_ref())
+                        .chain(case.when_then_expr.iter().map(|(w, _)| w.as_ref()))
+                    {
+                        let Ok(t) = item.get_type(schema) else {
+                            types.clear();
+                            break;
+                        };
+                        types.push(t);
+                    }
+                    if !types.is_empty()
+                        && types.iter().any(is_float)
+                        && types.iter().all(numeric_or_null)
+                    {
+                        converted = Some(datafusion::logical_expr::expr::Case {
+                            expr: None,
+                            when_then_expr: case
+                                .when_then_expr
+                                .iter()
+                                .map(|(when, then)| {
+                                    (
+                                        Box::new(ieee_cmp(
+                                            Operator::Eq,
+                                            operand.as_ref().clone(),
+                                            when.as_ref().clone(),
+                                        )),
+                                        then.clone(),
+                                    )
+                                })
+                                .collect(),
+                            else_expr: case.else_expr.clone(),
+                        });
+                    }
+                }
+                let current = converted.as_ref().unwrap_or(case);
+                let mut results: Vec<&Expr> = current
                     .when_then_expr
                     .iter()
                     .map(|(_, t)| t.as_ref())
                     .collect();
-                if let Some(otherwise) = &case.else_expr {
+                if let Some(otherwise) = &current.else_expr {
                     results.push(otherwise);
                 }
                 if let Some(mut widened) = widen_exact_to_double(&results, schema) {
-                    let mut replacement = case.clone();
-                    let else_expr = if case.else_expr.is_some() {
+                    let mut replacement = current.clone();
+                    let else_expr = if current.else_expr.is_some() {
                         widened.pop().map(Box::new)
                     } else {
                         None
@@ -785,6 +1006,9 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     }
                     replacement.else_expr = else_expr;
                     return Ok(Transformed::yes(Expr::Case(replacement)));
+                }
+                if let Some(converted) = converted {
+                    return Ok(Transformed::yes(Expr::Case(converted)));
                 }
             }
             _ => {}
@@ -950,6 +1174,50 @@ fn widen_union_to_double(inputs: Vec<Arc<LogicalPlan>>) -> Result<Vec<Arc<Logica
         .collect()
 }
 
+/// Equi-join keys of `DOUBLE` / `REAL` type cannot go through DataFusion's
+/// hash join: its key equality is Arrow's (NaN matches NaN), while Trino
+/// joins with the EQUAL operator (NaN matches nothing). The float pairs are
+/// moved out of `on` into the join filter as IEEE-equality UDF calls, which
+/// forces a nested-loop join with Trino's semantics. `USING` float keys are
+/// refused instead: the `USING` projection logic needs the pairs in `on`.
+fn move_float_join_keys(join: &Join) -> Result<Option<LogicalPlan>> {
+    let schema = {
+        let mut merged = DFSchema::empty();
+        merged.merge(join.left.schema());
+        merged.merge(join.right.schema());
+        merged
+    };
+    let float_pair = |l: &Expr, r: &Expr| {
+        let (Ok(lt), Ok(rt)) = (l.get_type(&schema), r.get_type(&schema)) else {
+            return false;
+        };
+        is_float(&lt) || is_float(&rt)
+    };
+    if !join.on.iter().any(|(l, r)| float_pair(l, r)) {
+        return Ok(None);
+    }
+    if join.join_constraint == JoinConstraint::Using {
+        return Err(unsupported_error(
+            "JOIN ... USING on DOUBLE / REAL keys",
+            "Trino compares double join keys with IEEE equality (NaN never matches), which \
+             DataFusion's hash join does not reproduce; write the join condition with ON",
+        ));
+    }
+    let mut moved = join.clone();
+    let (float, keep): (Vec<_>, Vec<_>) = moved.on.into_iter().partition(|(l, r)| float_pair(l, r));
+    moved.on = keep;
+    let condition = float
+        .into_iter()
+        .map(|(l, r)| ieee_cmp(Operator::Eq, l, r))
+        .reduce(Expr::and)
+        .expect("at least one float pair");
+    moved.filter = Some(match moved.filter.take() {
+        Some(filter) => filter.and(condition),
+        None => condition,
+    });
+    Ok(Some(LogicalPlan::Join(moved)))
+}
+
 /// Trino's `JOIN ... USING (k)` exposes one `k`: the left value for an inner
 /// or left join, the right value for a right join, `coalesce(l.k, r.k)` for
 /// a full join. DataFusion keeps both `l.k` and `r.k` and resolves an
@@ -1069,6 +1337,11 @@ impl AnalyzerRule for TrinoSemantics {
                 )?),
                 other => other.recompute_schema()?,
             };
+            if let LogicalPlan::Join(join) = &transformed.data
+                && let Some(fixed) = move_float_join_keys(join)?
+            {
+                transformed = Transformed::yes(fixed);
+            }
             if let LogicalPlan::Join(join) = &transformed.data
                 && let Some(projection) = using_join_projection(join)?
             {

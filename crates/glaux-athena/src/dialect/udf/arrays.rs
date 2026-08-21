@@ -49,6 +49,7 @@ pub fn all() -> Vec<ScalarUDF> {
         ScalarUDF::new_from_impl(TrinoArrayExtreme::new(true)),
         ScalarUDF::new_from_impl(TrinoArrayExtreme::new(false)),
         ScalarUDF::new_from_impl(TrinoArrayRemove::new()),
+        ScalarUDF::new_from_impl(TrinoArrayPosition::new()),
         ScalarUDF::new_from_impl(TrinoArrayJoin::new()),
         ScalarUDF::new_from_impl(TrinoArrayCompare::new(ArrayCmp::Eq)),
         ScalarUDF::new_from_impl(TrinoArrayCompare::new(ArrayCmp::NotEq)),
@@ -329,6 +330,18 @@ impl ScalarUDFImpl for TrinoReverse {
 // contains(array, x) / arrays_overlap(a, b)
 // ---------------------------------------------------------------------------
 
+/// Element equality with Trino's EQUAL semantics: floats compare with
+/// Java's `==` (`NaN` equals nothing, `-0.0` equals `0.0`); everything
+/// else uses `ScalarValue` equality (whose float rules would be Arrow's
+/// total order: `NaN = NaN`, `-0.0 ≠ 0.0`).
+fn scalar_equal_ieee(a: &ScalarValue, b: &ScalarValue) -> bool {
+    match (a, b) {
+        (ScalarValue::Float64(Some(x)), ScalarValue::Float64(Some(y))) => x == y,
+        (ScalarValue::Float32(Some(x)), ScalarValue::Float32(Some(y))) => x == y,
+        _ => a == b,
+    }
+}
+
 /// Three-valued result of a membership search.
 fn membership(found: bool, saw_null: bool) -> Option<bool> {
     if found {
@@ -413,7 +426,8 @@ impl ScalarUDFImpl for TrinoContains {
             }
             let wanted = ScalarValue::try_from_array(needle.as_ref(), i)?;
             let (elements, saw_null) = row_scalars(&list, i)?;
-            out.append_option(membership(elements.contains(&wanted), saw_null));
+            let found = elements.iter().any(|e| scalar_equal_ieee(e, &wanted));
+            out.append_option(membership(found, saw_null));
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
@@ -570,12 +584,56 @@ impl ScalarUDFImpl for TrinoArrayExtreme {
                 positions.push(None);
                 continue;
             }
+            // Trino's `array_max` ranks NaN smallest (`COMPARISON_UNORDERED_
+            // FIRST`), so it is the result only when every element is NaN;
+            // Arrow's sort ranks NaN largest. (`array_min` agrees between
+            // the two: both rank NaN largest there.)
+            if self.max
+                && let Some(best) = float_max_index(slice.as_ref())
+            {
+                positions.push(Some(start as i64 + best as i64));
+                continue;
+            }
             let order = sort_to_indices(slice.as_ref(), Some(options), Some(1))?;
             positions.push(Some(start as i64 + i64::from(order.value(0))));
         }
         let taken = take(values.as_ref(), &Int64Array::from(positions), None)?;
         Ok(ColumnarValue::Array(taken))
     }
+}
+
+/// The index of the Trino-max element of a float array with no nulls (NaN
+/// ranked smallest, `-0.0 < 0.0`), or `None` when the array is not a float
+/// array (empty slices never reach this: callers skip them).
+fn float_max_index(values: &dyn Array) -> Option<usize> {
+    let floats: Vec<f64> = match values.data_type() {
+        DataType::Float64 => values
+            .as_primitive::<arrow::datatypes::Float64Type>()
+            .values()
+            .to_vec(),
+        DataType::Float32 => values
+            .as_primitive::<arrow::datatypes::Float32Type>()
+            .values()
+            .iter()
+            .map(|v| f64::from(*v))
+            .collect(),
+        _ => return None,
+    };
+    let mut best = 0usize;
+    for (i, v) in floats.iter().enumerate().skip(1) {
+        let b = floats[best];
+        let prefer = if v.is_nan() {
+            false
+        } else if b.is_nan() {
+            true
+        } else {
+            v.total_cmp(&b) == std::cmp::Ordering::Greater
+        };
+        if prefer {
+            best = i;
+        }
+    }
+    Some(best)
 }
 
 /// `trino_array_remove(array, x)`: every element equal to `x` removed,
@@ -644,7 +702,10 @@ impl ScalarUDFImpl for TrinoArrayRemove {
             let wanted = ScalarValue::try_from_array(needle.as_ref(), i)?;
             for j in offsets[i] as usize..offsets[i + 1] as usize {
                 let keep = is_null_at(values.as_ref(), j)
-                    || ScalarValue::try_from_array(values.as_ref(), j)? != wanted;
+                    || !scalar_equal_ieee(
+                        &ScalarValue::try_from_array(values.as_ref(), j)?,
+                        &wanted,
+                    );
                 if keep {
                     kept.push(j as i64);
                 }
@@ -660,6 +721,79 @@ impl ScalarUDFImpl for TrinoArrayRemove {
             Some(validity.into()),
         )?;
         Ok(ColumnarValue::Array(Arc::new(result)))
+    }
+}
+
+/// `trino_array_position(array, x)`: the 1-based position of the first
+/// element equal to `x` (Trino's EQUAL operator, so floats compare IEEE:
+/// `array_position(ARRAY[NaN], NaN)` is 0), `0` when there is none, `NULL`
+/// for a `NULL` array or a `NULL` `x`; `NULL` elements never match.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoArrayPosition {
+    signature: Signature,
+}
+
+impl Default for TrinoArrayPosition {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoArrayPosition {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoArrayPosition {
+    fn name(&self) -> &str {
+        "trino_array_position"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        check_element_comparable("array_position", &arg_types[0], &arg_types[1])?;
+        Ok(DataType::Int64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let list = as_list("array_position", args.args[0].to_array(rows)?)?;
+        let element = list.values().data_type().clone();
+        let needle = args.args[1].to_array(rows)?;
+        let needle = if needle.data_type() == &element || element == DataType::Null {
+            needle
+        } else {
+            cast(&needle, &element)?
+        };
+        let values = list.values();
+        let offsets = list.value_offsets();
+        let mut out = arrow::array::Int64Builder::with_capacity(rows);
+        for i in 0..rows {
+            if list.is_null(i) || is_null_at(needle.as_ref(), i) {
+                out.append_null();
+                continue;
+            }
+            let wanted = ScalarValue::try_from_array(needle.as_ref(), i)?;
+            let (start, end) = (offsets[i] as usize, offsets[i + 1] as usize);
+            let mut position = 0i64;
+            for j in start..end {
+                if !is_null_at(values.as_ref(), j)
+                    && scalar_equal_ieee(&ScalarValue::try_from_array(values.as_ref(), j)?, &wanted)
+                {
+                    position = (j - start) as i64 + 1;
+                    break;
+                }
+            }
+            out.append_value(position);
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
 }
 
@@ -837,8 +971,36 @@ fn null_element_error() -> DataFusionError {
     )
 }
 
+/// The float element values at `i` / `j`, when both arrays are float
+/// arrays (which [`unify_lists`] guarantees come unified).
+fn float_pair(left: &dyn Array, i: usize, right: &dyn Array, j: usize) -> Option<(f64, f64)> {
+    match (left.data_type(), right.data_type()) {
+        (DataType::Float64, DataType::Float64) => Some((
+            left.as_primitive::<arrow::datatypes::Float64Type>()
+                .value(i),
+            right
+                .as_primitive::<arrow::datatypes::Float64Type>()
+                .value(j),
+        )),
+        (DataType::Float32, DataType::Float32) => Some((
+            f64::from(
+                left.as_primitive::<arrow::datatypes::Float32Type>()
+                    .value(i),
+            ),
+            f64::from(
+                right
+                    .as_primitive::<arrow::datatypes::Float32Type>()
+                    .value(j),
+            ),
+        )),
+        _ => None,
+    }
+}
+
 /// Three-valued equality of elements `i` of `left` and `j` of `right`,
-/// recursing into nested arrays.
+/// recursing into nested arrays. Float elements compare with Trino's EQUAL
+/// operator (IEEE: `NaN` equals nothing, `-0.0` equals `0.0`); Arrow's
+/// comparator would use its total order.
 fn element_equal(
     left: &dyn Array,
     i: usize,
@@ -848,6 +1010,9 @@ fn element_equal(
 ) -> Result<Option<bool>> {
     if is_null_at(left, i) || is_null_at(right, j) {
         return Ok(None);
+    }
+    if let Some((a, b)) = float_pair(left, i, right, j) {
+        return Ok(Some(a == b));
     }
     match (left.data_type(), right.data_type()) {
         (DataType::List(_), DataType::List(_)) => {
@@ -900,7 +1065,21 @@ fn array_ordering(left: &dyn Array, right: &dyn Array) -> Result<std::cmp::Order
                 left.as_list::<i32>().value(k).as_ref(),
                 right.as_list::<i32>().value(k).as_ref(),
             )?,
-            _ => comparator(k, k),
+            // Trino orders float elements with the IEEE operators (`-0.0 =
+            // 0.0` ties; a NaN makes both `<` and `>` false, an outcome the
+            // Ordering result cannot express), so NaN elements are refused
+            // rather than ordered by Arrow's total order.
+            _ => match float_pair(left, k, right, k) {
+                Some((a, b)) if a.is_nan() || b.is_nan() => {
+                    return Err(data_error(
+                        "NOT_SUPPORTED",
+                        "ARRAY comparison not supported for arrays with NaN elements",
+                    ));
+                }
+                Some((a, b)) if a == b => std::cmp::Ordering::Equal,
+                Some((a, b)) => a.total_cmp(&b),
+                None => comparator(k, k),
+            },
         };
         if ordering != Ordering::Equal {
             return Ok(ordering);

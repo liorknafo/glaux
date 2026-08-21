@@ -26,6 +26,7 @@ pub mod arrays;
 pub mod casts;
 pub mod datetime;
 pub mod decimal;
+pub mod floats;
 pub mod iso8601;
 pub mod json;
 pub mod math;
@@ -73,6 +74,17 @@ pub(crate) fn data_error(code: &str, message: impl Into<String>) -> DataFusionEr
     DataFusionError::External(Box::new(GlauxSqlError::runtime(code, message)))
 }
 
+/// A construct glaux refuses by name, raised from planning-time code that
+/// must return a [`DataFusionError`]. Carried as a
+/// [`GlauxSqlError::Unsupported`] so the client sees `NOT_SUPPORTED` naming
+/// the construct.
+pub(crate) fn unsupported_error(
+    construct: impl Into<String>,
+    message: impl Into<String>,
+) -> DataFusionError {
+    DataFusionError::External(Box::new(GlauxSqlError::unsupported(construct, message)))
+}
+
 macro_rules! user_err {
     ($function:expr, $($arg:tt)*) => {
         Err($crate::dialect::udf::user_error($function, format!($($arg)*)))
@@ -104,6 +116,7 @@ pub fn all() -> Vec<ScalarUDF> {
     udfs.extend(iso8601::all());
     udfs.extend(timestamps::all());
     udfs.extend(decimal::scalar_udfs());
+    udfs.extend(floats::all());
     udfs.extend(math::all());
     udfs.extend(nullable::all());
     udfs.extend(regex::all());
@@ -115,6 +128,7 @@ pub fn all() -> Vec<ScalarUDF> {
 pub fn all_aggregates() -> Vec<AggregateUDF> {
     let mut udafs = arithmetic::aggregate_udfs();
     udafs.extend(decimal::aggregate_udfs());
+    udafs.extend(floats::aggregate_udfs());
     udafs.extend(tdigest::aggregate_udfs());
     udafs
 }
