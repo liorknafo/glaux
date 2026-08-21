@@ -983,6 +983,14 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         ["greatest"]
     ),
     shim!(
+        "infinity",
+        "infinity() → double",
+        "Math",
+        Rewrite,
+        "`trino_double('Infinity')` — glaux's `CAST(varchar AS DOUBLE)`, which follows Java's `Double.parseDouble`. There is no infinite literal to fold onto, and DataFusion has no such function. Negative infinity is `-infinity()`.",
+        ["trino_double"]
+    ),
+    shim!(
         "least",
         "least(a, b, ...)",
         "Math",
@@ -1024,11 +1032,11 @@ pub static FUNCTIONS: &[FunctionShim] = &[
     ),
     shim!("mod", "mod(n, m)", "Math", Rewrite, "`n % m`", []),
     shim!(
-        "infinity",
-        "infinity() → double",
+        "nan",
+        "nan() → double",
         "Math",
         Rewrite,
-        "`trino_double('Infinity')` — glaux's `CAST(varchar AS DOUBLE)`, which follows Java's `Double.parseDouble`. There is no infinite literal to fold onto, and DataFusion has no such function. Negative infinity is `-infinity()`.",
+        "`trino_double('NaN')` — glaux's `CAST(varchar AS DOUBLE)`, which follows Java's `Double.parseDouble`. There is no NaN literal to fold onto, and DataFusion has no such function; `0e0 / 0e0` is the same value.",
         ["trino_double"]
     ),
     shim!(
@@ -1038,14 +1046,6 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         Passthrough,
         "DataFusion `pi`",
         ["pi"]
-    ),
-    shim!(
-        "nan",
-        "nan() → double",
-        "Math",
-        Rewrite,
-        "`trino_double('NaN')` — glaux's `CAST(varchar AS DOUBLE)`, which follows Java's `Double.parseDouble`. There is no NaN literal to fold onto, and DataFusion has no such function; `0e0 / 0e0` is the same value.",
-        ["trino_double"]
     ),
     shim!(
         "pow",

@@ -784,7 +784,7 @@ fn navigate<'a>(value: &'a json::Json, steps: &[Step]) -> Option<&'a json::Json>
 /// Trino's `JsonFunctions.jsonParse` catches every parse failure and
 /// reports `Cannot convert '<text>' to JSON`; serde-style offsets ("expected
 /// `null` at offset 0") are the parser's wording, not Athena's.
-fn parse_json(_function: &str, text: &str) -> Result<json::Json> {
+fn parse_json(text: &str) -> Result<json::Json> {
     json::parse(text).map_err(|_| {
         data_error(
             "INVALID_FUNCTION_ARGUMENT",
@@ -998,7 +998,7 @@ fn json_map<T>(
             continue;
         }
         let parsed = if strict {
-            parse_json(function, json.value(i))?
+            parse_json(json.value(i))?
         } else {
             match json::parse(json.value(i)) {
                 Ok(v) => v,

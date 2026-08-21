@@ -578,7 +578,8 @@ async fn bad_sql_fails_with_athena_error_details_not_fake_rows() {
     );
     assert_eq!(qe.statistics().unwrap().data_scanned_in_bytes(), Some(0));
 
-    // Unknown column: the planner's diagnostic is passed through verbatim.
+    // Unknown column: named the way Trino names it, not with DataFusion's
+    // schema dump ("No field named nope. Valid fields are ...").
     let id = start_query(&h, "SELECT nope FROM people").await;
     let qe = wait_terminal(&h, &id).await;
     assert!(
@@ -586,7 +587,7 @@ async fn bad_sql_fails_with_athena_error_details_not_fake_rows() {
             .unwrap()
             .state_change_reason()
             .unwrap()
-            .contains("No field named nope"),
+            .contains("Column 'nope' cannot be resolved"),
         "{qe:?}"
     );
 
