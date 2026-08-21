@@ -136,8 +136,8 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "avg(x) → double",
         "Aggregate",
         Passthrough,
-        "DataFusion `avg`; over DECIMAL inputs glaux substitutes its own aggregate so the result is `decimal(p, s)` rounded HALF_UP, as in Trino (DataFusion would add four decimal places: `avg` of `1.5` and `2.5` is `2.0`, not `2.00000`).",
-        ["avg", "trino_decimal_avg"]
+        "DataFusion `avg`; over DECIMAL inputs glaux substitutes its own aggregate so the result is `decimal(p, s)` rounded HALF_UP, as in Trino (DataFusion would add four decimal places: `avg` of `1.5` and `2.5` is `2.0`, not `2.00000`), and over REAL inputs one that returns `real` (a double accumulator cast to float at the end, as Trino's).",
+        ["avg", "trino_decimal_avg", "trino_real_avg"]
     ),
     shim!(
         "bool_and",
@@ -272,8 +272,13 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "sum(x)",
         "Aggregate",
         Passthrough,
-        "DataFusion `sum`; for integer inputs glaux substitutes an overflow-checked sum so a bigint overflow is an error (`NUMERIC_VALUE_OUT_OF_RANGE`), and for DECIMAL inputs a `decimal(38, s)` sum with Trino's overflow check, as in Trino.",
-        ["sum", "trino_checked_sum", "trino_decimal_sum"]
+        "DataFusion `sum`; for integer inputs glaux substitutes an overflow-checked sum so a bigint overflow is an error (`NUMERIC_VALUE_OUT_OF_RANGE`), for DECIMAL inputs a `decimal(38, s)` sum with Trino's overflow check, and for REAL inputs a sum accumulated in double and returned as `real` (`3.3000002`, not a `double`), as in Trino.",
+        [
+            "sum",
+            "trino_checked_sum",
+            "trino_decimal_sum",
+            "trino_real_sum"
+        ]
     ),
     shim!(
         "var_pop",
@@ -1405,7 +1410,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "JOIN (INNER, LEFT, RIGHT, FULL, CROSS)",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "`ON` and `USING` forms; join keys must have comparable types (`TYPE_MISMATCH` otherwise). `NATURAL`, `SEMI` / `ANTI`, `APPLY`, and `ASOF` joins are refused as non-Trino syntax.",
+        notes: "`ON` and `USING` forms; join keys must have comparable types (`TYPE_MISMATCH` otherwise). `JOIN ... USING (k)` follows Trino: one `k` column (the left value for inner / left joins, the right value for right joins, `coalesce(l.k, r.k)` for full joins — DataFusion alone would return one side's NULL), `SELECT *` lists the `USING` columns first, then the remaining left columns, then the remaining right columns, and a qualified `a.k` is refused (`Column 'a.k' cannot be resolved`, as on Trino). A `JOIN` with neither `ON` nor `USING` is refused (DataFusion would run a cross join); write `CROSS JOIN`. `NATURAL`, `SEMI` / `ANTI`, `APPLY`, and `ASOF` joins are refused as non-Trino syntax.",
         corpus_marker: "FULL OUTER JOIN",
     },
     Construct {
@@ -1433,7 +1438,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "GROUP BY / HAVING / ROLLUP / CUBE / GROUPING SETS",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "",
+        notes: "`GROUP BY` and `HAVING` resolve against the source columns only, as on Trino: `SELECT status s, count(*) FROM t GROUP BY s` and `HAVING c > 1` over an alias `c` are `Column cannot be resolved` unless the source has a column of that name (DataFusion would resolve the output alias). `ORDER BY` may use output aliases.",
         corpus_marker: "ROLLUP",
     },
     Construct {
@@ -1447,7 +1452,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "UNION / UNION ALL / INTERSECT / EXCEPT",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "Corresponding columns must have comparable types (`SELECT 1 UNION SELECT 'a'` is a `TYPE_MISMATCH`, as on Athena).",
+        notes: "Corresponding columns must have comparable types (`SELECT 1 UNION SELECT 'a'` is a `TYPE_MISMATCH`, as on Athena). The result types follow Trino: `SELECT 1 UNION SELECT 1` is `integer`, `1 UNION ALL 1.5` is `decimal(11,1)`, and `1.5 UNION 2e0` is `double` (DataFusion alone would report `bigint`, `decimal(21,1)`, and `decimal(30,15)`). `FETCH FIRST n ROWS WITH TIES` is refused.",
         corpus_marker: "UNION ALL",
     },
     Construct {
@@ -1468,7 +1473,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "CAST",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "Trino type names (`VARCHAR[(n)]`, `BIGINT`, `INTEGER`, `SMALLINT`, `TINYINT`, `DOUBLE`, `REAL`, `DECIMAL(p,s)`, `BOOLEAN`, `DATE`, `TIMESTAMP`) map to Arrow types; casts Trino does not define (`CAST(12 AS DATE)`, `CAST(DATE ... AS BIGINT)`, `CAST(TIMESTAMP ... AS DOUBLE)`) are a `TYPE_MISMATCH` instead of running with DataFusion's semantics. The `x::type` form is refused as non-Trino syntax. Double/decimal → integer rounds half away from zero (`CAST(2.5 AS BIGINT)` is 3) and fails on overflow (`INVALID_CAST_ARGUMENT`; NULL under `TRY_CAST`). `CAST(... AS VARCHAR)` uses Trino's text forms (`2024-01-05 10:30:00.000`, `1.0E20`); `VARCHAR(n)` truncates a varchar source but refuses a longer text of any other type (`CAST(12345 AS VARCHAR(2))` fails, as on Trino). Varchar → `TIMESTAMP` follows Trino's pattern (`YYYY-MM-DD[ HH:MM[:SS[.fraction]]]`, rounded HALF_UP to milliseconds, zone suffixes refused); varchar → `DATE` must be exactly a calendar date (`'2024-01-05 10:00:00'` fails, as on Trino); varchar → `BOOLEAN` accepts only `true`/`false`/`t`/`f`/`1`/`0`. Double → `DECIMAL(p, s)` uses the exact binary expansion with HALF_UP rounding (`CAST(1e0 AS DECIMAL(38,37))` is exactly 1). `CHAR(n)`, `TIMESTAMP(p ≠ 3)`, `VARBINARY`, `JSON`, `ROW`, `MAP` targets are refused by name.",
+        notes: "Trino type names (`VARCHAR[(n)]`, `BIGINT`, `INTEGER`, `SMALLINT`, `TINYINT`, `DOUBLE`, `REAL`, `DECIMAL(p,s)`, `BOOLEAN`, `DATE`, `TIMESTAMP`) map to Arrow types; casts Trino does not define (`CAST(12 AS DATE)`, `CAST(DATE ... AS BIGINT)`, `CAST(TIMESTAMP ... AS DOUBLE)`) are a `TYPE_MISMATCH` instead of running with DataFusion's semantics. The `x::type` form is refused as non-Trino syntax. Double/decimal → integer rounds half away from zero (`CAST(2.5 AS BIGINT)` is 3) and fails on overflow (`INVALID_CAST_ARGUMENT`; NULL under `TRY_CAST`). `CAST(... AS VARCHAR)` uses Trino's text forms (`2024-01-05 10:30:00.000`, `1.0E20`); `VARCHAR(n)` truncates a varchar source but refuses a longer text of any other type (`CAST(12345 AS VARCHAR(2))` fails, as on Trino). Varchar → `TIMESTAMP` follows Trino's pattern (`YYYY-MM-DD[ HH:MM[:SS[.fraction]]]`, rounded HALF_UP to milliseconds, zone suffixes refused); varchar → `DATE` must be exactly a calendar date (`'2024-01-05 10:00:00'` fails, as on Trino); varchar → `BOOLEAN` accepts only `true`/`false`/`t`/`f`/`1`/`0`; varchar → `DOUBLE` / `REAL` follows Java's `Double.parseDouble` (`NaN`, `Infinity`, `-Infinity` exactly — `'nan'`, `'inf'`, `'infinity'` are `INVALID_CAST_ARGUMENT`; surrounding whitespace and a `d` / `f` suffix are accepted; hexadecimal floats are refused). `FLOAT` is not a Trino type name and is refused. Double → `DECIMAL(p, s)` uses the exact binary expansion with HALF_UP rounding (`CAST(1e0 AS DECIMAL(38,37))` is exactly 1). `CHAR(n)`, `TIMESTAMP(p ≠ 3)`, `VARBINARY`, `JSON`, `ROW`, `MAP` targets are refused by name.",
         corpus_marker: "CAST(",
     },
     Construct {
@@ -1482,7 +1487,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "INTERVAL literals",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "`INTERVAL '1' DAY`, `INTERVAL '2' HOUR`, and `timestamp ± interval` arithmetic. `date ± interval` requires a whole number of days (`DATE '2024-01-05' + INTERVAL '1' HOUR` is an error, as on Trino, where DataFusion would drop the hour). `date - date`, `timestamp - timestamp`, and `interval + interval` (an `interval` result in Trino) are refused; use `date_diff`.",
+        notes: "`INTERVAL '<n>' YEAR | MONTH | DAY | HOUR | MINUTE | SECOND` (a whole number, optionally signed; a fraction only for `SECOND`) and `timestamp ± interval` arithmetic. PostgreSQL interval strings DataFusion would accept (`INTERVAL '1 day'`, `'1 hour 30 minutes'`) are refused as syntax errors, and the range forms (`INTERVAL '1-2' YEAR TO MONTH`, `'1 02:03:04' DAY TO SECOND`) and `interval * n` are refused by name. `date ± interval` requires a whole number of days (`DATE '2024-01-05' + INTERVAL '1' HOUR` is an error, as on Trino, where DataFusion would drop the hour). `date - date`, `timestamp - timestamp`, and `interval + interval` (an `interval` result in Trino) are refused; use `date_diff`.",
         corpus_marker: "INTERVAL '",
     },
     Construct {
@@ -1496,7 +1501,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "BETWEEN / IN (list) / LIKE / IS [NOT] NULL / IS DISTINCT FROM",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "`LIKE` has no default escape character, as in Trino: a backslash in the pattern is literal (`'a_c' LIKE 'a\\_c'` is false) unless an `ESCAPE` clause names it; the escape character must precede `%`, `_`, or itself. `ILIKE`, `SIMILAR TO`, and `LIKE ANY` are refused as non-Trino syntax.",
+        notes: "`LIKE` has no default escape character, as in Trino: a backslash in the pattern is literal (`'a_c' LIKE 'a\\_c'` is false) unless an `ESCAPE` clause names it; the escape character must precede `%`, `_`, or itself. `ILIKE`, `SIMILAR TO`, and `LIKE ANY` are refused as non-Trino syntax. Array comparison follows Trino's NULL-element rules: `ARRAY[1, NULL] = ARRAY[1, NULL]` is NULL (a definite element mismatch or a length mismatch is `false`), and ordering arrays with NULL elements (`<`, `ORDER BY`) is an error, `ARRAY comparison not supported for arrays with null elements`.",
         corpus_marker: "IS DISTINCT FROM",
     },
     Construct {
@@ -1615,7 +1620,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Non-Trino syntax",
         category: "Unsupported",
         status: ConstructStatus::Unsupported,
-        notes: "Syntax DataFusion accepts but Trino does not is refused by name instead of running with DataFusion semantics: `DISTINCT ON`, `QUALIFY`, `GROUP BY ALL`, `ORDER BY ALL`, `TABLESAMPLE`, `FOR UPDATE`, `NATURAL` / `SEMI` / `ANTI` / `APPLY` / `ASOF` joins, `[1, 2]` array literals, `x::type` casts, `TOP`, `SELECT INTO`, `SELECT * EXCLUDE`, `ILIKE`, PostgreSQL operators, `0x1F` literals, and a number glued to identifier characters (`1_000`, which Trino rejects and sqlparser would read as `1 AS _000`).",
+        notes: "Syntax DataFusion accepts but Trino does not is refused by name instead of running with DataFusion semantics: `DISTINCT ON`, `QUALIFY`, `GROUP BY ALL`, `ORDER BY ALL`, `TABLESAMPLE`, `FOR UPDATE`, `NATURAL` / `SEMI` / `ANTI` / `APPLY` / `ASOF` joins, `[1, 2]` array literals, `x::type` casts, `TOP`, `SELECT INTO`, `SELECT * EXCLUDE`, `ILIKE`, the operators Trino lacks (`&`, `|`, `^`, `~`, `==`, `<=>`, `->`, and the other PostgreSQL operators — use `bitwise_and`, `regexp_like`, ...), a string literal as an alias (`SELECT 'a' 'b'`), PostgreSQL interval strings (`INTERVAL '1 day'`), `JOIN` without `ON` / `USING`, `FLOAT` as a type name, `0x1F` literals, and a number glued to identifier characters (`1_000`, which Trino rejects and sqlparser would read as `1 AS _000`).",
         corpus_marker: "",
     },
     Construct {

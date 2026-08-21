@@ -878,7 +878,7 @@ fn array_equal(left: &dyn Array, right: &dyn Array) -> Result<Option<bool>> {
 /// Whether any element (at any depth) of `array` is NULL.
 fn has_null_element(array: &dyn Array) -> bool {
     if array.null_count() > 0 || array.data_type() == &DataType::Null {
-        return array.len() > 0;
+        return !array.is_empty();
     }
     if let DataType::List(_) = array.data_type() {
         let list = array.as_list::<i32>();

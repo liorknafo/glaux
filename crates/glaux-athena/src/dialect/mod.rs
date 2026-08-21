@@ -29,6 +29,7 @@ pub mod error;
 pub mod formats;
 pub mod naming;
 pub mod registry;
+pub mod resolve;
 pub mod rewrite;
 pub mod strict;
 pub mod udf;
@@ -158,6 +159,12 @@ fn reject_digit_identifiers(sql: &str) -> Result<(), GlauxSqlError> {
         .map_err(|e| GlauxSqlError::Parse {
             message: e.to_string(),
         })?;
+    // `==` parses to the same AST as `=`; Trino has only `=`.
+    if tokens.iter().any(|t| matches!(t.token, Token::DoubleEq)) {
+        return Err(GlauxSqlError::Parse {
+            message: "mismatched input '==': Trino's equality operator is '='".to_string(),
+        });
+    }
     for pair in tokens.windows(2) {
         if let (Token::Number(number, _), Token::Word(word)) = (&pair[0].token, &pair[1].token)
             && word.quote_style.is_none()
@@ -303,7 +310,11 @@ impl QueryEngine for TrinoEngine {
     async fn execute(&self, request: QueryRequest) -> Result<QueryOutput, EngineError> {
         let started = Instant::now();
         let ctx = self.inner.context_for(&request)?;
-        let Translation { statement, renames } = translate_full(&request.sql)?;
+        let Translation {
+            mut statement,
+            renames,
+        } = translate_full(&request.sql)?;
+        resolve::resolve(&ctx, &mut statement).await?;
         let plan = ctx
             .state()
             .statement_to_plan(DFStatement::Statement(Box::new(statement)))

@@ -19,6 +19,8 @@
 //!   elements;
 //! - set operations and joins get their schema recomputed so the narrowed
 //!   literal types show (`SELECT 1 UNION SELECT 1` is `integer`);
+//! - outer `JOIN ... USING` to a projection giving the join column Trino's
+//!   value (`coalesce(l.k, r.k)` for a full join);
 //! - `greatest` / `least` over a mix of double and exact numbers to double
 //!   (Trino's common supertype; DataFusion picks a wide decimal);
 //! - table scans whose timestamp columns are not millisecond-precise to a
@@ -38,14 +40,15 @@ use arrow::datatypes::{DataType, Field, FieldRef, Int64Type, TimeUnit};
 use arrow::error::ArrowError;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
+use datafusion::common::{Column, DFSchema, DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::expr::{ScalarFunction, WindowFunction};
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, AggregateUDFImpl, ColumnarValue, Expr, ExprSchemable, LogicalPlan,
-    LogicalPlanBuilder, Operator, Projection, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
-    Signature, TypeSignature, Union, Volatility, WindowFunctionDefinition,
+    Accumulator, AggregateUDF, AggregateUDFImpl, ColumnarValue, Expr, ExprSchemable, Join,
+    JoinConstraint, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, Projection,
+    ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Union, Volatility,
+    WindowFunctionDefinition,
 };
 use datafusion::optimizer::analyzer::AnalyzerRule;
 
@@ -724,12 +727,11 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
             Expr::AggregateFunction(agg) if matches!(agg.func.name(), "sum" | "avg") => {
                 if let [arg] = agg.params.args.as_slice()
                     && let Ok(t) = arg.get_type(schema)
+                    && let Some(func) = trino_sum_avg(agg.func.name(), &t)
                 {
-                    if let Some(func) = trino_sum_avg(agg.func.name(), &t) {
-                        let mut replacement = agg.clone();
-                        replacement.func = Arc::new(func);
-                        return Ok(Transformed::yes(Expr::AggregateFunction(replacement)));
-                    }
+                    let mut replacement = agg.clone();
+                    replacement.func = Arc::new(func);
+                    return Ok(Transformed::yes(Expr::AggregateFunction(replacement)));
                 }
             }
             Expr::WindowFunction(window) => {
@@ -737,14 +739,13 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     && matches!(func.name(), "sum" | "avg")
                     && let [arg] = window.params.args.as_slice()
                     && let Ok(t) = arg.get_type(schema)
+                    && let Some(func) = trino_sum_avg(func.name(), &t)
                 {
-                    if let Some(func) = trino_sum_avg(func.name(), &t) {
-                        let mut replacement: WindowFunction = window.as_ref().clone();
-                        replacement.fun = WindowFunctionDefinition::AggregateUDF(Arc::new(func));
-                        return Ok(Transformed::yes(Expr::WindowFunction(Box::new(
-                            replacement,
-                        ))));
-                    }
+                    let mut replacement: WindowFunction = window.as_ref().clone();
+                    replacement.fun = WindowFunctionDefinition::AggregateUDF(Arc::new(func));
+                    return Ok(Transformed::yes(Expr::WindowFunction(Box::new(
+                        replacement,
+                    ))));
                 }
             }
             // Trino's common supertype of double and an exact number is
@@ -838,18 +839,37 @@ fn narrow_values(rows: &[Vec<Expr>]) -> Vec<Vec<Expr>> {
         .collect();
     let width = rows.first().map_or(0, Vec::len);
     for column in 0..width {
-        let is_typed_null = |e: &Expr| matches!(e, Expr::Literal(ScalarValue::Int64(None), _));
-        let all_integer = rows.iter().all(|row| {
-            matches!(row[column], Expr::Literal(ScalarValue::Int32(_), _))
-                || is_typed_null(&row[column])
+        // The planner typed a bare NULL after the column type it had
+        // inferred from the `bigint` literals; an untyped NULL lets the
+        // builder infer the type from the narrowed literals again.
+        let is_typed_null = |e: &Expr| {
+            matches!(
+                e,
+                Expr::Literal(
+                    ScalarValue::Int64(None)
+                        | ScalarValue::Int32(None)
+                        | ScalarValue::Decimal128(None, ..)
+                        | ScalarValue::Float64(None),
+                    _
+                )
+            )
+        };
+        let any_numeric_value = rows.iter().any(|row| {
+            matches!(
+                &row[column],
+                Expr::Literal(
+                    ScalarValue::Int32(Some(_))
+                        | ScalarValue::Int64(Some(_))
+                        | ScalarValue::Decimal128(Some(_), ..)
+                        | ScalarValue::Float64(Some(_)),
+                    _
+                ) | Expr::Cast(_)
+            )
         });
-        let any_integer = rows
-            .iter()
-            .any(|row| matches!(row[column], Expr::Literal(ScalarValue::Int32(_), _)));
-        if all_integer && any_integer {
+        if any_numeric_value {
             for row in &mut rows {
                 if is_typed_null(&row[column]) {
-                    row[column] = Expr::Literal(ScalarValue::Int32(None), None);
+                    row[column] = Expr::Literal(ScalarValue::Null, None);
                 }
             }
         }
@@ -930,6 +950,54 @@ fn widen_union_to_double(inputs: Vec<Arc<LogicalPlan>>) -> Result<Vec<Arc<Logica
         .collect()
 }
 
+/// Trino's `JOIN ... USING (k)` exposes one `k`: the left value for an inner
+/// or left join, the right value for a right join, `coalesce(l.k, r.k)` for
+/// a full join. DataFusion keeps both `l.k` and `r.k` and resolves an
+/// unqualified `k` (and `SELECT *`) to whichever copy it picks, which is
+/// NULL on the unmatched side of an outer join. Wraps an outer `USING` join
+/// in a projection that gives *both* copies Trino's value, so every
+/// reference sees it (qualified references are refused at translation, as
+/// on Trino).
+fn using_join_projection(join: &Join) -> Result<Option<LogicalPlan>> {
+    if join.join_constraint != JoinConstraint::Using
+        || !matches!(
+            join.join_type,
+            JoinType::Left | JoinType::Right | JoinType::Full
+        )
+    {
+        return Ok(None);
+    }
+    let pairs: Vec<(Column, Column)> = join
+        .on
+        .iter()
+        .filter_map(|(l, r)| Some((l.try_as_col()?.clone(), r.try_as_col()?.clone())))
+        .collect();
+    if pairs.len() != join.on.len() {
+        return Ok(None);
+    }
+    let value_of = |left: &Column, right: &Column| -> Expr {
+        let (l, r) = (Expr::Column(left.clone()), Expr::Column(right.clone()));
+        match join.join_type {
+            JoinType::Left => l,
+            JoinType::Right => r,
+            _ => datafusion::functions::core::expr_fn::coalesce(vec![l, r]),
+        }
+    };
+    let exprs: Vec<Expr> = join
+        .schema
+        .iter()
+        .map(|(qualifier, field)| {
+            let column = Column::from((qualifier, field));
+            match pairs.iter().find(|(l, r)| *l == column || *r == column) {
+                Some((l, r)) => value_of(l, r).alias_qualified(qualifier.cloned(), field.name()),
+                None => Expr::Column(column),
+            }
+        })
+        .collect();
+    let projection = Projection::try_new(exprs, Arc::new(LogicalPlan::Join(join.clone())))?;
+    Ok(Some(LogicalPlan::Projection(projection)))
+}
+
 /// Wrap a scan whose schema has non-millisecond timestamps in a projection
 /// that rounds them, keeping every (qualifier, name) pair.
 fn round_scan_timestamps(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
@@ -1001,6 +1069,11 @@ impl AnalyzerRule for TrinoSemantics {
                 )?),
                 other => other.recompute_schema()?,
             };
+            if let LogicalPlan::Join(join) = &transformed.data
+                && let Some(projection) = using_join_projection(join)?
+            {
+                transformed = Transformed::yes(projection);
+            }
             // `VALUES` keeps its planned schema; rebuild it so the narrowed
             // literal types show.
             if let LogicalPlan::Values(values) = &transformed.data {
@@ -1012,12 +1085,7 @@ impl AnalyzerRule for TrinoSemantics {
             }
             Ok(transformed)
         })
-        .map(|t| {
-            if std::env::var_os("GLAUX_DEBUG_PLAN").is_some() {
-                eprintln!("after trino_semantics:\n{}", t.data.display_indent_schema());
-            }
-            t.data
-        })
+        .map(|t| t.data)
     }
 
     fn name(&self) -> &str {

@@ -28,7 +28,8 @@ use sqlparser::ast::{
     FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident,
     JoinConstraint, JoinOperator, NamedWindowExpr, ObjectName, ObjectNamePart, OrderByExpr,
     OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Subscript, TableAlias, TableFactor,
-    TimezoneInfo, TrimWhereField, UnaryOperator, Value, VisitMut, VisitorMut, WindowType,
+    TableWithJoins, TimezoneInfo, TrimWhereField, UnaryOperator, Value, Visit, VisitMut, Visitor,
+    VisitorMut, WindowType,
 };
 
 use super::error::GlauxSqlError;
@@ -105,7 +106,12 @@ impl VisitorMut for Rewriter {
             }
             | TableFactor::NestedJoin {
                 alias: Some(alias), ..
-            } => fold_alias(alias),
+            } => {
+                if let Err(err) = check_alias_quoting(alias.name.clone()) {
+                    return ControlFlow::Break(Box::new(err));
+                }
+                fold_alias(alias);
+            }
             _ => {}
         }
         let refused = match table_factor {
@@ -197,7 +203,179 @@ fn rewrite_query(query: &mut Query, wrap_values: bool) -> Result<(), GlauxSqlErr
     if wrap_values && matches!(query.body.as_ref(), SetExpr::Values(_)) {
         wrap_values_body(&mut query.body);
     }
+    for select in selects_of(&query.body) {
+        check_using_references(select, query.order_by.as_ref())?;
+    }
     rewrite_set_expr(&mut query.body)
+}
+
+/// The selects of a query body: the select itself or, for a set
+/// operation, every select on either side (nested queries are visited on
+/// their own).
+pub(crate) fn selects_of(body: &SetExpr) -> Vec<&Select> {
+    match body {
+        SetExpr::Select(select) => vec![select],
+        SetExpr::SetOperation { left, right, .. } => {
+            let mut out = selects_of(left);
+            out.extend(selects_of(right));
+            out
+        }
+        _ => vec![],
+    }
+}
+
+/// Mutable [`selects_of`].
+pub(crate) fn selects_of_mut(body: &mut SetExpr) -> Vec<&mut Select> {
+    match body {
+        SetExpr::Select(select) => vec![select],
+        SetExpr::SetOperation { left, right, .. } => {
+            let mut out = selects_of_mut(left);
+            out.extend(selects_of_mut(right));
+            out
+        }
+        _ => vec![],
+    }
+}
+
+/// The `USING` column names of a join, if it is one.
+pub(crate) fn join_using_columns(operator: &JoinOperator) -> Option<&[ObjectName]> {
+    match operator {
+        JoinOperator::Join(JoinConstraint::Using(columns))
+        | JoinOperator::Inner(JoinConstraint::Using(columns))
+        | JoinOperator::Left(JoinConstraint::Using(columns))
+        | JoinOperator::LeftOuter(JoinConstraint::Using(columns))
+        | JoinOperator::Right(JoinConstraint::Using(columns))
+        | JoinOperator::RightOuter(JoinConstraint::Using(columns))
+        | JoinOperator::FullOuter(JoinConstraint::Using(columns)) => Some(columns),
+        _ => None,
+    }
+}
+
+/// Whether the `FROM` clause has a `USING` join anywhere in its join trees
+/// (not inside derived tables, whose output is already projected).
+pub(crate) fn has_using_join(from: &[TableWithJoins]) -> bool {
+    fn table_has_using(table: &TableWithJoins) -> bool {
+        let nested = |factor: &TableFactor| match factor {
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => table_has_using(table_with_joins),
+            _ => false,
+        };
+        nested(&table.relation)
+            || table.joins.iter().any(|join| {
+                join_using_columns(&join.join_operator).is_some() || nested(&join.relation)
+            })
+    }
+    from.iter().any(table_has_using)
+}
+
+/// The `USING` column names and the relation names / aliases of a `FROM`
+/// clause (lower-case), through nested joins.
+fn using_scope(from: &[TableWithJoins]) -> (Vec<String>, Vec<String>) {
+    fn factor(factor: &TableFactor, columns: &mut Vec<String>, relations: &mut Vec<String>) {
+        match factor {
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+            } => {
+                walk(table_with_joins, columns, relations);
+                if let Some(alias) = alias {
+                    relations.push(alias.name.value.to_lowercase());
+                }
+            }
+            TableFactor::Table { name, alias, .. } => {
+                if let Some(ObjectNamePart::Identifier(id)) = name.0.last() {
+                    relations.push(id.value.to_lowercase());
+                }
+                if let Some(alias) = alias {
+                    relations.push(alias.name.value.to_lowercase());
+                }
+            }
+            TableFactor::Derived {
+                alias: Some(alias), ..
+            } => relations.push(alias.name.value.to_lowercase()),
+            _ => {}
+        }
+    }
+    fn walk(table: &TableWithJoins, columns: &mut Vec<String>, relations: &mut Vec<String>) {
+        factor(&table.relation, columns, relations);
+        for join in &table.joins {
+            factor(&join.relation, columns, relations);
+            if let Some(using) = join_using_columns(&join.join_operator) {
+                for column in using {
+                    if let Some(ObjectNamePart::Identifier(id)) = column.0.last() {
+                        columns.push(id.value.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
+    let (mut columns, mut relations) = (vec![], vec![]);
+    for table in from {
+        walk(table, &mut columns, &mut relations);
+    }
+    (columns, relations)
+}
+
+/// Trino exposes the columns of a `JOIN ... USING (k)` only unqualified
+/// (a single `k`, `coalesce(l.k, r.k)` for outer joins): `SELECT a.k` is
+/// `Column 'a.k' cannot be resolved`. DataFusion would return one side's
+/// raw value, so the qualified reference is refused here.
+fn check_using_references(
+    select: &Select,
+    order_by: Option<&sqlparser::ast::OrderBy>,
+) -> Result<(), GlauxSqlError> {
+    let (columns, relations) = using_scope(&select.from);
+    if columns.is_empty() {
+        return Ok(());
+    }
+    struct Checker {
+        columns: Vec<String>,
+        relations: Vec<String>,
+    }
+    impl Visitor for Checker {
+        type Break = GlauxSqlError;
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<GlauxSqlError> {
+            if let Expr::CompoundIdentifier(ids) = expr
+                && let [.., relation, column] = ids.as_slice()
+                && self.columns.contains(&column.value.to_lowercase())
+                && self.relations.contains(&relation.value.to_lowercase())
+            {
+                return ControlFlow::Break(GlauxSqlError::Parse {
+                    message: format!(
+                        "Column '{}.{}' cannot be resolved: a JOIN ... USING column is only available \
+                         unqualified on Trino",
+                        relation.value, column.value
+                    ),
+                });
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut checker = Checker { columns, relations };
+    let mut result = select.visit(&mut checker);
+    if let (ControlFlow::Continue(()), Some(order_by)) = (&result, order_by) {
+        result = order_by.visit(&mut checker);
+    }
+    match result {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(err) => Err(err),
+    }
+}
+
+/// A select-item or table alias written as a string literal (`SELECT 'a'
+/// 'b'`, which Trino rejects and sqlparser reads as `'a' AS "b"`).
+fn check_alias_quoting(alias: Ident) -> Result<(), GlauxSqlError> {
+    if alias.quote_style == Some('\'') {
+        return Err(GlauxSqlError::Parse {
+            message: format!(
+                "mismatched input '{}': a string literal cannot be used as an alias (write AS \
+                 \"{}\" or separate the values with a comma)",
+                alias.value, alias.value
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Trino sorts NULLs last whatever the direction; DataFusion (like
@@ -381,6 +559,7 @@ fn rewrite_select(select: &mut Select) -> Result<(), GlauxSqlError> {
     naming::name_nested_select(select);
     for item in &mut select.projection {
         if let SelectItem::ExprWithAlias { alias, .. } = item {
+            check_alias_quoting(alias.clone())?;
             fold_ident(alias);
         }
     }
@@ -434,6 +613,14 @@ fn check_join(operator: &JoinOperator) -> Result<(), GlauxSqlError> {
         return Err(GlauxSqlError::unsupported(
             "NATURAL JOIN",
             "not Trino syntax; write the join condition with ON or USING",
+        ));
+    }
+    if matches!(constraint, JoinConstraint::None) && !matches!(operator, JoinOperator::CrossJoin(_))
+    {
+        return Err(GlauxSqlError::unsupported(
+            "JOIN without ON or USING",
+            "not Trino syntax (DataFusion would run it as a cross join); write CROSS JOIN or \
+             a join condition",
         ));
     }
     Ok(())
@@ -902,6 +1089,41 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
                 "`0x1F` is not Trino syntax and `X'1F'` varbinary literals are not supported in v0.1",
             ))
         }
+        // Under a dialect without lambda support `x -> ...` reads as the
+        // PostgreSQL `->` operator; name the construct Trino users mean.
+        Expr::BinaryOp {
+            op: BinaryOperator::Arrow,
+            ..
+        } => Err(GlauxSqlError::unsupported(
+            "lambda expression",
+            "`x -> ...` arguments are not translated; express the logic with explicit SQL",
+        )),
+        Expr::BinaryOp { op, .. }
+            if !matches!(
+                op,
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+                    | BinaryOperator::StringConcat
+                    | BinaryOperator::Gt
+                    | BinaryOperator::Lt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::And
+                    | BinaryOperator::Or
+            ) =>
+        {
+            Err(GlauxSqlError::unsupported(
+                format!("operator {op}"),
+                "not a Trino operator (Trino has no bitwise, regex-match, or PostgreSQL \
+                 operators; use the equivalent function: bitwise_and, regexp_like, ...)",
+            ))
+        }
+        Expr::Interval(interval) => check_interval(interval),
         Expr::Cast {
             kind: CastKind::DoubleColon,
             ..
@@ -1070,6 +1292,96 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
         }
         _ => Ok(()),
     }
+}
+
+/// Trino interval literals are `INTERVAL '<n>' <unit>` with a whole number
+/// (a decimal fraction is allowed for `SECOND`); the unit is mandatory.
+/// DataFusion also accepts PostgreSQL strings (`INTERVAL '1 day'`, `'1
+/// hour 30 minutes'`) and the range forms (`'1-2' YEAR TO MONTH`), which
+/// glaux refuses by name.
+fn check_interval(interval: &sqlparser::ast::Interval) -> Result<(), GlauxSqlError> {
+    let text = match interval.value.as_ref() {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) => s.clone(),
+            other => {
+                return Err(GlauxSqlError::Parse {
+                    message: format!(
+                        "INTERVAL {other}: the interval value must be a quoted string \
+                         (INTERVAL '1' DAY)"
+                    ),
+                });
+            }
+        },
+        other => {
+            return Err(GlauxSqlError::Parse {
+                message: format!(
+                    "INTERVAL {other}: the interval value must be a string literal (INTERVAL \
+                     '1' DAY)"
+                ),
+            });
+        }
+    };
+    let Some(unit) = &interval.leading_field else {
+        return Err(GlauxSqlError::unsupported(
+            "PostgreSQL interval string",
+            format!(
+                "INTERVAL '{text}' has no unit; Trino requires INTERVAL '<n>' DAY / HOUR / \
+                 MINUTE / SECOND / MONTH / YEAR"
+            ),
+        ));
+    };
+    if let Some(to) = &interval.last_field {
+        return Err(GlauxSqlError::unsupported(
+            format!("INTERVAL ... {unit} TO {to}"),
+            "interval range literals (YEAR TO MONTH, DAY TO SECOND, ...) are not supported in \
+             v0.1; add the parts separately",
+        ));
+    }
+    if interval.leading_precision.is_some() || interval.fractional_seconds_precision.is_some() {
+        return Err(GlauxSqlError::unsupported(
+            "INTERVAL with precision",
+            "`INTERVAL '1' SECOND(3)` is not Trino syntax",
+        ));
+    }
+    let allowed = matches!(
+        unit,
+        DateTimeField::Year
+            | DateTimeField::Month
+            | DateTimeField::Day
+            | DateTimeField::Hour
+            | DateTimeField::Minute
+            | DateTimeField::Second
+    );
+    if !allowed {
+        return Err(GlauxSqlError::unsupported(
+            format!("INTERVAL ... {unit}"),
+            "Trino interval units are YEAR, MONTH, DAY, HOUR, MINUTE, SECOND",
+        ));
+    }
+    let body = text.trim();
+    let unsigned = body.strip_prefix(['-', '+']).unwrap_or(body);
+    let (int_part, frac_part) = match unsigned.split_once('.') {
+        Some((i, f)) if matches!(unit, DateTimeField::Second) => (i, Some(f)),
+        Some(_) => {
+            return Err(GlauxSqlError::Parse {
+                message: format!(
+                    "Invalid INTERVAL {unit} value: '{text}' (a fraction is only \
+                     allowed for SECOND)"
+                ),
+            });
+        }
+        None => (unsigned, None),
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(int_part) || frac_part.is_some_and(|f| !digits(f)) {
+        return Err(GlauxSqlError::Parse {
+            message: format!(
+                "Invalid INTERVAL {unit} value: '{text}' (Trino expects a whole number, as in \
+                 INTERVAL '1' {unit}; PostgreSQL strings such as '1 day' are not accepted)"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// `LIKE` patterns: Trino has no default escape character, so `\` is a
