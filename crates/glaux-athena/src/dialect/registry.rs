@@ -216,7 +216,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "max(x)",
         "Aggregate",
         Passthrough,
-        "DataFusion `max`",
+        "DataFusion `max`; over DOUBLE / REAL inputs glaux substitutes its own aggregate ranking NaN smallest (`max` of `{1.0, NaN}` is `1.0`, NaN only when every value is NaN), matching Trino's `COMPARISON_UNORDERED_FIRST`; Arrow's `max` would return NaN. `min` needs no substitute: both engines rank NaN largest there.",
         ["max"]
     ),
     shim!(
@@ -334,7 +334,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "lag(x[, offset[, default]]) OVER (...)",
         "Window",
         Passthrough,
-        "DataFusion `lag`",
+        "DataFusion `lag`. The offset must be a non-negative integer literal: a negative offset is `INVALID_FUNCTION_ARGUMENT: Offset must be at least 0` and a NULL offset `Offset must not be null`, as on Trino (DataFusion would silently run `lag(x, -1)` as `lead`).",
         ["lag"]
     ),
     shim!(
@@ -350,7 +350,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "lead(x[, offset[, default]]) OVER (...)",
         "Window",
         Passthrough,
-        "DataFusion `lead`",
+        "DataFusion `lead`. The offset must be a non-negative integer literal: a negative offset is `INVALID_FUNCTION_ARGUMENT: Offset must be at least 0` and a NULL offset `Offset must not be null`, as on Trino (DataFusion would silently run `lead(x, -1)` as `lag`).",
         ["lead"]
     ),
     shim!(
@@ -358,7 +358,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "nth_value(x, n) OVER (...)",
         "Window",
         Passthrough,
-        "DataFusion `nth_value`",
+        "DataFusion `nth_value`. `n` must be a positive integer literal: `nth_value(x, 0)` is `INVALID_FUNCTION_ARGUMENT: Offset must be at least 1` and a NULL `n` `Offset must not be null`, as on Trino (DataFusion would return NULL).",
         ["nth_value"]
     ),
     shim!(
@@ -366,7 +366,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "ntile(n) OVER (...)",
         "Window",
         Passthrough,
-        "`CAST(ntile(...) AS BIGINT)` — DataFusion's result is unsigned",
+        "`CAST(ntile(...) AS BIGINT)` — DataFusion's result is unsigned. `n` must be a positive integer literal (`ntile(0)` is `INVALID_FUNCTION_ARGUMENT`, as on Trino).",
         ["ntile"]
     ),
     shim!(
@@ -415,7 +415,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "nullif(a, b)",
         "Conditional",
         Passthrough,
-        "DataFusion `nullif`",
+        "DataFusion `nullif`; over DOUBLE / REAL arguments glaux substitutes `CASE WHEN a = b THEN NULL ELSE a END` with IEEE equality, so `nullif(0e0, -0e0)` is NULL and `nullif(NaN, NaN)` is NaN, as on Trino (DataFusion's kernel compares bit patterns).",
         ["nullif"]
     ),
     shim!(
@@ -979,7 +979,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "greatest(a, b, ...)",
         "Math",
         Rewrite,
-        "`CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE greatest(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type.",
+        "`CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE greatest(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type. Over DOUBLE / REAL arguments glaux substitutes its own function ranking NaN smallest (`greatest(1e0, NaN)` is `1.0`), matching Trino's `COMPARISON_UNORDERED_FIRST`; `least` needs no substitute (both engines rank NaN largest there).",
         ["greatest"]
     ),
     shim!(
@@ -1133,7 +1133,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "array_max(array)",
         "Array",
         Rewrite,
-        "Rust UDF `trino_array_max`: NULL when the array is empty or has a NULL element, as in Trino (DataFusion skips NULL elements).",
+        "Rust UDF `trino_array_max`: NULL when the array is empty or has a NULL element, as in Trino (DataFusion skips NULL elements); NaN ranks smallest (`array_max(ARRAY[1e0, NaN])` is `1.0`), matching Trino's `COMPARISON_UNORDERED_FIRST`.",
         ["trino_array_max"]
     ),
     shim!(
@@ -1149,15 +1149,15 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "array_position(array, element) → bigint",
         "Array",
         Rewrite,
-        "`CASE WHEN array IS NULL OR element IS NULL THEN NULL ELSE coalesce(CAST(array_position(array, element) AS BIGINT), 0) END` — Trino returns 0 for a missing element (DataFusion returns NULL) and NULL for a NULL element argument.",
-        ["array_position", "coalesce"]
+        "Rust UDF `trino_array_position`: 0 for a missing element (DataFusion returns NULL), NULL for a NULL array or element argument, and Trino's EQUAL semantics for float elements (`array_position(ARRAY[NaN], NaN)` is 0; NaN equals nothing).",
+        ["trino_array_position"]
     ),
     shim!(
         "array_remove",
         "array_remove(array, element) → array",
         "Array",
         Rewrite,
-        "Rust UDF `trino_array_remove`: every occurrence is removed, NULL elements are kept (`array_remove(ARRAY[1, NULL], 1)` is `[NULL]`), a NULL element argument gives NULL, as in Trino.",
+        "Rust UDF `trino_array_remove`: every occurrence is removed, NULL elements are kept (`array_remove(ARRAY[1, NULL], 1)` is `[NULL]`), a NULL element argument gives NULL, as in Trino. Float elements match with Trino's EQUAL semantics, so NaN is never removed.",
         ["trino_array_remove"]
     ),
     shim!(
@@ -1197,7 +1197,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "contains(array, element) → boolean",
         "Array",
         Rewrite,
-        "Rust UDF `trino_contains`: NULL (not false) when the element is not found but the array has a NULL element, or when the element is NULL, as in Trino. The element type must be comparable with the array's.",
+        "Rust UDF `trino_contains`: NULL (not false) when the element is not found but the array has a NULL element, or when the element is NULL, as in Trino. The element type must be comparable with the array's. Float elements match with Trino's EQUAL semantics (`contains(ARRAY[NaN], NaN)` is false, `contains(ARRAY[0e0], -0e0)` is true).",
         ["trino_contains"]
     ),
     shim!(
@@ -1410,7 +1410,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "JOIN (INNER, LEFT, RIGHT, FULL, CROSS)",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "`ON` and `USING` forms; join keys must have comparable types (`TYPE_MISMATCH` otherwise). `JOIN ... USING (k)` follows Trino: one `k` column (the left value for inner / left joins, the right value for right joins, `coalesce(l.k, r.k)` for full joins — DataFusion alone would return one side's NULL), `SELECT *` lists the `USING` columns first, then the remaining left columns, then the remaining right columns, and a qualified `a.k` is refused (`Column 'a.k' cannot be resolved`, as on Trino). A `JOIN` with neither `ON` nor `USING` is refused (DataFusion would run a cross join); write `CROSS JOIN`. `NATURAL`, `SEMI` / `ANTI`, `APPLY`, and `ASOF` joins are refused as non-Trino syntax.",
+        notes: "`ON` and `USING` forms; join keys must have comparable types (`TYPE_MISMATCH` otherwise). `JOIN ... USING (k)` follows Trino: one `k` column (the left value for inner / left joins, the right value for right joins, `coalesce(l.k, r.k)` for full joins — DataFusion alone would return one side's NULL), `SELECT *` lists the `USING` columns first, then the remaining left columns, then the remaining right columns, and a qualified `a.k` is refused (`Column 'a.k' cannot be resolved`, as on Trino). A `JOIN` with neither `ON` nor `USING` is refused (DataFusion would run a cross join); write `CROSS JOIN`. Equi-join keys of `DOUBLE` / `REAL` type run through a nested-loop join with IEEE equality, because Trino's join equality never matches NaN while DataFusion's hash join would (`USING` over float keys is refused; write `ON`). `NATURAL`, `SEMI` / `ANTI`, `APPLY`, and `ASOF` joins are refused as non-Trino syntax.",
         corpus_marker: "FULL OUTER JOIN",
     },
     Construct {
@@ -1424,14 +1424,14 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Subqueries (derived tables, scalar, IN, EXISTS)",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "Correlated `EXISTS` / `IN` are decorrelated by DataFusion. A scalar subquery that returns no rows is NULL, also over a non-nullable source such as `VALUES` or a literal (DataFusion alone would fail with `declared as non-nullable but contains null values`).",
+        notes: "Correlated `EXISTS` / `IN` are decorrelated by DataFusion. A scalar subquery that returns no rows is NULL, also over a non-nullable source such as `VALUES` or a literal (DataFusion alone would fail with `declared as non-nullable but contains null values`). `IN (subquery)` / `EXISTS` used as a *value* (in the select list or any position other than a `WHERE` / `HAVING` predicate) is refused by name — DataFusion cannot evaluate it as an expression. `IN (subquery)` over `DOUBLE` / `REAL` operands is refused by name: Trino compares with IEEE equality (NaN never matches), which DataFusion's semi-join does not reproduce.",
         corpus_marker: "EXISTS (",
     },
     Construct {
         name: "Window functions",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "`OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` and named windows. Ranking functions return `bigint` (cast from DataFusion's unsigned result). Window `ORDER BY` sorts NULLs last by default, as in Trino.",
+        notes: "`OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` and named windows. Ranking functions return `bigint` (cast from DataFusion's unsigned result). Window `ORDER BY` sorts NULLs last by default, as in Trino. The offset arguments of `lead` / `lag` / `nth_value` / `ntile` are validated as on Trino (`lead(x, -1)` is `INVALID_FUNCTION_ARGUMENT: Offset must be at least 0`; DataFusion would run it as `lag`).",
         corpus_marker: "OVER (",
     },
     Construct {
@@ -1445,7 +1445,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "ORDER BY / LIMIT / OFFSET",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "`NULLS FIRST/LAST` honoured. Trino's default — NULLs last whatever the direction, also for window `ORDER BY` and aggregate `ORDER BY` arguments — is applied when unspecified (DataFusion's own default would sort NULLs first under `DESC`). An `ORDER BY` name matching several output columns (`SELECT id x, amount x ... ORDER BY x`) is refused as ambiguous, as on Trino. `ORDER BY ALL` is refused.",
+        notes: "`NULLS FIRST/LAST` honoured. Trino's default — NULLs last whatever the direction, also for window `ORDER BY` and aggregate `ORDER BY` arguments — is applied when unspecified (DataFusion's own default would sort NULLs first under `DESC`). An `ORDER BY` name matching several output columns (`SELECT id x, amount x ... ORDER BY x`) is refused as ambiguous, as on Trino. `ORDER BY ALL` is refused. `FETCH FIRST n ROWS ONLY` (Trino's standard form of LIMIT) is rewritten onto LIMIT; `WITH TIES` and `PERCENT` are refused by name.",
         corpus_marker: "OFFSET",
     },
     Construct {
@@ -1459,7 +1459,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "VALUES",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "Inline tables, also as a `FROM` source with column aliases; anonymous columns are `_col0`, `_col1`, … as on Athena.",
+        notes: "Inline tables, also as a `FROM` source with column aliases; anonymous columns are `_col0`, `_col1`, … as on Athena. Bare (unparenthesised) row expressions — `VALUES 1, 2`, valid Trino — are wrapped for sqlparser at the token level.",
         corpus_marker: "VALUES",
     },
     Construct {
@@ -1473,7 +1473,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "CAST",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "Trino type names (`VARCHAR[(n)]`, `BIGINT`, `INTEGER`, `SMALLINT`, `TINYINT`, `DOUBLE`, `REAL`, `DECIMAL(p,s)`, `BOOLEAN`, `DATE`, `TIMESTAMP`) map to Arrow types; casts Trino does not define (`CAST(12 AS DATE)`, `CAST(DATE ... AS BIGINT)`, `CAST(TIMESTAMP ... AS DOUBLE)`) are a `TYPE_MISMATCH` instead of running with DataFusion's semantics. The `x::type` form is refused as non-Trino syntax. Double/decimal → integer rounds half away from zero (`CAST(2.5 AS BIGINT)` is 3) and fails on overflow (`INVALID_CAST_ARGUMENT`; NULL under `TRY_CAST`). `CAST(... AS VARCHAR)` uses Trino's text forms (`2024-01-05 10:30:00.000`, `1.0E20`); `VARCHAR(n)` truncates a varchar source but refuses a longer text of any other type (`CAST(12345 AS VARCHAR(2))` fails, as on Trino). Varchar → `TIMESTAMP` follows Trino's pattern (`YYYY-MM-DD[ HH:MM[:SS[.fraction]]]`, rounded HALF_UP to milliseconds, zone suffixes refused); varchar → `DATE` must be exactly a calendar date (`'2024-01-05 10:00:00'` fails, as on Trino); varchar → `BOOLEAN` accepts only `true`/`false`/`t`/`f`/`1`/`0`; varchar → `DOUBLE` / `REAL` follows Java's `Double.parseDouble` (`NaN`, `Infinity`, `-Infinity` exactly — `'nan'`, `'inf'`, `'infinity'` are `INVALID_CAST_ARGUMENT`; surrounding whitespace and a `d` / `f` suffix are accepted; hexadecimal floats are refused). `FLOAT` is not a Trino type name and is refused. Double → `DECIMAL(p, s)` uses the exact binary expansion with HALF_UP rounding (`CAST(1e0 AS DECIMAL(38,37))` is exactly 1). `CHAR(n)`, `TIMESTAMP(p ≠ 3)`, `VARBINARY`, `JSON`, `ROW`, `MAP` targets are refused by name.",
+        notes: "Trino type names (`VARCHAR[(n)]`, `BIGINT`, `INTEGER`, `SMALLINT`, `TINYINT`, `DOUBLE`, `REAL`, `DECIMAL(p,s)`, `BOOLEAN`, `DATE`, `TIMESTAMP`) map to Arrow types; casts Trino does not define (`CAST(12 AS DATE)`, `CAST(DATE ... AS BIGINT)`, `CAST(TIMESTAMP ... AS DOUBLE)`) are a `TYPE_MISMATCH` instead of running with DataFusion's semantics. The `x::type` form is refused as non-Trino syntax. Double/decimal → integer rounds half away from zero (`CAST(2.5 AS BIGINT)` is 3) and fails on overflow (`INVALID_CAST_ARGUMENT`; NULL under `TRY_CAST`). `CAST(... AS VARCHAR)` uses Trino's text forms (`2024-01-05 10:30:00.000`, `1.0E20`); `VARCHAR(n)` truncates a varchar source but refuses a longer text of any other type (`CAST(12345 AS VARCHAR(2))` fails, as on Trino). Varchar → `TIMESTAMP` follows Trino's pattern (`YYYY-MM-DD[ HH:MM[:SS[.fraction]]]`, rounded HALF_UP to milliseconds, zone suffixes refused); varchar → `DATE` must be exactly a calendar date (`'2024-01-05 10:00:00'` fails, as on Trino); varchar → `BOOLEAN` accepts only `true`/`false`/`t`/`f`/`1`/`0`; varchar → `DOUBLE` / `REAL` follows Java's `Double.parseDouble` (`NaN`, `Infinity`, `-Infinity` exactly — `'nan'`, `'inf'`, `'infinity'` are `INVALID_CAST_ARGUMENT`; surrounding whitespace and a `d` / `f` suffix are accepted; hexadecimal floats are refused). `FLOAT` is not a Trino type name and is refused. Double → `DECIMAL(p, s)` uses the exact binary expansion with HALF_UP rounding (`CAST(1e0 AS DECIMAL(38,37))` is exactly 1). `CHAR(n)`, `TIMESTAMP(p ≠ 3)`, `VARBINARY`, `JSON`, `ROW`, `MAP` targets are refused by name. Array types use Trino's `ARRAY(T)` syntax (`CAST(NULL AS ARRAY(INTEGER))`); Hive's `ARRAY<T>` is refused as non-Trino syntax.",
         corpus_marker: "CAST(",
     },
     Construct {
@@ -1487,7 +1487,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "INTERVAL literals",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "`INTERVAL '<n>' YEAR | MONTH | DAY | HOUR | MINUTE | SECOND` (a whole number, optionally signed; a fraction only for `SECOND`) and `timestamp ± interval` arithmetic. PostgreSQL interval strings DataFusion would accept (`INTERVAL '1 day'`, `'1 hour 30 minutes'`) are refused as syntax errors, and the range forms (`INTERVAL '1-2' YEAR TO MONTH`, `'1 02:03:04' DAY TO SECOND`) and `interval * n` are refused by name. `date ± interval` requires a whole number of days (`DATE '2024-01-05' + INTERVAL '1' HOUR` is an error, as on Trino, where DataFusion would drop the hour). `date - date`, `timestamp - timestamp`, and `interval + interval` (an `interval` result in Trino) are refused; use `date_diff`. Comparing intervals (`INTERVAL '1' DAY = INTERVAL '24' HOUR`, true on Trino, which compares the normalised milliseconds / months and refuses mixed kinds) is refused by name, because DataFusion compares its month/day/nanosecond triple structurally and would answer false.",
+        notes: "`INTERVAL '<n>' YEAR | MONTH | DAY | HOUR | MINUTE | SECOND` (a whole number, optionally signed; a fraction only for `SECOND`) and `timestamp ± interval` arithmetic. PostgreSQL interval strings DataFusion would accept (`INTERVAL '1 day'`, `'1 hour 30 minutes'`) are refused as syntax errors, and the range forms (`INTERVAL '1-2' YEAR TO MONTH`, `'1 02:03:04' DAY TO SECOND`) and `interval * n` / `interval / n` (an `interval` result in Trino) are refused by name. `date ± interval` requires a whole number of days (`DATE '2024-01-05' + INTERVAL '1' HOUR` is an error, as on Trino, where DataFusion would drop the hour). `date - date`, `timestamp - timestamp`, and `interval + interval` (an `interval` result in Trino) are refused; use `date_diff`. Comparing intervals (`INTERVAL '1' DAY = INTERVAL '24' HOUR`, true on Trino, which compares the normalised milliseconds / months and refuses mixed kinds) is refused by name, because DataFusion compares its month/day/nanosecond triple structurally and would answer false.",
         corpus_marker: "INTERVAL '",
     },
     Construct {
@@ -1561,6 +1561,13 @@ pub static CONSTRUCTS: &[Construct] = &[
         corpus_marker: "TIMESTAMP '",
     },
     Construct {
+        name: "DOUBLE / REAL special values (NaN, -0.0)",
+        category: "Semantics",
+        status: ConstructStatus::Supported,
+        notes: "Comparisons involving a float operand use Trino's IEEE operators (`DoubleType`: Java's primitive `==`, `<`, …): every `=` / `<` / `<=` / `>` / `>=` with NaN is false, `NaN <> NaN` is true, and `-0.0 = 0.0` is true — where Arrow's kernels use a total order (NaN equal to NaN and above every number). The same routing covers `IN` lists, `BETWEEN`, simple `CASE` operands, `nullif` (`nullif(0e0, -0e0)` is NULL, `nullif(NaN, NaN)` is NaN), and equi-join keys (nested-loop joined). `greatest` / `max` / `array_max` rank NaN smallest (`COMPARISON_UNORDERED_FIRST`), so `max` of `{1.0, NaN}` is `1.0`; the min side needs no substitute. `contains` / `array_position` / `array_remove` match with EQUAL semantics, so NaN is never found or removed. `ORDER BY`, `GROUP BY`, `DISTINCT`, and `array_distinct` group and order NaN like Trino already. Ordering *arrays* with NaN elements (`ARRAY[NaN] < ...`) is refused: Trino's per-element IEEE ordering has no total-order equivalent.",
+        corpus_marker: "NaN",
+    },
+    Construct {
         name: "Read-only statements",
         category: "Semantics",
         status: ConstructStatus::Supported,
@@ -1617,10 +1624,17 @@ pub static CONSTRUCTS: &[Construct] = &[
         corpus_marker: "",
     },
     Construct {
+        name: "WITH RECURSIVE",
+        category: "Unsupported",
+        status: ConstructStatus::Unsupported,
+        notes: "Recursive CTEs (valid Trino) are refused by name in v0.1: DataFusion's recursive execution has not been vetted against Trino's semantics (its type unification differs and genuinely recursive queries fail with planner errors). Rewrite the recursion as an explicit `UNION ALL` of the levels.",
+        corpus_marker: "",
+    },
+    Construct {
         name: "Non-Trino syntax",
         category: "Unsupported",
         status: ConstructStatus::Unsupported,
-        notes: "Syntax DataFusion accepts but Trino does not is refused by name instead of running with DataFusion semantics: `DISTINCT ON`, `QUALIFY`, `GROUP BY ALL`, `ORDER BY ALL`, `TABLESAMPLE`, `FOR UPDATE`, `NATURAL` / `SEMI` / `ANTI` / `APPLY` / `ASOF` joins, `[1, 2]` array literals, `x::type` casts, `TOP`, `SELECT INTO`, `SELECT * EXCLUDE`, `ILIKE`, `IS [NOT] TRUE` / `IS [NOT] FALSE` / `IS [NOT] UNKNOWN`, the operators Trino lacks (`&`, `|`, `^`, `~`, `==`, `<=>`, `->`, and the other PostgreSQL operators — use `bitwise_and`, `regexp_like`, ...), a string literal as an alias (`SELECT 'a' 'b'`), PostgreSQL interval strings (`INTERVAL '1 day'`), `JOIN` without `ON` / `USING`, `FLOAT` as a type name, `0x1F` literals, and a number glued to identifier characters (`1_000`, which Trino rejects and sqlparser would read as `1 AS _000`).",
+        notes: "Syntax DataFusion accepts but Trino does not is refused by name instead of running with DataFusion semantics: `DISTINCT ON`, `QUALIFY`, `GROUP BY ALL`, `ORDER BY ALL`, `TABLESAMPLE`, `FOR UPDATE`, `NATURAL` / `SEMI` / `ANTI` / `APPLY` / `ASOF` joins, `[1, 2]` array literals, `x::type` casts, `TOP`, `SELECT INTO`, `SELECT * EXCLUDE`, `ILIKE`, `IS [NOT] TRUE` / `IS [NOT] FALSE` / `IS [NOT] UNKNOWN`, the operators Trino lacks (`&`, `|`, `^`, `~`, `==`, `<=>`, `->`, and the other PostgreSQL operators — use `bitwise_and`, `regexp_like`, ...), a string literal as an alias (`SELECT 'a' 'b'`), PostgreSQL interval strings (`INTERVAL '1 day'`), `JOIN` without `ON` / `USING`, `FLOAT` as a type name, `ARRAY<T>` type syntax (Trino writes `ARRAY(T)`), `0x1F` literals, and a number glued to identifier characters (`1_000`, which Trino rejects and sqlparser would read as `1 AS _000`).",
         corpus_marker: "",
     },
     Construct {

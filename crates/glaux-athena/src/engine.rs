@@ -256,15 +256,33 @@ fn classify(err: DataFusionError) -> EngineError {
     if let Some(user) = glaux_error(&err) {
         return user;
     }
+    // The root cause without the optimizer's context wrappers ("Optimizer
+    // rule 'simplify_expressions' failed, caused by ..."), which would leak
+    // engine internals into user-facing messages.
+    let root_message = err.find_root().to_string();
     let data = |code: &str| EngineError::Data {
         code: code.to_string(),
-        message: err.to_string(),
+        message: root_message.clone(),
     };
     match err.find_root() {
         DataFusionError::SQL(..)
         | DataFusionError::Plan(..)
         | DataFusionError::SchemaError(..)
-        | DataFusionError::NotImplemented(..) => EngineError::Plan(err.to_string()),
+        | DataFusionError::NotImplemented(..) => {
+            // DataFusion's coercion failure for operand types it does not
+            // combine is Trino's TYPE_MISMATCH ("Cannot apply operator:
+            // boolean = integer"), not a syntax error.
+            if let Some(rest) = root_message.strip_prefix(
+                "Error during planning: Cannot infer common argument \
+                     type for comparison operation ",
+            ) {
+                return EngineError::TypeMismatch(format!(
+                    "Cannot apply operator: {}",
+                    trino_type_tokens(rest)
+                ));
+            }
+            EngineError::Plan(err.to_string())
+        }
         DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
             ArrowError::CastError(_) => data("INVALID_CAST_ARGUMENT"),
             ArrowError::ParseError(_) => data("INVALID_FUNCTION_ARGUMENT"),
@@ -282,6 +300,27 @@ fn classify(err: DataFusionError) -> EngineError {
         DataFusionError::Execution(_) => data("GENERIC_USER_ERROR"),
         _ => EngineError::Execution(err.to_string()),
     }
+}
+
+/// Best-effort mapping of the Arrow type names in a coercion diagnostic
+/// ("Boolean = Int64") onto Trino's ("boolean = bigint"). Unknown tokens
+/// pass through unchanged.
+fn trino_type_tokens(text: &str) -> String {
+    text.split(' ')
+        .map(|token| match token {
+            "Boolean" => "boolean",
+            "Int8" => "tinyint",
+            "Int16" => "smallint",
+            "Int32" => "integer",
+            "Int64" => "bigint",
+            "Float32" => "real",
+            "Float64" => "double",
+            "Utf8" | "LargeUtf8" | "Utf8View" => "varchar",
+            "Date32" | "Date64" => "date",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub(crate) fn execution_error(err: DataFusionError) -> EngineError {
@@ -461,6 +500,33 @@ mod tests {
         assert!(
             matches!(&err, EngineError::Plan(m) if m.contains("nope")),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn coercion_failures_map_to_type_mismatch_with_trino_type_names() {
+        let err = classify(DataFusionError::Plan(
+            "Cannot infer common argument type for comparison operation Boolean = Int64"
+                .to_string(),
+        ));
+        assert_eq!(
+            err.to_string(),
+            "TYPE_MISMATCH: Cannot apply operator: boolean = bigint"
+        );
+        // Data errors report the root cause, not the optimizer context that
+        // wrapped it.
+        let err = classify(DataFusionError::Context(
+            "Optimizer rule 'simplify_expressions' failed".to_string(),
+            Box::new(DataFusionError::ArrowError(
+                Box::new(ArrowError::CastError(
+                    "Cannot cast string '9999999999' to value of Int32 type".to_string(),
+                )),
+                None,
+            )),
+        ));
+        assert_eq!(
+            err.to_string(),
+            "INVALID_CAST_ARGUMENT: Arrow error: Cast error: Cannot cast string '9999999999' to value of Int32 type"
         );
     }
 

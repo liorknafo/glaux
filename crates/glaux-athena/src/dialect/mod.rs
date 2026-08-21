@@ -121,9 +121,11 @@ pub fn translate(sql: &str) -> Result<Statement, GlauxSqlError> {
 
 /// [`translate`], also returning the output renames the engine must apply.
 pub fn translate_full(sql: &str) -> Result<Translation, GlauxSqlError> {
-    reject_digit_identifiers(sql)?;
-    let mut statements =
-        Parser::parse_sql(&AthenaDialect, sql).map_err(|e| GlauxSqlError::Parse {
+    let tokens = preprocess_tokens(sql)?;
+    let mut statements = Parser::new(&AthenaDialect)
+        .with_tokens_with_locations(tokens)
+        .parse_statements()
+        .map_err(|e| GlauxSqlError::Parse {
             message: e.to_string(),
         })?;
     match statements.len() {
@@ -149,16 +151,31 @@ pub fn translate_full(sql: &str) -> Result<Translation, GlauxSqlError> {
     Ok(Translation { statement, renames })
 }
 
-/// Trino lexes a digit run glued to identifier characters (`1_000`, `1AS`,
-/// `0x1F`) as one token and rejects it ("identifier must not start with a
-/// digit"); sqlparser splits it into a number and an identifier, which would
-/// make `SELECT 1_000` a query returning `1` aliased `_000`.
-fn reject_digit_identifiers(sql: &str) -> Result<(), GlauxSqlError> {
+/// Tokenize `sql` and apply the token-level fixes the parser cannot do
+/// itself:
+///
+/// - refuse digit-glued identifiers and `==` (Trino syntax errors);
+/// - `ARRAY(T)` type syntax (Trino's) → `ARRAY<T>` (the form sqlparser
+///   parses), and Hive's `ARRAY<T>` — not Trino syntax — refused by name;
+/// - bare-row `VALUES 1, 2` (valid Trino) → `VALUES (1), (2)`.
+fn preprocess_tokens(sql: &str) -> Result<Vec<sqlparser::tokenizer::TokenWithSpan>, GlauxSqlError> {
     let tokens = Tokenizer::new(&AthenaDialect, sql)
         .tokenize_with_location()
         .map_err(|e| GlauxSqlError::Parse {
             message: e.to_string(),
         })?;
+    reject_digit_identifiers(&tokens)?;
+    let tokens = convert_array_type_parens(tokens)?;
+    Ok(wrap_bare_values_rows(tokens))
+}
+
+/// Trino lexes a digit run glued to identifier characters (`1_000`, `1AS`,
+/// `0x1F`) as one token and rejects it ("identifier must not start with a
+/// digit"); sqlparser splits it into a number and an identifier, which would
+/// make `SELECT 1_000` a query returning `1` aliased `_000`.
+fn reject_digit_identifiers(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+) -> Result<(), GlauxSqlError> {
     // `==` parses to the same AST as `=`; Trino has only `=`.
     if tokens.iter().any(|t| matches!(t.token, Token::DoubleEq)) {
         return Err(GlauxSqlError::Parse {
@@ -180,6 +197,160 @@ fn reject_digit_identifiers(sql: &str) -> Result<(), GlauxSqlError> {
         }
     }
     Ok(())
+}
+
+/// Whether a token is whitespace (the tokenizer keeps whitespace tokens;
+/// the parser skips them).
+fn is_whitespace(token: &Token) -> bool {
+    matches!(token, Token::Whitespace(_))
+}
+
+/// The index of the next non-whitespace token after `i`, if any.
+fn next_significant(tokens: &[sqlparser::tokenizer::TokenWithSpan], i: usize) -> Option<usize> {
+    tokens
+        .iter()
+        .enumerate()
+        .skip(i + 1)
+        .find(|(_, t)| !is_whitespace(&t.token))
+        .map(|(j, _)| j)
+}
+
+/// Whether the token is the unquoted keyword `word` (case-insensitive).
+fn is_keyword(token: &Token, word: &str) -> bool {
+    matches!(token, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(word))
+}
+
+/// Trino writes array types `ARRAY(INTEGER)`; sqlparser only parses the
+/// Hive/BigQuery form `ARRAY<INTEGER>` (`Expected: <, found: (`). The
+/// parentheses directly after an `ARRAY` keyword are converted to angle
+/// brackets so Trino's form parses, and a literal `ARRAY<...>` — not Trino
+/// syntax — is refused by name.
+fn convert_array_type_parens(
+    mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Result<Vec<sqlparser::tokenizer::TokenWithSpan>, GlauxSqlError> {
+    // Depth-indexed stack: `true` for parens opened directly after ARRAY.
+    let mut stack: Vec<bool> = Vec::new();
+    let mut previous_significant: Option<Token> = None;
+    for entry in &mut tokens {
+        let token = entry.token.clone();
+        if is_whitespace(&token) {
+            continue;
+        }
+        let after_array = previous_significant
+            .as_ref()
+            .is_some_and(|t| is_keyword(t, "array"));
+        match &token {
+            Token::Lt if after_array => {
+                return Err(GlauxSqlError::unsupported(
+                    "ARRAY<...> type syntax",
+                    "`ARRAY<INTEGER>` is Hive syntax, not Trino's; write ARRAY(INTEGER)",
+                ));
+            }
+            Token::LParen => {
+                if after_array {
+                    entry.token = Token::Lt;
+                }
+                stack.push(after_array);
+            }
+            Token::RParen if stack.pop().unwrap_or(false) => {
+                entry.token = Token::Gt;
+            }
+            _ => {}
+        }
+        previous_significant = Some(token);
+    }
+    Ok(tokens)
+}
+
+/// Keywords that end a `VALUES` row list at depth 0.
+fn ends_values_list(token: &Token) -> bool {
+    [
+        "order",
+        "limit",
+        "offset",
+        "fetch",
+        "union",
+        "except",
+        "intersect",
+    ]
+    .iter()
+    .any(|k| is_keyword(token, k))
+        || matches!(token, Token::SemiColon)
+}
+
+/// Trino allows `VALUES 1, 2` — each row a bare expression; sqlparser
+/// requires parenthesised rows (`Expected: (, found: 1`). When the first
+/// row after `VALUES` is bare, every top-level comma-separated row is
+/// wrapped in parentheses. Applied repeatedly so `VALUES` bodies nested in
+/// subqueries are covered too.
+fn wrap_bare_values_rows(
+    mut tokens: Vec<sqlparser::tokenizer::TokenWithSpan>,
+) -> Vec<sqlparser::tokenizer::TokenWithSpan> {
+    fn starts_query_body(previous: Option<&Token>) -> bool {
+        match previous {
+            // Statement start.
+            None => true,
+            Some(Token::LParen) => true,
+            Some(t) => ["union", "except", "intersect", "all", "distinct"]
+                .iter()
+                .any(|k| is_keyword(t, k)),
+        }
+    }
+    let empty = |token: Token| sqlparser::tokenizer::TokenWithSpan {
+        token,
+        span: sqlparser::tokenizer::Span::empty(),
+    };
+    'restart: loop {
+        let mut previous_significant: Option<usize> = None;
+        for i in 0..tokens.len() {
+            if is_whitespace(&tokens[i].token) {
+                continue;
+            }
+            let starts = starts_query_body(previous_significant.map(|p| &tokens[p].token));
+            if is_keyword(&tokens[i].token, "values")
+                && starts
+                && let Some(first) = next_significant(&tokens, i)
+                && !matches!(tokens[first].token, Token::LParen)
+                && !is_keyword(&tokens[first].token, "row")
+                && !ends_values_list(&tokens[first].token)
+            {
+                // Wrap each depth-0 comma-separated row in parentheses.
+                let mut out = tokens[..first].to_vec();
+                out.push(empty(Token::LParen));
+                let mut depth = 0usize;
+                let mut rest = first;
+                while rest < tokens.len() {
+                    let token = &tokens[rest].token;
+                    match token {
+                        Token::LParen | Token::LBracket => depth += 1,
+                        Token::RParen | Token::RBracket => {
+                            if depth == 0 {
+                                break;
+                            }
+                            depth -= 1;
+                        }
+                        Token::Comma if depth == 0 => {
+                            out.push(empty(Token::RParen));
+                            out.push(tokens[rest].clone());
+                            out.push(empty(Token::LParen));
+                            rest += 1;
+                            continue;
+                        }
+                        t if depth == 0 && ends_values_list(t) => break,
+                        _ => {}
+                    }
+                    out.push(tokens[rest].clone());
+                    rest += 1;
+                }
+                out.push(empty(Token::RParen));
+                out.extend_from_slice(&tokens[rest..]);
+                tokens = out;
+                continue 'restart;
+            }
+            previous_significant = Some(i);
+        }
+        return tokens;
+    }
 }
 
 /// Result types Athena cannot return: an `interval` (DataFusion produces one
@@ -372,6 +543,50 @@ mod tests {
         assert!(err.to_string().contains("lambda"), "{err}");
         let err = translate("SELECT array_sort(a, (x, y) -> 1) FROM t").unwrap_err();
         assert!(err.to_string().contains("lambda"), "{err}");
+    }
+
+    #[test]
+    fn bare_values_rows_are_wrapped_in_parens() {
+        assert_eq!(
+            translate("VALUES 1, 2").unwrap().to_string(),
+            "SELECT column1 AS _col0 FROM (VALUES (1), (2)) AS __glaux_values"
+        );
+        assert_eq!(
+            translate("SELECT x FROM (VALUES 1, (2), 1 + 2) t(x)")
+                .unwrap()
+                .to_string(),
+            "SELECT x FROM (SELECT column1 AS _col0 FROM (VALUES (1), ((2)), (1 + 2)) AS __glaux_values) t (x)"
+        );
+        // Terminators stop the row list; nested commas stay inside their
+        // parens / brackets.
+        translate("VALUES abs(-1), 2 ORDER BY 1 LIMIT 1").unwrap();
+        translate("SELECT x FROM (VALUES ARRAY[1, 2], ARRAY[3]) t(x)").unwrap();
+        translate("VALUES 1 UNION ALL VALUES 2").unwrap();
+        // Parenthesised rows are untouched (a two-column row is not a
+        // nested expression).
+        assert_eq!(
+            translate("SELECT * FROM (VALUES (1, 2))")
+                .unwrap()
+                .to_string(),
+            "SELECT * FROM (SELECT column1 AS _col0, column2 AS _col1 FROM (VALUES (1, 2)) AS __glaux_values)"
+        );
+    }
+
+    #[test]
+    fn array_type_syntax_is_trinos_not_hives() {
+        // Trino's ARRAY(T) parses (the tokens are converted to the angle-
+        // bracket form sqlparser understands), nesting included.
+        translate("SELECT CAST(NULL AS ARRAY(INTEGER))").unwrap();
+        translate("SELECT CAST(NULL AS ARRAY(DECIMAL(2,1)))").unwrap();
+        translate("SELECT CAST(NULL AS ARRAY(ARRAY(INTEGER)))").unwrap();
+        // Hive's ARRAY<T> is refused by name.
+        let err = translate("SELECT CAST(NULL AS ARRAY<INTEGER>)").unwrap_err();
+        assert!(
+            matches!(&err, GlauxSqlError::Unsupported { construct, .. } if construct == "ARRAY<...> type syntax"),
+            "{err}"
+        );
+        // ARRAY[...] literals are untouched.
+        translate("SELECT ARRAY[1, 2]").unwrap();
     }
 
     #[test]
