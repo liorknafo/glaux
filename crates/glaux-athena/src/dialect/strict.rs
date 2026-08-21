@@ -145,6 +145,8 @@ pub(crate) fn comparable(left: &DataType, right: &DataType) -> bool {
 fn trino_function_name(name: &str) -> &str {
     match name {
         "character_length" => "length",
+        "trino_replace" => "replace",
+        "trino_power" => "power",
         "levenshtein" => "levenshtein_distance",
         "to_timestamp" => "date_parse",
         other => other,
@@ -279,7 +281,7 @@ fn string_arguments(name: &str) -> &'static [usize] {
     match name {
         "character_length" => &[0],
         "starts_with" | "strpos" | "levenshtein" | "regexp_match" => &[0, 1],
-        "replace" | "translate" => &[0, 1, 2],
+        "trino_replace" | "translate" => &[0, 1, 2],
         // `date_parse(x, fmt)`: the parsed text must be a varchar.
         "to_timestamp" => &[0],
         _ => &[],
@@ -295,7 +297,7 @@ fn numeric_arguments(name: &str) -> &'static [usize] {
         "abs" | "cbrt" | "ceil" | "chr" | "degrees" | "exp" | "factorial" | "floor" | "ln"
         | "log10" | "log2" | "radians" | "signum" | "sqrt" | "acos" | "asin" | "atan" | "cos"
         | "cosh" | "sin" | "sinh" | "tan" | "tanh" | "trunc" | "width_bucket" => &[0],
-        "atan2" | "log" | "power" | "nanvl" => &[0, 1],
+        "atan2" | "log" | "trino_power" | "nanvl" => &[0, 1],
         _ => &[],
     }
 }

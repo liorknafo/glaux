@@ -2091,7 +2091,7 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             if full.len() == 2 {
                 full.push(str_lit(""));
             }
-            func("replace", full)
+            func("trino_replace", full)
         }
         "levenshtein_distance" => return simple_rename("levenshtein", &[2]),
         "substr" | "substring" => return simple_rename("trino_substr", &[2, 3]),
@@ -2265,7 +2265,7 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
         "pow" | "power" => {
             arity(name, &args, &[2])?;
             func(
-                "power",
+                "trino_power",
                 args.into_iter().map(|a| cast_to(a, double())).collect(),
             )
         }

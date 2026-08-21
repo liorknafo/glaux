@@ -504,8 +504,8 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "replace(varchar, search[, replacement])",
         "String",
         Rewrite,
-        "DataFusion `replace`; the 2-argument (delete) form becomes `replace(x, search, '')`",
-        ["replace"]
+        "Rust UDF `trino_replace`; the 2-argument (delete) form becomes `replace(x, search, '')`. An **empty** `search` follows Trino's separate branch, which inserts the replacement in front of every code point and at the end: `replace('abc', '', 'X')` is `'XaXbXcX'`, `replace('', '', 'X')` is `'X'`, `replace('a👍', '', '-')` is `'-a-👍-'` (DataFusion's `replace` returned the input unchanged).",
+        ["trino_replace"]
     ),
     shim!(
         "reverse",
@@ -1036,16 +1036,16 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "pow(x, p) → double",
         "Math",
         Rewrite,
-        "`power(CAST(x AS DOUBLE), CAST(p AS DOUBLE))`: always a double, as in Trino (DataFusion keeps integer arguments integral).",
-        ["power"]
+        "Rust UDF `trino_power(CAST(x AS DOUBLE), CAST(p AS DOUBLE))`: always a double, as in Trino (DataFusion keeps integer arguments integral), and Java's `Math.pow` value throughout — `power(0, -1)` is `Infinity` and `power(-0e0, -1)` is `-Infinity`, where DataFusion carries PostgreSQL's `zero raised to a negative power is undefined` guard. The four cases where `Math.pow` departs from C's `pow` are reproduced too: `p = 0` is `1.0` for any `x`, `p = 1` is `x`, a NaN `p` is NaN (so `power(1, nan())` is NaN, not `1.0`), and `|x| = 1` with an infinite `p` is NaN.",
+        ["trino_power"]
     ),
     shim!(
         "power",
         "power(x, p) → double",
         "Math",
         Rewrite,
-        "`power(CAST(x AS DOUBLE), CAST(p AS DOUBLE))`: always a double, as in Trino (DataFusion keeps integer arguments integral).",
-        ["power"]
+        "Rust UDF `trino_power(CAST(x AS DOUBLE), CAST(p AS DOUBLE))`: always a double, as in Trino (DataFusion keeps integer arguments integral), and Java's `Math.pow` value throughout — `power(0, -1)` is `Infinity` and `power(-0e0, -1)` is `-Infinity`, where DataFusion carries PostgreSQL's `zero raised to a negative power is undefined` guard. The four cases where `Math.pow` departs from C's `pow` are reproduced too: `p = 0` is `1.0` for any `x`, `p = 1` is `x`, a NaN `p` is NaN (so `power(1, nan())` is NaN, not `1.0`), and `|x| = 1` with an infinite `p` is NaN.",
+        ["trino_power"]
     ),
     shim!(
         "rand",

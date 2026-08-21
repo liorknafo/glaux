@@ -19,6 +19,10 @@
 //!   (engine v2), so Athena answers it with a function-resolution error.
 //!   DataFusion's two-argument `trunc` would happily return a value
 //!   instead.
+//! - `power(x, p)`: Trino is Java's `Math.pow`, which is IEEE 754 `pow`
+//!   with four Java-specific special cases. DataFusion 55 keeps
+//!   PostgreSQL's guard and raises `zero raised to a negative power is
+//!   undefined` where Athena answers `Infinity`.
 
 use std::sync::Arc;
 
@@ -50,6 +54,7 @@ pub fn all() -> Vec<ScalarUDF> {
     .into_iter()
     .map(|op| ScalarUDF::new_from_impl(TrinoMath::new(op)))
     .chain(std::iter::once(ScalarUDF::new_from_impl(TrinoSqrt::new())))
+    .chain(std::iter::once(ScalarUDF::new_from_impl(TrinoPower::new())))
     .chain(std::iter::once(ScalarUDF::new_from_impl(
         TrinoRandomBound::new(),
     )))
@@ -189,6 +194,97 @@ impl ScalarUDFImpl for TrinoSqrt {
         let doubles = cast(&input, &DataType::Float64)?;
         let out: PrimitiveArray<Float64Type> =
             doubles.as_primitive::<Float64Type>().unary(f64::sqrt);
+        Ok(ColumnarValue::Array(Arc::new(out)))
+    }
+}
+
+/// Trino's `power(x, p)`: Java's `Math.pow`.
+///
+/// That is IEEE 754 `pow` (what Rust's `f64::powf` gives) except for four
+/// cases the `Math.pow` javadoc lists ahead of the IEEE ones, and which it
+/// applies in this order:
+///
+/// * `p == ±0.0` → `1.0` (even for `x` NaN),
+/// * `p == 1.0` → `x`,
+/// * `p` NaN → NaN (C's `pow(1.0, NaN)` is `1.0`),
+/// * `|x| == 1` and `p` infinite → NaN (C's `pow(1.0, inf)` is `1.0`).
+///
+/// Everything else — `power(0, -1)` → `Infinity`, `power(-0.0, -1)` →
+/// `-Infinity` — is plain `powf`. DataFusion's `power` instead carries
+/// PostgreSQL's guard and errors on a zero base with a negative exponent,
+/// which is data-dependent and so kills whole queries as soon as one row
+/// holds a zero.
+pub fn trino_power(x: f64, p: f64) -> f64 {
+    if p == 0.0 {
+        return 1.0;
+    }
+    if p == 1.0 {
+        return x;
+    }
+    if p.is_nan() || (x.abs() == 1.0 && p.is_infinite()) {
+        return f64::NAN;
+    }
+    x.powf(p)
+}
+
+/// `trino_power(x, p)`: see [`trino_power`].
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoPower {
+    signature: Signature,
+}
+
+impl Default for TrinoPower {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoPower {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoPower {
+    fn name(&self) -> &str {
+        "trino_power"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        for t in arg_types {
+            match t {
+                t if is_integer(t) => {}
+                DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(..)
+                | DataType::Null => {}
+                other => {
+                    return Err(type_mismatch(format!(
+                        "Unexpected parameters ({}) for function power. Expected: \
+                         power(double, double)",
+                        trino_type_name(other)
+                    )));
+                }
+            }
+        }
+        Ok(DataType::Float64)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let base = cast(&args.args[0].to_array(rows)?, &DataType::Float64)?;
+        let exponent = cast(&args.args[1].to_array(rows)?, &DataType::Float64)?;
+        let base = base.as_primitive::<Float64Type>();
+        let exponent = exponent.as_primitive::<Float64Type>();
+        let out: PrimitiveArray<Float64Type> =
+            arrow::compute::kernels::arity::binary(base, exponent, trino_power)?;
         Ok(ColumnarValue::Array(Arc::new(out)))
     }
 }
@@ -687,5 +783,29 @@ mod tests {
         );
         assert_eq!(round_integer(MathOp::Round, 1249, Some(-2)).unwrap(), 1200);
         assert_eq!(round_integer(MathOp::Floor, 7, None).unwrap(), 7);
+    }
+}
+
+#[cfg(test)]
+mod power_tests {
+    use super::trino_power;
+
+    #[test]
+    fn power_is_java_math_pow() {
+        // IEEE: a zero base with a negative exponent is infinite, where
+        // DataFusion's PostgreSQL guard raised instead.
+        assert_eq!(trino_power(0.0, -1.0), f64::INFINITY);
+        assert_eq!(trino_power(-0.0, -1.0), f64::NEG_INFINITY);
+        assert_eq!(trino_power(0.0, -2.0), f64::INFINITY);
+        assert_eq!(trino_power(2.0, 10.0), 1024.0);
+        assert!(trino_power(-8.0, 1.0 / 3.0).is_nan());
+        // The four cases where Math.pow departs from C's pow.
+        assert_eq!(trino_power(f64::NAN, 0.0), 1.0);
+        assert_eq!(trino_power(f64::NAN, -0.0), 1.0);
+        assert!(trino_power(f64::NAN, 1.0).is_nan());
+        assert!(trino_power(1.0, f64::NAN).is_nan());
+        assert!(trino_power(1.0, f64::INFINITY).is_nan());
+        assert!(trino_power(-1.0, f64::NEG_INFINITY).is_nan());
+        assert_eq!(trino_power(2.0, f64::NEG_INFINITY), 0.0);
     }
 }

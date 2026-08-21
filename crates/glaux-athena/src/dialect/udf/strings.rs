@@ -6,7 +6,10 @@
 //! Trino), `upper` / `lower`, which Trino maps per code point (`ß` stays
 //! `ß`) where Rust applies the full Unicode mapping, and `trim` / `ltrim` /
 //! `rtrim`, which strip every Java whitespace code point (tab, newline,
-//! `U+2028`, ...) where DataFusion strips only the ASCII space.
+//! `U+2028`, ...) where DataFusion strips only the ASCII space, and
+//! `replace` with an empty `search`, which Trino answers by inserting the
+//! replacement around every code point where DataFusion returns the input
+//! unchanged.
 
 use std::sync::Arc;
 
@@ -27,6 +30,7 @@ pub fn all() -> Vec<ScalarUDF> {
         ScalarUDF::new_from_impl(TrinoSubstr::new()),
         ScalarUDF::new_from_impl(TrinoSplitPart::new()),
         ScalarUDF::new_from_impl(TrinoSplit::new()),
+        ScalarUDF::new_from_impl(TrinoReplace::new()),
         ScalarUDF::new_from_impl(TrinoStringOp::new(StringOp::Lpad)),
         ScalarUDF::new_from_impl(TrinoStringOp::new(StringOp::Rpad)),
         ScalarUDF::new_from_impl(TrinoStringOp::new(StringOp::Codepoint)),
@@ -104,6 +108,84 @@ impl ScalarUDFImpl for TrinoSplit {
                 out.values().append_value(part);
             }
             out.append(true);
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+/// Trino's `replace(string, search, replace)`.
+///
+/// With a non-empty `search` this is the usual left-to-right replacement of
+/// every non-overlapping occurrence. With an **empty** `search` Trino's
+/// `StringFunctions.replace` takes a separate branch that "insert[s]
+/// `replace` in front of every character and at the end", so
+/// `replace('abc', '', 'X')` is `'XaXbXcX'` and `replace('', '', 'X')` is
+/// `'X'` — DataFusion's `replace` returns the input untouched instead.
+/// "Character" is a code point there (the Java loop advances by
+/// `lengthOfCodePointSafe`), so `replace('a👍', '', '-')` is `'-a-👍-'`.
+pub fn trino_replace(s: &str, search: &str, replacement: &str) -> String {
+    if !search.is_empty() {
+        return s.replace(search, replacement);
+    }
+    let mut out = String::with_capacity(s.len() + replacement.len() * (s.chars().count() + 1));
+    out.push_str(replacement);
+    for c in s.chars() {
+        out.push(c);
+        out.push_str(replacement);
+    }
+    out
+}
+
+/// `trino_replace(string, search, replacement)`: see [`trino_replace`].
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoReplace {
+    signature: Signature,
+}
+
+impl Default for TrinoReplace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoReplace {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(3), Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoReplace {
+    fn name(&self) -> &str {
+        "trino_replace"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let strings = string_array("replace", &args.args[0], rows)?;
+        let searches = string_array("replace", &args.args[1], rows)?;
+        let replacements = string_array("replace", &args.args[2], rows)?;
+        let mut out = StringBuilder::new();
+        for i in 0..rows {
+            if strings.is_null(i) || searches.is_null(i) || replacements.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            out.append_value(trino_replace(
+                strings.value(i),
+                searches.value(i),
+                replacements.value(i),
+            ));
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
@@ -718,5 +800,23 @@ mod trim_tests {
         assert_eq!(trino_trim("xax", TrimSide::Leading, Some("x")), "ax");
         assert_eq!(trino_trim("xax", TrimSide::Trailing, Some("x")), "xa");
         assert_eq!(trino_trim(" a ", TrimSide::Both, Some("x")), " a ");
+    }
+}
+
+#[cfg(test)]
+mod replace_tests {
+    use super::*;
+
+    #[test]
+    fn empty_search_wraps_every_code_point() {
+        assert_eq!(trino_replace("abc", "", "X"), "XaXbXcX");
+        assert_eq!(trino_replace("", "", "X"), "X");
+        assert_eq!(trino_replace("a\u{1F44D}", "", "-"), "-a-\u{1F44D}-");
+        assert_eq!(trino_replace("abc", "", "XY").chars().count(), 11);
+        assert_eq!(trino_replace("abc", "", ""), "abc");
+        // Non-empty searches are the ordinary left-to-right replacement.
+        assert_eq!(trino_replace("a,b,,c", ",", ";"), "a;b;;c");
+        assert_eq!(trino_replace("aaa", "aa", "b"), "ba");
+        assert_eq!(trino_replace("abc", "b", ""), "ac");
     }
 }

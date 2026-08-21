@@ -8,7 +8,9 @@
 //! - `reverse(x)`: reverses a string *or* an array (DataFusion's `reverse`
 //!   is string-only and would stringify an array).
 //! - `contains(array, x)` / `arrays_overlap(a, b)`: `NULL`, not `false`,
-//!   when no match is found but a `NULL` element could have been one.
+//!   when no match is found but a `NULL` element could have been one, and
+//!   an `array(unknown)` operand (`ARRAY[]`, `ARRAY[NULL]`) unifies with
+//!   the sibling operand's element type instead of failing.
 //! - `array_max` / `array_min`: `NULL` when any element is `NULL`
 //!   (DataFusion skips NULL elements).
 //! - `array_remove(array, x)`: keeps `NULL` elements (DataFusion drops them)
@@ -108,6 +110,24 @@ fn check_element_comparable(function: &str, array: &DataType, value: &DataType) 
             trino_type_name(value)
         )))
     }
+}
+
+/// Give `list` the element type `wanted` when its own is `unknown`.
+///
+/// An empty `ARRAY[]` literal (and `ARRAY[NULL]`) plans as a list of
+/// `Null`, which is Trino's `array(unknown)`. Trino unifies that with the
+/// sibling operand's type — `contains(ARRAY[], 1)` is `false`,
+/// `arrays_overlap(ARRAY[], ARRAY[1])` is `false` — so the same unification
+/// happens here. Arrow casts `Null` to any type but nothing *to* `Null`, so
+/// the unknown side is always the one that moves: casting the value to the
+/// list's element type (what the code used to do in both directions) failed
+/// with `Casting from Int32 to Null not supported`.
+fn unify_unknown_elements(function: &str, list: ListArray, wanted: &DataType) -> Result<ListArray> {
+    if !matches!(list.values().data_type(), DataType::Null) || matches!(wanted, DataType::Null) {
+        return Ok(list);
+    }
+    let target = DataType::List(Arc::new(Field::new("item", wanted.clone(), true)));
+    as_list(function, cast(&list, &target)?)
 }
 
 /// `trino_element_at(array, i)` (lenient) and `trino_subscript(array, i)`
@@ -412,8 +432,9 @@ impl ScalarUDFImpl for TrinoContains {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let rows = args.number_rows;
         let list = as_list("contains", args.args[0].to_array(rows)?)?;
-        let element = list.values().data_type().clone();
         let needle = args.args[1].to_array(rows)?;
+        let list = unify_unknown_elements("contains", list, needle.data_type())?;
+        let element = list.values().data_type().clone();
         let needle = if needle.data_type() == &element {
             needle
         } else {
@@ -492,6 +513,7 @@ impl ScalarUDFImpl for TrinoArraysOverlap {
         let rows = args.number_rows;
         let left = as_list("arrays_overlap", args.args[0].to_array(rows)?)?;
         let right = as_list("arrays_overlap", args.args[1].to_array(rows)?)?;
+        let left = unify_unknown_elements("arrays_overlap", left, right.values().data_type())?;
         let right = if right.values().data_type() == left.values().data_type() {
             right
         } else {
