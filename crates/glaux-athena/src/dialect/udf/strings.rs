@@ -38,14 +38,18 @@ pub fn all() -> Vec<ScalarUDF> {
     ]
 }
 
-/// Trino's `split(string, delimiter)`: `split('', ',')` is `['']` and an
-/// empty delimiter splits into single characters (DataFusion's
-/// `string_to_array` gives `[]` and `['abc']` respectively).
-pub fn trino_split(s: &str, delimiter: &str) -> Vec<String> {
+/// Trino's `split(string, delimiter)`: `split('', ',')` is `['']`
+/// (DataFusion's `string_to_array` gives `[]`) and an empty delimiter is
+/// an `INVALID_FUNCTION_ARGUMENT` error (`The delimiter may not be the
+/// empty string`; only `split_part` splits into characters on it).
+pub fn trino_split(s: &str, delimiter: &str) -> Result<Vec<String>> {
     if delimiter.is_empty() {
-        return s.chars().map(String::from).collect();
+        return Err(data_error(
+            "INVALID_FUNCTION_ARGUMENT",
+            "split: The delimiter may not be the empty string",
+        ));
     }
-    s.split(delimiter).map(String::from).collect()
+    Ok(s.split(delimiter).map(String::from).collect())
 }
 
 /// `trino_split(string, delimiter)`: see [`trino_split`].
@@ -96,7 +100,7 @@ impl ScalarUDFImpl for TrinoSplit {
                 out.append(false);
                 continue;
             }
-            for part in trino_split(strings.value(i), delimiters.value(i)) {
+            for part in trino_split(strings.value(i), delimiters.value(i))? {
                 out.values().append_value(part);
             }
             out.append(true);
@@ -493,11 +497,15 @@ mod tests {
 
     #[test]
     fn split_keeps_empty_fields_and_splits_characters_on_empty_delimiter() {
-        assert_eq!(trino_split("", ","), vec![""]);
-        assert_eq!(trino_split("a,b,,c", ","), vec!["a", "b", "", "c"]);
-        assert_eq!(trino_split("abc", ""), vec!["a", "b", "c"]);
-        assert_eq!(trino_split("Über", ""), vec!["Ü", "b", "e", "r"]);
-        assert_eq!(trino_split("a::b", "::"), vec!["a", "b"]);
+        assert_eq!(trino_split("", ",").unwrap(), vec![""]);
+        assert_eq!(trino_split("a,b,,c", ",").unwrap(), vec!["a", "b", "", "c"]);
+        assert_eq!(trino_split("a::b", "::").unwrap(), vec!["a", "b"]);
+        let err = trino_split("abc", "").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("The delimiter may not be the empty string"),
+            "{err}"
+        );
     }
 
     #[test]

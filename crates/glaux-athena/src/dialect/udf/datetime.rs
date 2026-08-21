@@ -5,12 +5,18 @@
 //!   (DataFusion widens it to a timestamp), sub-day units on a `DATE` are
 //!   errors, and varchar input is refused (DataFusion would parse it).
 //! - `to_unixtime(timestamp)` refuses varchar input for the same reason.
+//! - `trino_check_parsed_time(text, chrono_format)` guards `date_parse` /
+//!   `parse_datetime`: chrono parses a leap second (`10:30:60`) that
+//!   DataFusion's `to_timestamp` then rolls over to `10:31:00`, where Joda
+//!   raises `Value 60 for secondOfMinute must be in the range [0,59]`. The
+//!   function returns its text unchanged or raises that error.
 
 use std::sync::Arc;
 
 use arrow::array::{Array, AsArray, Float64Array};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, TimeUnit, TimestampMicrosecondType};
+use chrono::format::{Parsed, StrftimeItems};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, TimeDelta};
 use datafusion::common::Result;
 use datafusion::logical_expr::{
@@ -18,7 +24,9 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
-use super::{Unit, from_naive, to_naive, type_mismatch, unit_arg, user_err};
+use super::{
+    Unit, data_error, from_naive, string_array, to_naive, type_mismatch, unit_arg, user_err,
+};
 use crate::dialect::udf::casts::trino_type_name;
 
 /// The date/time UDFs.
@@ -26,7 +34,74 @@ pub fn all() -> Vec<ScalarUDF> {
     vec![
         ScalarUDF::new_from_impl(TrinoDateTrunc::new()),
         ScalarUDF::new_from_impl(TrinoToUnixtime::new()),
+        ScalarUDF::new_from_impl(TrinoCheckParsedTime::new()),
     ]
+}
+
+/// Whether `text` parsed with the chrono `format` carries a field value
+/// Joda rejects: a second of 60 (chrono's leap second). `Ok(())` when the
+/// text does not parse at all — `to_timestamp` reports that itself.
+pub fn check_parsed_time(text: &str, format: &str) -> Result<()> {
+    let mut parsed = Parsed::new();
+    let items = StrftimeItems::new(format);
+    if chrono::format::parse(&mut parsed, text, items).is_err() {
+        return Ok(());
+    }
+    if parsed.second() == Some(60) {
+        return Err(data_error(
+            "INVALID_FUNCTION_ARGUMENT",
+            "Value 60 for secondOfMinute must be in the range [0,59]",
+        ));
+    }
+    Ok(())
+}
+
+/// `trino_check_parsed_time(text, format)`: see the module docs.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoCheckParsedTime {
+    signature: Signature,
+}
+
+impl Default for TrinoCheckParsedTime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoCheckParsedTime {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoCheckParsedTime {
+    fn name(&self) -> &str {
+        "trino_check_parsed_time"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(arg_types[0].clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let texts = string_array("date_parse", &args.args[0], rows)?;
+        let formats = string_array("date_parse", &args.args[1], rows)?;
+        for i in 0..rows {
+            if texts.is_null(i) || formats.is_null(i) {
+                continue;
+            }
+            check_parsed_time(texts.value(i), formats.value(i))?;
+        }
+        Ok(args.args[0].clone())
+    }
 }
 
 fn is_date_or_timestamp(data_type: &DataType) -> bool {
@@ -195,6 +270,13 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn leap_seconds_are_refused_like_joda() {
+        check_parsed_time("2024-01-05 10:30:59", "%Y-%m-%d %H:%M:%S").unwrap();
+        check_parsed_time("garbage", "%Y-%m-%d %H:%M:%S").unwrap();
+        let err = check_parsed_time("2024-01-05 10:30:60", "%Y-%m-%d %H:%M:%S").unwrap_err();
+        assert!(err.to_string().contains("secondOfMinute"), "{err}");
+    }
     #[test]
     fn truncation_follows_trino_units() {
         let t = ts(2024, 2, 14, 8, 30, 45);

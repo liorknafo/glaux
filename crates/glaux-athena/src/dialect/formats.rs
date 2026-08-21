@@ -155,31 +155,37 @@ pub fn joda_to_chrono(
             i += 1;
         }
         let n = i - start;
+        // Joda pads a numeric field to at least `n` digits (`D` prints 5,
+        // `DDD` 005, `yyyyy` 02024); chrono has a fixed width per
+        // specifier plus the `%-` (no padding) flag, so only the counts
+        // chrono can reproduce are mapped and the others are refused.
         let mapped: &str = match (c, n) {
-            ('y', _) | ('Y', _) if n == 2 => "%y",
-            ('y', _) | ('Y', _) => "%Y",
+            ('y', 2) | ('Y', 2) => "%y",
+            ('y', 1..=4) | ('Y', 1..=4) => "%Y",
             ('x', 2) => "%g",
-            ('x', _) => "%G",
+            ('x', 1 | 3 | 4) => "%G",
             ('M', 1) => "%-m",
             ('M', 2) => "%m",
             ('M', 3) => "%b",
             ('M', _) => "%B",
             ('d', 1) => "%-d",
-            ('d', _) => "%d",
-            ('D', _) => "%j",
+            ('d', 2) => "%d",
+            ('D', 1) => "%-j",
+            ('D', 3) => "%j",
             ('E', n) if n < 4 => "%a",
             ('E', _) => "%A",
-            ('e', _) => "%u",
-            ('w', _) => "%V",
+            ('e', 1) => "%u",
+            ('w', 1) => "%-V",
+            ('w', 2) => "%V",
             ('a', _) => "%p",
             ('H', 1) => "%-H",
-            ('H', _) => "%H",
+            ('H', 2) => "%H",
             ('h', 1) => "%-I",
-            ('h', _) => "%I",
+            ('h', 2) => "%I",
             ('m', 1) => "%-M",
-            ('m', _) => "%M",
+            ('m', 2) => "%M",
             ('s', 1) => "%-S",
-            ('s', _) => "%S",
+            ('s', 2) => "%S",
             ('S', 3) => "%3f",
             ('S', 6) => "%6f",
             ('S', 9) => "%9f",
@@ -208,6 +214,32 @@ pub fn joda_to_chrono(
                     format!(
                         "Joda pattern letter '{}' (x{n}) in {pattern:?} is not supported by glaux",
                         c
+                    ),
+                ));
+            }
+            ('y', _)
+            | ('Y', _)
+            | ('x', _)
+            | ('d', _)
+            | ('D', _)
+            | ('e', _)
+            | ('w', _)
+            | ('H', _)
+            | ('h', _)
+            | ('m', _)
+            | ('s', _) => {
+                return Err(GlauxSqlError::invalid_arguments(
+                    function,
+                    format!(
+                        "Joda pattern letter '{c}' (x{n}) in {pattern:?}: Joda pads this \
+                         numeric field to at least {n} digits, which glaux cannot reproduce; \
+                         use a count glaux supports ({})",
+                        match c {
+                            'y' | 'Y' | 'x' => "1-4 letters",
+                            'D' => "D or DDD",
+                            'e' => "a single letter",
+                            _ => "1 or 2 letters",
+                        }
                     ),
                 ));
             }
@@ -306,6 +338,30 @@ mod tests {
             err.to_string().contains("timestamp with time zone"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn joda_numeric_fields_honour_the_letter_count() {
+        assert_eq!(
+            joda_to_chrono(
+                "format_datetime",
+                "D DDD w ww d dd y yyy e",
+                Direction::Format
+            )
+            .unwrap(),
+            "%-j %j %-V %V %-d %d %Y %Y %u"
+        );
+        for (pattern, letter) in [
+            ("DD", "'D' (x2)"),
+            ("yyyyy", "'y' (x5)"),
+            ("www", "'w' (x3)"),
+            ("ddd", "'d' (x3)"),
+            ("HHH", "'H' (x3)"),
+            ("ee", "'e' (x2)"),
+        ] {
+            let err = joda_to_chrono("format_datetime", pattern, Direction::Format).unwrap_err();
+            assert!(err.to_string().contains(letter), "{pattern}: {err}");
+        }
     }
 
     #[test]

@@ -23,7 +23,6 @@ SELECT id,
        reverse(ARRAY[1, 2, 3]) AS rev_arr,
        array_sort(ARRAY[3, NULL, 1]) AS sorted_nulls_last,
        cardinality(split('', ',')) AS split_empty_n,
-       split('abc', '') AS split_chars,
        flatten(ARRAY[ARRAY[1, 2], ARRAY[3]]) AS flat
 FROM customers
 ORDER BY id

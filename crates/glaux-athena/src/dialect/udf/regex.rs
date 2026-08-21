@@ -87,9 +87,15 @@ const VERTICAL_SPACE: &str = "\\n\\x0B\\f\\r\\x85\\x{2028}\\x{2029}";
 ///   Unicode classes) and Rust's (Unicode mode / lazy quantifiers) differ;
 ///   `m`, `s`, `i`, `x` agree, and an `m` flag leaves `$` alone.
 ///
+/// - possessive quantifiers (`a*+`, `a++`, `a?+`, `a{n,m}+`) are refused:
+///   Rust's `regex` would read the trailing `+` as a second, ordinary
+///   (backtracking) quantifier, so `regexp_like('aaa', 'a*+a')` would be
+///   true where Java's possessive repetition never gives back and returns
+///   false.
+///
 /// Everything else is passed through; Java syntax Rust lacks (look-around,
-/// back-references, possessive quantifiers, `\Q..\E`) fails at compile
-/// time as an invalid pattern, never silently.
+/// back-references, atomic groups, `\Q..\E`) fails at compile time as an
+/// invalid pattern, never silently.
 pub fn translate_java_pattern(pattern: &str) -> std::result::Result<String, String> {
     let multiline = has_multiline_flag(pattern);
     let mut out = String::with_capacity(pattern.len() + 8);
@@ -98,7 +104,28 @@ pub fn translate_java_pattern(pattern: &str) -> std::result::Result<String, Stri
     let mut depth = 0usize;
     // Just after `[` or `[^`, where `]` is a literal in Java.
     let mut class_start = false;
+    // The previous character (outside a class) was a quantifier (`*`, `+`,
+    // `?`, or the `}` of `{n,m}`): a `+` here is a possessive suffix.
+    let mut after_quantifier = false;
     while let Some(c) = chars.next() {
+        if depth == 0 {
+            let was_after_quantifier = std::mem::take(&mut after_quantifier);
+            match c {
+                '+' if was_after_quantifier => {
+                    return Err(format!(
+                        "possessive quantifier (`{}+`) in pattern {pattern:?}: Java's \
+                         possessive repetition never backtracks, which glaux's regex engine \
+                         cannot express",
+                        out.chars().last().unwrap_or('?')
+                    ));
+                }
+                '*' | '+' | '?' | '}' if !was_after_quantifier => after_quantifier = true,
+                // A lazy `*?` / `+?` / `??` is a complete quantifier too;
+                // `?` after `?` would be Java's lazy-optional form.
+                '?' => after_quantifier = false,
+                _ => {}
+            }
+        }
         match c {
             '\\' => {
                 let Some(escaped) = chars.next() else {
@@ -578,6 +605,20 @@ impl ScalarUDFImpl for TrinoRegexp {
 mod tests {
     use super::*;
 
+    #[test]
+    fn possessive_quantifiers_are_refused_and_lazy_ones_kept() {
+        for pattern in [
+            "a*+a", "a++a", "a?+ab", "a{1,2}+a", "[ab]++", "(ab)*+", "\\d++",
+        ] {
+            let err = translate_java_pattern(pattern).unwrap_err();
+            assert!(err.contains("possessive quantifier"), "{pattern}: {err}");
+        }
+        for pattern in [
+            "a*?a", "a+?", "a??b", "a{1,2}?", "\\++", "a+b+", "[+]+", "a+\\+",
+        ] {
+            translate_java_pattern(pattern).unwrap_or_else(|e| panic!("{pattern}: {e}"));
+        }
+    }
     #[test]
     fn replacement_references_are_validated_against_the_pattern() {
         let re = Regex::new("(?<x>b)(c)?").unwrap();
