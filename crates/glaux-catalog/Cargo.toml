@@ -1,0 +1,19 @@
+[package]
+name = "glaux-catalog"
+description = "Glue Data Catalog client, DataFusion catalog provider, and S3 object-store backends"
+license = "Apache-2.0"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+async-trait = { workspace = true }
+datafusion = { workspace = true }
+object_store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
