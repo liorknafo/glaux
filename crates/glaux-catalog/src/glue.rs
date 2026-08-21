@@ -9,7 +9,7 @@
 //! only piece that genuinely needs battle-tested code — request signing for
 //! real AWS — is exactly what `aws-sigv4` provides.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
@@ -182,9 +182,21 @@ struct GlueErrorBody {
     message: Option<String>,
 }
 
+/// Upper bound on establishing a TCP/TLS connection to the Glue endpoint.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on one complete Glue request/response exchange.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upper bound on pages followed by one paginated listing. Glue pages hold
+/// up to 1000 items, so this allows ten million entries per listing.
+const MAX_PAGES: usize = 10_000;
+
 impl NetworkGlueApi {
     /// Build a client from the unified configuration.
-    pub fn new(config: &GlauxConfig) -> Self {
+    ///
+    /// Fails if the underlying HTTP client cannot be constructed (e.g. the
+    /// TLS backend fails to initialise); there is no fallback to an
+    /// unbounded client.
+    pub fn new(config: &GlauxConfig) -> Result<Self> {
         let endpoint = config
             .glue_endpoint
             .clone()
@@ -222,12 +234,17 @@ impl NetworkGlueApi {
                 ),
             },
         };
-        Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|source| CatalogError::GlueClient { source })?;
+        Ok(Self {
             endpoint,
             region: config.region.clone(),
             credentials,
-            client: reqwest::Client::new(),
-        }
+            client,
+        })
     }
 
     /// Invoke a raw Glue action (`X-Amz-Target: AWSGlue.<action>`) with a
@@ -366,7 +383,7 @@ impl NetworkGlueApi {
     ) -> Result<Vec<T>> {
         let mut items = Vec::new();
         let mut next_token: Option<String> = None;
-        loop {
+        for page_index in 0..MAX_PAGES {
             let mut payload = base_payload.clone();
             if let Some(token) = &next_token {
                 payload
@@ -375,25 +392,44 @@ impl NetworkGlueApi {
                     .insert("NextToken".to_string(), Value::String(token.clone()));
             }
             let mut response = self.invoke(action, payload).await?;
-            let page = response
-                .get_mut(list_key)
-                .map(Value::take)
-                .unwrap_or(Value::Array(Vec::new()));
+            // A missing list is a malformed response, not an empty listing:
+            // the trait contract is "complete or fail loudly".
+            let page = response.get_mut(list_key).map(Value::take).ok_or_else(|| {
+                CatalogError::GlueResponseParse {
+                    action,
+                    message: format!("response is missing the {list_key} field"),
+                }
+            })?;
             let page: Vec<T> =
                 serde_json::from_value(page).map_err(|e| CatalogError::GlueResponseParse {
                     action,
                     message: format!("invalid {list_key} entry: {e}"),
                 })?;
             items.extend(page);
-            next_token = response
+            let token = response
                 .get("NextToken")
                 .and_then(Value::as_str)
                 .filter(|t| !t.is_empty())
                 .map(str::to_string);
-            if next_token.is_none() {
+            let Some(token) = token else {
                 return Ok(items);
+            };
+            // An endpoint that echoes the token back would loop forever.
+            if next_token.as_deref() == Some(token.as_str()) {
+                return Err(CatalogError::GlueResponseParse {
+                    action,
+                    message: format!(
+                        "NextToken {token:?} repeated on page {}; pagination is not advancing",
+                        page_index + 1
+                    ),
+                });
             }
+            next_token = Some(token);
         }
+        Err(CatalogError::GlueResponseParse {
+            action,
+            message: format!("listing exceeded {MAX_PAGES} pages without completing"),
+        })
     }
 }
 

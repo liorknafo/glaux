@@ -209,6 +209,21 @@ fn csv_format(
         .transpose()
         .map_err(&invalid)?;
 
+    // Arrow's CSV reader always splits records on `\n`; a table declaring
+    // any other record terminator would be read as one giant row, so it is
+    // rejected rather than misread. (`collection.delim` / `mapkey.delim`
+    // only matter for array/map/struct columns, which the CSV reader
+    // already rejects by type.)
+    if let Some(line_delim) = serde_params.get("line.delim") {
+        let byte = single_byte("line.delim", line_delim).map_err(&invalid)?;
+        if byte != b'\n' {
+            return Err(invalid(format!(
+                "line.delim = {line_delim:?} is not supported (the CSV reader splits records on \
+                 newline only)"
+            )));
+        }
+    }
+
     // `skip.header.line.count` may live in table parameters (Athena
     // TBLPROPERTIES), the storage descriptor, or the SerDe parameters.
     let header_lines = table
@@ -388,6 +403,18 @@ mod tests {
         let table = table_with(descriptor.clone());
         let err = file_format_for_table("db", &table, &descriptor).unwrap_err();
         assert!(err.to_string().contains("skip.header.line.count"), "{err}");
+    }
+
+    #[test]
+    fn non_newline_line_delim_errors() {
+        let descriptor = sd(Some(LAZY_SIMPLE_SERDE), &[("line.delim", "|")]);
+        let table = table_with(descriptor.clone());
+        let err = file_format_for_table("db", &table, &descriptor).unwrap_err();
+        assert!(err.to_string().contains("line.delim"), "{err}");
+
+        let descriptor = sd(Some(LAZY_SIMPLE_SERDE), &[("line.delim", "\\n")]);
+        let table = table_with(descriptor.clone());
+        assert!(file_format_for_table("db", &table, &descriptor).is_ok());
     }
 
     #[test]
