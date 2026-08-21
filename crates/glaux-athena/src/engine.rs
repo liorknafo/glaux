@@ -262,7 +262,7 @@ fn classify(err: DataFusionError) -> EngineError {
     let root_message = err.find_root().to_string();
     let data = |code: &str| EngineError::Data {
         code: code.to_string(),
-        message: root_message.clone(),
+        message: runtime_message(&root_message),
     };
     match err.find_root() {
         DataFusionError::SQL(..)
@@ -404,8 +404,19 @@ fn classify(err: DataFusionError) -> EngineError {
         DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
             ArrowError::CastError(_) => data("INVALID_CAST_ARGUMENT"),
             ArrowError::ParseError(_) => data("INVALID_FUNCTION_ARGUMENT"),
-            ArrowError::DivideByZero => data("DIVISION_BY_ZERO"),
+            // Arrow's own wording is "Divide by zero error"; Trino's is the
+            // sentence glaux's decimal path already uses.
+            ArrowError::DivideByZero => EngineError::Data {
+                code: "DIVISION_BY_ZERO".to_string(),
+                message: "Division by zero".to_string(),
+            },
             ArrowError::ArithmeticOverflow(_) => data("NUMERIC_VALUE_OUT_OF_RANGE"),
+            // Arrow reports an integer kernel's overflow as a compute error
+            // ("Int64Array overflow on abs(-9223372036854775808)"); Trino
+            // reports NUMERIC_VALUE_OUT_OF_RANGE for all of them.
+            ArrowError::ComputeError(message) if message.contains("overflow") => {
+                data("NUMERIC_VALUE_OUT_OF_RANGE")
+            }
             ArrowError::ComputeError(_)
             | ArrowError::InvalidArgumentError(_)
             | ArrowError::NotYetImplemented(_)
@@ -415,9 +426,65 @@ fn classify(err: DataFusionError) -> EngineError {
         // DataFusion raises `Execution` for data problems its kernels
         // detect themselves (format-string parse failures, bad function
         // arguments at runtime). Engine-internal failures use `Internal`.
-        DataFusionError::Execution(_) => data("GENERIC_USER_ERROR"),
+        DataFusionError::Execution(message) => runtime_execution_error(message, data),
         _ => EngineError::Execution(err.to_string()),
     }
+}
+
+/// Trino's code and wording for the runtime failures DataFusion reports as
+/// plain `Execution` errors, which would otherwise all be
+/// `GENERIC_USER_ERROR` with the kernel's own text.
+fn runtime_execution_error(message: &str, data: impl Fn(&str) -> EngineError) -> EngineError {
+    // `chr(1114112)`: Trino's `chr` refuses anything outside the Unicode
+    // range with INVALID_FUNCTION_ARGUMENT.
+    if message.contains("invalid Unicode scalar value") {
+        return EngineError::InvalidArgument {
+            function: "chr".to_string(),
+            message: "Not a valid Unicode code point".to_string(),
+        };
+    }
+    // `date_parse('2024-13-05', '%Y-%m-%d')`: an unparsable input is
+    // INVALID_FUNCTION_ARGUMENT on Trino, not a generic user error.
+    if let Some(rest) = message.strip_prefix("Error parsing timestamp from ") {
+        return EngineError::InvalidArgument {
+            function: "date_parse".to_string(),
+            message: format!("cannot parse timestamp from {rest}"),
+        };
+    }
+    if message.contains("Scalar subquery returned more than one row") {
+        return EngineError::Data {
+            code: "SUBQUERY_MULTIPLE_ROWS".to_string(),
+            message: "Scalar sub-query has returned multiple rows".to_string(),
+        };
+    }
+    data("GENERIC_USER_ERROR")
+}
+
+/// Arrow and DataFusion name the layer that raised a runtime diagnostic
+/// ("Arrow error: Compute error: ..."); Trino's messages carry the reason
+/// alone, so the wrappers are peeled off before the client sees them.
+fn runtime_message(message: &str) -> String {
+    let mut text = message;
+    for prefix in [
+        "Arrow error: ",
+        "Compute error: ",
+        "Cast error: ",
+        "Invalid argument error: ",
+        "Arithmetic overflow: ",
+        "Parser error: ",
+        "Execution error: ",
+    ] {
+        text = text.strip_prefix(prefix).unwrap_or(text);
+    }
+    // Arrow names the array type in its integer-kernel overflows
+    // ("Int64Array overflow on abs(...)"); Trino names the SQL type.
+    if let Some((array_type, rest)) = text.split_once("Array overflow on ") {
+        let name = trino_type_tokens(array_type);
+        if name != array_type {
+            return format!("{name} overflow on {rest}");
+        }
+    }
+    text.to_string()
 }
 
 /// Best-effort mapping of the Arrow type names in a coercion diagnostic
@@ -652,7 +719,7 @@ mod tests {
         ));
         assert_eq!(
             err.to_string(),
-            "INVALID_CAST_ARGUMENT: Arrow error: Cast error: Cannot cast string '9999999999' to value of Int32 type"
+            "INVALID_CAST_ARGUMENT: Cannot cast string '9999999999' to value of Int32 type"
         );
     }
 

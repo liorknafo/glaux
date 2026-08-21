@@ -1550,7 +1550,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Runtime errors",
         category: "Semantics",
         status: ConstructStatus::Supported,
-        notes: "Failures caused by the query's data (an invalid cast, an unparsable date, a bad subscript, an invalid regular expression, a missing regexp group) are user errors (Athena `ErrorCategory` 2) with Trino's error code; only I/O and engine failures are category 1.",
+        notes: "Failures caused by the query's data (an invalid cast, an unparsable date, a bad subscript, an invalid regular expression, a missing regexp group) are user errors (Athena `ErrorCategory` 2) with Trino's error code; only I/O and engine failures are category 1. The codes follow Trino: integer overflow in a kernel is `NUMERIC_VALUE_OUT_OF_RANGE` (`abs(-9223372036854775808)`), `chr` outside the Unicode range and an unparsable `date_parse` input are `INVALID_FUNCTION_ARGUMENT`, and a scalar subquery returning several rows is `SUBQUERY_MULTIPLE_ROWS`. The messages name the reason alone: Arrow's and DataFusion's layer prefixes (`Arrow error: Compute error: `, `Execution error: `) and array-type names are stripped, and division by zero says `Division by zero` whether the operands are integers, doubles, or decimals.",
         corpus_marker: "CAST('abc' AS INTEGER)",
     },
     Construct {
