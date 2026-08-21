@@ -18,6 +18,12 @@ SELECT id,
        array_sort(ARRAY[3, 1, 2]) AS sorted,
        array_union(ARRAY[1, 2], ARRAY[2, 3]) AS unioned,
        arrays_overlap(tags, ARRAY['beta', 'gamma']) AS overlaps,
+       arrays_overlap(tags, ARRAY['zzz']) AS overlaps_none,
+       contains(tags, 'zzz') AS contains_none,
+       reverse(ARRAY[1, 2, 3]) AS rev_arr,
+       array_sort(ARRAY[3, NULL, 1]) AS sorted_nulls_last,
+       cardinality(split('', ',')) AS split_empty_n,
+       split('abc', '') AS split_chars,
        flatten(ARRAY[ARRAY[1, 2], ARRAY[3]]) AS flat
 FROM customers
 ORDER BY id

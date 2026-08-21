@@ -8,4 +8,5 @@ SELECT abs(-3.5) AS a, ceil(1.2) AS c, ceiling(1.2) AS c2, floor(-1.2) AS f,
        sign(-2.5) AS s_neg, sign(0) AS s_zero, sign(7) AS s_pos,
        truncate(2.7) AS t, truncate(-2.7) AS t_neg,
        greatest(1, 5, 3) AS g, least(1, 5, 3) AS l,
+       greatest(1, NULL, 3) AS g_null, least(1.5, 2.5) AS l_dec,
        random() < 2 AS rnd_ok, rand() >= 0 AS rand_ok
