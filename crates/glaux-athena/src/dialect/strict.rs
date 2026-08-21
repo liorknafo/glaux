@@ -286,6 +286,82 @@ fn string_arguments(name: &str) -> &'static [usize] {
     }
 }
 
+/// Argument positions typed `numeric` by Trino, for the DataFusion
+/// functions the registry passes through: DataFusion would parse a varchar
+/// there, or fail with its own planner text (`Function 'abs' expects
+/// Numeric but received String`), where Athena reports `TYPE_MISMATCH`.
+fn numeric_arguments(name: &str) -> &'static [usize] {
+    match name {
+        "abs" | "cbrt" | "ceil" | "chr" | "degrees" | "exp" | "factorial" | "floor" | "ln"
+        | "log10" | "log2" | "radians" | "signum" | "sqrt" | "acos" | "asin" | "atan" | "cos"
+        | "cosh" | "sin" | "sinh" | "tan" | "tanh" | "trunc" | "width_bucket" => &[0],
+        "atan2" | "log" | "power" | "nanvl" => &[0, 1],
+        _ => &[],
+    }
+}
+
+/// Argument positions typed `array` by Trino, same idea.
+fn array_arguments(name: &str) -> &'static [usize] {
+    match name {
+        // (`reverse` is not here: Trino has both `reverse(varchar)` and
+        // `reverse(array)`.)
+        "cardinality" | "array_distinct" | "flatten" | "array_sort" => &[0],
+        "array_union"
+        | "array_intersect"
+        | "array_except"
+        | "trino_arrays_overlap"
+        | "trino_array_concat" => &[0, 1],
+        _ => &[],
+    }
+}
+
+/// Aggregates Trino declares only over numeric or only over boolean
+/// arguments; DataFusion refuses the mismatch with an `Internal error:
+/// Function 'sum' failed to match any signature ...` that ends in an
+/// invitation to file a DataFusion bug report.
+fn aggregate_argument_class(name: &str) -> Option<(Class, &'static str)> {
+    match name {
+        "sum" | "avg" | "stddev" | "stddev_pop" | "stddev_samp" | "var_pop" | "var_samp"
+        | "variance" | "corr" | "covar_pop" | "covar_samp" | "regr_slope" | "regr_intercept"
+        | "checked_int_sum" | "trino_decimal_sum" | "trino_decimal_avg" | "trino_real_sum"
+        | "trino_real_avg" => Some((Class::Number, "a numeric argument")),
+        "bool_and" | "bool_or" => Some((Class::Boolean, "a boolean argument")),
+        _ => None,
+    }
+}
+
+/// `TYPE_MISMATCH: Unexpected parameters (varchar) for function abs:
+/// expected a numeric argument`, Trino's shape for a signature that has no
+/// overload for the argument type.
+fn unexpected_parameters(name: &str, actual: &DataType, expected: &str) -> GlauxSqlError {
+    GlauxSqlError::type_mismatch(format!(
+        "Unexpected parameters ({}) for function {}: expected {expected}",
+        trino_type_name(actual),
+        trino_function_name(name)
+    ))
+}
+
+/// Refuse a function call whose argument at `index` is not of `class`.
+fn check_argument_class(
+    name: &str,
+    args: &[Expr],
+    index: usize,
+    class_wanted: Class,
+    expected: &str,
+    schema: &DFSchema,
+) -> Result<(), GlauxSqlError> {
+    let Some(arg) = args.get(index) else {
+        return Ok(());
+    };
+    let Ok(t) = arg.get_type(schema) else {
+        return Ok(());
+    };
+    if class(&t) == class_wanted || class(&t) == Class::Null || class(&t) == Class::Other {
+        return Ok(());
+    }
+    Err(unexpected_parameters(name, &t, expected))
+}
+
 /// Whether Trino has a cast between these type classes (varchar sources are
 /// validated at run time; the pairs here are the ones Trino refuses at
 /// planning, such as `CAST(DATE ... AS BIGINT)` or `CAST(12 AS DATE)`).
@@ -411,6 +487,30 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
         }
         Expr::Cast(cast) => check_cast(&cast.expr, cast.field.data_type(), schema),
         Expr::TryCast(cast) => check_cast(&cast.expr, cast.field.data_type(), schema),
+        // `sum(varchar)` / `bool_and(bigint)`: Trino has no such overload
+        // and reports `TYPE_MISMATCH`, where DataFusion's signature
+        // matcher raises an `Internal error` that asks the user to file a
+        // DataFusion bug report.
+        Expr::AggregateFunction(agg) => {
+            let name = agg.func.name();
+            let Some((wanted, expected)) = aggregate_argument_class(name) else {
+                return Ok(());
+            };
+            for index in 0..agg.params.args.len() {
+                check_argument_class(name, &agg.params.args, index, wanted, expected, schema)?;
+            }
+            Ok(())
+        }
+        Expr::WindowFunction(window) => {
+            let name = window.fun.name().to_string();
+            let Some((wanted, expected)) = aggregate_argument_class(&name) else {
+                return Ok(());
+            };
+            for index in 0..window.params.args.len() {
+                check_argument_class(&name, &window.params.args, index, wanted, expected, schema)?;
+            }
+            Ok(())
+        }
         Expr::ScalarFunction(call) => {
             let name = call.func.name();
             match name {
@@ -446,6 +546,26 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
                              date_parse or CAST)",
                             trino_type_name(&t)
                         )));
+                    }
+                    for index in numeric_arguments(name) {
+                        check_argument_class(
+                            name,
+                            &call.args,
+                            *index,
+                            Class::Number,
+                            "a numeric argument",
+                            schema,
+                        )?;
+                    }
+                    for index in array_arguments(name) {
+                        check_argument_class(
+                            name,
+                            &call.args,
+                            *index,
+                            Class::Array,
+                            "an array",
+                            schema,
+                        )?;
                     }
                     for index in string_arguments(name) {
                         if let Some(arg) = call.args.get(*index)

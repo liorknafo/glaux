@@ -1057,11 +1057,11 @@ pub static FUNCTIONS: &[FunctionShim] = &[
     ),
     shim!(
         "random",
-        "random() → double",
+        "random() → double, random(n) → same integer type as n",
         "Math",
-        Passthrough,
-        "DataFusion `random`",
-        ["random"]
+        Rewrite,
+        "DataFusion `random` for the nullary form; the bounded overload becomes the Rust UDF `trino_random(n, random())`, a uniform value in `[0, n)` with `n`'s own type and an `INVALID_FUNCTION_ARGUMENT` for `n <= 0`, as in Trino.",
+        ["random", "trino_random"]
     ),
     shim!(
         "round",
@@ -1543,7 +1543,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Operator type checking",
         category: "Semantics",
         status: ConstructStatus::Supported,
-        notes: "Comparisons, arithmetic (`1 + '2'`), `||`, `LIKE` over non-varchar operands (`1 LIKE '1'`, refused with Trino's \"must evaluate to a varchar\" diagnostic), `IN` (lists and subqueries), `BETWEEN`, join keys, simple `CASE` operands, `CASE` / `if` / `nullif` / `coalesce` / `greatest` / `least` results, and set-operation columns between types Trino does not combine (`varchar = integer`, `'a' || 1`, `date = varchar`) are refused with `TYPE_MISMATCH` instead of being coerced, and the date-part functions (`year`, `date_trunc`, `date_format`, `to_unixtime`, `EXTRACT`) refuse varchar arguments. Numeric types compare with each other and `date` with `timestamp`, as in Trino.",
+        notes: "Comparisons, arithmetic (`1 + '2'`), `||`, `LIKE` over non-varchar operands (`1 LIKE '1'`, refused with Trino's \"must evaluate to a varchar\" diagnostic), `IN` (lists and subqueries), `BETWEEN`, join keys, simple `CASE` operands, `CASE` / `if` / `nullif` / `coalesce` / `greatest` / `least` results, and set-operation columns between types Trino does not combine (`varchar = integer`, `'a' || 1`, `date = varchar`) are refused with `TYPE_MISMATCH` instead of being coerced, and the date-part functions (`year`, `date_trunc`, `date_format`, `to_unixtime`, `EXTRACT`) refuse varchar arguments. Numeric types compare with each other and `date` with `timestamp`, as in Trino. Function arguments are checked the same way: an argument type Trino has no overload for is `TYPE_MISMATCH: Unexpected parameters (varchar) for function abs` (aggregates included — `sum(varchar)` used to leak DataFusion's `Internal error: Function 'sum' failed to match any signature ...`, which ends in an invitation to file a DataFusion bug report). The boolean contexts follow Trino too: `true AND 1` is `Logical expression term must evaluate to a boolean (actual: bigint)`, `NOT 1` is `Value of logical NOT expression must evaluate to a boolean (actual: bigint)`, and `WHERE 1` is `WHERE clause must evaluate to a boolean: actual type bigint`. A unary `-` over a non-numeric operand is refused as well (DataFusion does not name the operand type there, so the message cannot either), and a window function written without `OVER` is refused by name instead of DataFusion's `Invalid function 'rank'.`.",
         corpus_marker: "'1' = 1",
     },
     Construct {

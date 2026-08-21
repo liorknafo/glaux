@@ -50,7 +50,94 @@ pub fn all() -> Vec<ScalarUDF> {
     .into_iter()
     .map(|op| ScalarUDF::new_from_impl(TrinoMath::new(op)))
     .chain(std::iter::once(ScalarUDF::new_from_impl(TrinoSqrt::new())))
+    .chain(std::iter::once(ScalarUDF::new_from_impl(
+        TrinoRandomBound::new(),
+    )))
     .collect()
+}
+
+/// `trino_random(n, r)`: Trino's bounded `random(n)` overload — a uniform
+/// value in `[0, n)` with `n`'s own integer type, an
+/// `INVALID_FUNCTION_ARGUMENT` for `n <= 0`. `r` is DataFusion's `random()`
+/// draw in `[0, 1)`, which the rewriter passes in so the randomness (and
+/// the per-row volatility) stays DataFusion's.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoRandomBound {
+    signature: Signature,
+}
+
+impl Default for TrinoRandomBound {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoRandomBound {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Volatile),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoRandomBound {
+    fn name(&self) -> &str {
+        "trino_random"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        match &arg_types[0] {
+            // Trino declares `random(integer) -> integer` and
+            // `random(bigint) -> bigint`; the narrower integer types widen
+            // to `integer`, as they do everywhere else.
+            DataType::Int8 | DataType::Int16 | DataType::Int32 => Ok(DataType::Int32),
+            DataType::Int64 => Ok(DataType::Int64),
+            other => Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function random: expected random() or \
+                 random(integer) / random(bigint)",
+                trino_type_name(other)
+            ))),
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let wide = args.return_field.data_type() == &DataType::Int64;
+        let bounds = cast(&args.args[0].to_array(rows)?, &DataType::Int64)?;
+        let bounds = bounds.as_primitive::<Int64Type>();
+        let draws = cast(&args.args[1].to_array(rows)?, &DataType::Float64)?;
+        let draws = draws.as_primitive::<Float64Type>();
+        let mut out: Vec<Option<i64>> = Vec::with_capacity(rows);
+        for i in 0..rows {
+            if bounds.is_null(i) {
+                out.push(None);
+                continue;
+            }
+            let bound = bounds.value(i);
+            if bound <= 0 {
+                return Err(super::user_error(
+                    "random",
+                    format!("bound must be positive (got {bound})"),
+                ));
+            }
+            // `floor(r · bound)` with r in [0, 1) is uniform on [0, bound);
+            // the clamp guards the rounding edge only.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+            let value = ((draws.value(i) * bound as f64) as i64).clamp(0, bound - 1);
+            out.push(Some(value));
+        }
+        let array: ArrayRef = Arc::new(PrimitiveArray::<Int64Type>::from_iter(out));
+        Ok(ColumnarValue::Array(if wide {
+            array
+        } else {
+            cast(&array, &DataType::Int32)?
+        }))
+    }
 }
 
 /// `trino_sqrt(x)`: Java's `Math.sqrt` — `NaN` for a negative argument

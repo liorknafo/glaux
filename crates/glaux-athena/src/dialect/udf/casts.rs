@@ -28,7 +28,7 @@ use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Decimal128Type, Float32Type, Float64Type, Int64Type,
 };
 use arrow::util::display::ArrayFormatter;
-use datafusion::common::{Result, plan_err};
+use datafusion::common::Result;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
@@ -484,7 +484,10 @@ impl ScalarUDFImpl for TrinoVarchar {
                 | DataType::BinaryView
                 | DataType::FixedSizeBinary(_)
         ) {
-            return plan_err!("Cannot cast {} to varchar", trino_type_name(&arg_types[0]));
+            return Err(type_mismatch(format!(
+                "Cannot cast {} to varchar",
+                trino_type_name(&arg_types[0])
+            )));
         }
         Ok(DataType::Utf8)
     }

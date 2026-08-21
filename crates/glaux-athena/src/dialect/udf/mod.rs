@@ -44,7 +44,7 @@ use arrow::array::{
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{DateTime, Datelike, Months, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta};
-use datafusion::common::{DataFusionError, Result, ScalarValue, plan_err};
+use datafusion::common::{DataFusionError, Result, ScalarValue};
 
 use super::error::GlauxSqlError;
 use casts::trino_type_name;
@@ -529,15 +529,20 @@ impl ScalarUDFImpl for DateAdd {
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         if !is_integer(&arg_types[1]) && !matches!(arg_types[1], DataType::Null) {
-            return plan_err!(
-                "date_add: value must be an integer, got {}; Trino does not truncate \
-                 fractional values (use date_add with a finer unit instead)",
-                arg_types[1]
-            );
+            return Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function date_add: the value must be an \
+                 integer (Trino does not truncate fractional values; use date_add with a \
+                 finer unit instead)",
+                trino_type_name(&arg_types[1])
+            )));
         }
         match &arg_types[2] {
             t @ (DataType::Date32 | DataType::Timestamp(_, _)) => Ok(t.clone()),
-            other => plan_err!("date_add: third argument must be a DATE or TIMESTAMP, got {other}"),
+            other => Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function date_add: the third argument must \
+                 be a date or timestamp",
+                trino_type_name(other)
+            ))),
         }
     }
 
@@ -619,10 +624,12 @@ impl ScalarUDFImpl for DateDiff {
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         for (i, t) in arg_types[1..].iter().enumerate() {
             if !matches!(t, DataType::Date32 | DataType::Timestamp(_, _)) {
-                return plan_err!(
-                    "date_diff: argument {} must be a DATE or TIMESTAMP, got {t}",
+                return Err(type_mismatch(format!(
+                    "Unexpected parameters ({}) for function date_diff: argument {} must be \
+                     a date or timestamp",
+                    trino_type_name(t),
                     i + 2
-                );
+                )));
             }
         }
         Ok(DataType::Int64)

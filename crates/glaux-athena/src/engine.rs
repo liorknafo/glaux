@@ -311,6 +311,94 @@ fn classify(err: DataFusionError) -> EngineError {
                     trino_type_tokens(found.trim_end_matches('.'))
                 ));
             }
+            // Trino types the operands of `AND` / `OR`, `NOT`, and a
+            // `WHERE` / `HAVING` predicate as boolean and reports
+            // TYPE_MISMATCH with the sentences below; DataFusion phrases the
+            // same refusals in its own words and Arrow type names.
+            if let Some(rest) = root_message.strip_prefix(
+                "Error during planning: Cannot infer common argument type \
+                     for logical boolean operation ",
+            ) {
+                let actual = rest
+                    .split(' ')
+                    .find(|token| *token != "Boolean" && !matches!(*token, "AND" | "OR"))
+                    .unwrap_or(rest);
+                return EngineError::TypeMismatch(format!(
+                    "Logical expression term must evaluate to a boolean (actual: {})",
+                    trino_type_tokens(actual)
+                ));
+            }
+            if let Some(rest) = root_message.strip_prefix(
+                "Error during planning: Unary operator 'NOT' requires a \
+                     boolean expression, got ",
+            ) {
+                return EngineError::TypeMismatch(format!(
+                    "Value of logical NOT expression must evaluate to a boolean (actual: {})",
+                    trino_type_tokens(rest)
+                ));
+            }
+            if root_message.starts_with(
+                "Error during planning: Cannot create filter with non-boolean predicate",
+            ) && let Some((_, actual)) = root_message.rsplit_once(" returning ")
+            {
+                return EngineError::TypeMismatch(format!(
+                    "WHERE clause must evaluate to a boolean: actual type {}",
+                    trino_type_tokens(actual)
+                ));
+            }
+            // DataFusion does not name the operand type of a unary minus it
+            // refuses, so neither can the message.
+            if root_message.starts_with(
+                "Error during planning: Unary operator '-' only supports signed numeric",
+            ) {
+                return EngineError::TypeMismatch(
+                    "Cannot negate the operand of unary '-': Trino has a negation \
+                     operator only for numeric and interval types"
+                        .to_string(),
+                );
+            }
+            // Function resolution: DataFusion appends "No function matches
+            // the given name and argument types 'abs(Utf8)'" (plus an
+            // invitation to file a DataFusion bug report, for aggregates).
+            // Every name that gets this far is in glaux's coverage table, so
+            // the failure is always the argument types or the arity —
+            // Trino's `Unexpected parameters (...) for function ...`.
+            if let Some(call) = root_message
+                .split("No function matches the given name and argument types '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                && let Some((name, args)) = call.strip_suffix(')').and_then(|c| c.split_once('('))
+            {
+                return EngineError::TypeMismatch(format!(
+                    "Unexpected parameters ({}) for function {name}",
+                    trino_type_list(args)
+                ));
+            }
+            // A window function written without `OVER`: DataFusion cannot
+            // resolve it as a scalar or aggregate and says `Invalid
+            // function 'rank'.`. Every name that reaches the planner is in
+            // glaux's coverage table, so the missing `OVER` is the cause.
+            if let Some(name) = root_message
+                .strip_prefix("Error during planning: Invalid function '")
+                .and_then(|rest| rest.split('\'').next())
+            {
+                return EngineError::InvalidArgument {
+                    function: name.to_string(),
+                    message: format!(
+                        "{name} is a window function and requires an OVER clause, as in Trino"
+                    ),
+                };
+            }
+            if let Some(name) = root_message
+                .split("Function '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                && root_message.contains("failed to match any signature")
+            {
+                return EngineError::TypeMismatch(format!(
+                    "Unexpected parameters for function {name}: no signature accepts these                      argument types"
+                ));
+            }
             EngineError::Plan(err.to_string())
         }
         DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
@@ -351,6 +439,14 @@ fn trino_type_tokens(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The Trino names of a comma-separated Arrow type list ("Utf8, Int64").
+fn trino_type_list(text: &str) -> String {
+    text.split(", ")
+        .map(trino_type_tokens)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub(crate) fn execution_error(err: DataFusionError) -> EngineError {

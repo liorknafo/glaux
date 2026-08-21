@@ -28,7 +28,7 @@ use arrow::array::{
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::{SortOptions, cast, sort_to_indices, take};
 use arrow::datatypes::{DataType, Field};
-use datafusion::common::{DataFusionError, Result, ScalarValue, plan_err};
+use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
@@ -78,10 +78,10 @@ fn as_list(function: &str, input: ArrayRef) -> Result<ListArray> {
             cast(&input, &target)?
         }
         other => {
-            return plan_err!(
-                "{function}: expected an array, got {}",
+            return Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function {function}: expected an array",
                 trino_type_name(other)
-            );
+            )));
         }
     };
     Ok(list.as_list::<i32>().clone())
@@ -92,10 +92,10 @@ fn as_list(function: &str, input: ArrayRef) -> Result<ListArray> {
 /// `TYPE_MISMATCH` on Athena.
 fn check_element_comparable(function: &str, array: &DataType, value: &DataType) -> Result<()> {
     let Some(element) = element_type(array) else {
-        return plan_err!(
-            "{function}: expected an array, got {}",
+        return Err(type_mismatch(format!(
+            "Unexpected parameters ({}) for function {function}: expected an array",
             trino_type_name(array)
-        );
+        )));
     };
     if comparable(element, value) {
         Ok(())
@@ -196,11 +196,11 @@ impl ScalarUDFImpl for TrinoElementAt {
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         match element_type(&arg_types[0]) {
             Some(t) => Ok(t.clone()),
-            None => plan_err!(
-                "{}: expected an array, got {}",
-                self.function(),
-                trino_type_name(&arg_types[0])
-            ),
+            None => Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function {}: expected an array",
+                trino_type_name(&arg_types[0]),
+                self.function()
+            ))),
         }
     }
 
@@ -219,10 +219,10 @@ impl ScalarUDFImpl for TrinoElementAt {
                 cast(&input, &target)?
             }
             other => {
-                return plan_err!(
-                    "{function}: expected an array, got {}",
+                return Err(type_mismatch(format!(
+                    "Unexpected parameters ({}) for function {function}: expected an array",
                     trino_type_name(other)
-                );
+                )));
             }
         };
         let list = list.as_list::<i32>();

@@ -2283,6 +2283,16 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             )
         }
         "rand" => return simple_rename("random", &[0]),
+        // Trino has a bounded overload, `random(n) -> [0, n)`, that
+        // DataFusion's nullary `random()` does not; the draw itself stays
+        // DataFusion's.
+        "random" => {
+            arity(name, &args, &[0, 1])?;
+            match args.into_iter().next() {
+                Some(bound) => func("trino_random", vec![bound, func("random", vec![])]),
+                None => func("random", vec![]),
+            }
+        }
         "sign" => return simple_rename("trino_sign", &[1]),
         "sqrt" => return simple_rename("trino_sqrt", &[1]),
         "truncate" => return simple_rename("trino_truncate", &[1, 2]),
