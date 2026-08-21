@@ -104,7 +104,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "approx_distinct(x) → bigint",
         "Aggregate",
         Passthrough,
-        "DataFusion `approx_distinct` (HyperLogLog; estimates differ from Trino's within the usual error bound)",
+        "`CAST(approx_distinct(x) AS BIGINT)` (HyperLogLog; estimates differ from Trino's within the usual error bound)",
         ["approx_distinct"]
     ),
     shim!(
@@ -272,7 +272,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "sum(x)",
         "Aggregate",
         Passthrough,
-        "DataFusion `sum`",
+        "DataFusion `sum`; for integer inputs glaux substitutes an overflow-checked sum so a bigint overflow is an error (`NUMERIC_VALUE_OUT_OF_RANGE`), as in Trino.",
         ["sum"]
     ),
     shim!(
@@ -313,7 +313,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "dense_rank() OVER (...)",
         "Window",
         Passthrough,
-        "DataFusion `dense_rank`",
+        "`CAST(dense_rank(...) AS BIGINT)` — DataFusion's result is unsigned",
         ["dense_rank"]
     ),
     shim!(
@@ -361,7 +361,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "ntile(n) OVER (...)",
         "Window",
         Passthrough,
-        "DataFusion `ntile`",
+        "`CAST(ntile(...) AS BIGINT)` — DataFusion's result is unsigned",
         ["ntile"]
     ),
     shim!(
@@ -377,7 +377,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "rank() OVER (...)",
         "Window",
         Passthrough,
-        "DataFusion `rank`",
+        "`CAST(rank(...) AS BIGINT)` — DataFusion's result is unsigned",
         ["rank"]
     ),
     shim!(
@@ -385,7 +385,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "row_number() OVER (...)",
         "Window",
         Passthrough,
-        "DataFusion `row_number`",
+        "`CAST(row_number(...) AS BIGINT)` — DataFusion's result is unsigned",
         ["row_number"]
     ),
     // --- Conditional -------------------------------------------------------
@@ -459,7 +459,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "length(varchar) → bigint",
         "String",
         Passthrough,
-        "DataFusion `length` (characters, not bytes)",
+        "`CAST(length(x) AS BIGINT)` (characters, not bytes)",
         ["length"]
     ),
     shim!(
@@ -467,7 +467,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "levenshtein_distance(a, b) → bigint",
         "String",
         Rewrite,
-        "`levenshtein(a, b)`",
+        "`CAST(levenshtein(a, b) AS BIGINT)`",
         ["levenshtein"]
     ),
     shim!(
@@ -538,9 +538,9 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "split_part",
         "split_part(varchar, delimiter, index) → varchar",
         "String",
-        Passthrough,
-        "DataFusion `split_part` (1-based, like Trino)",
-        ["split_part"]
+        Rewrite,
+        "Rust UDF `trino_split_part`: 1-based; NULL past the last field (DataFusion returns `''`); `index < 1` is an error; an empty delimiter splits into characters.",
+        ["trino_split_part"]
     ),
     shim!(
         "starts_with",
@@ -555,24 +555,24 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "strpos(varchar, substring) → bigint",
         "String",
         Passthrough,
-        "DataFusion `strpos` (1-based, 0 when absent). The 3-argument `strpos(x, sub, instance)` form is refused.",
+        "`CAST(strpos(x, sub) AS BIGINT)` (1-based, 0 when absent). The 3-argument `strpos(x, sub, instance)` form is refused.",
         ["strpos"]
     ),
     shim!(
         "substr",
         "substr(varchar, start[, length])",
         "String",
-        Passthrough,
-        "DataFusion `substr` (1-based)",
-        ["substr"]
+        Rewrite,
+        "Rust UDF `trino_substr` with Trino's rules: 1-based; negative `start` counts from the end; `start = 0`, a non-positive `length`, or a start past either end gives `''` (DataFusion's `substr` follows PostgreSQL, where `substr('hello', -3)` is `'hello'`).",
+        ["trino_substr"]
     ),
     shim!(
         "substring",
         "substring(varchar, start[, length])",
         "String",
-        Passthrough,
-        "DataFusion `substring` (1-based)",
-        ["substring"]
+        Rewrite,
+        "Same as `substr`, for both the call and the `SUBSTRING(x FROM s FOR n)` syntax.",
+        ["trino_substr"]
     ),
     shim!(
         "translate",
@@ -628,8 +628,8 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "regexp_replace(varchar, pattern[, replacement]) → varchar",
         "Regular expression",
         Rewrite,
-        "`regexp_replace(x, pattern, replacement, 'g')` — Trino replaces every match, DataFusion only the first unless flagged. The lambda form is refused.",
-        ["regexp_replace"]
+        "`regexp_replace(x, pattern, trino_regexp_replacement(replacement), 'g')` — Trino replaces every match (DataFusion only the first unless flagged), and the replacement is translated from Java syntax (`$1x` is group 1 then `x`; `\\$` a literal dollar) to Rust's. Patterns use Rust `regex` syntax, which lacks look-around and back-references (those fail loudly). The lambda form is refused.",
+        ["regexp_replace", "trino_regexp_replacement"]
     ),
     shim!(
         "regexp_split",
@@ -685,7 +685,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "date_add(unit, value, timestamp) → same type",
         "Date and time",
         Udf,
-        "Rust UDF: calendar arithmetic for month/quarter/year (clamps to month end), fixed lengths otherwise. Units: millisecond … year; adding sub-day units to a DATE is an error.",
+        "Rust UDF: calendar arithmetic for month/quarter/year (clamps to month end), fixed lengths otherwise. Units: millisecond … year; adding sub-day units to a DATE is an error, and so is a fractional `value` (Trino requires bigint).",
         ["date_add"]
     ),
     shim!(
@@ -709,7 +709,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "date_parse(varchar, format) → timestamp",
         "Date and time",
         Rewrite,
-        "`to_timestamp(x, <strftime>)` with the MySQL-style format translated; the format must be a literal.",
+        "`to_timestamp(x, <strftime>)` with the MySQL-style format translated; the format must be a literal. `%f` accepts 1-9 fractional digits when parsing, like Trino, but only directly after a `.`.",
         ["to_timestamp"]
     ),
     shim!(
@@ -773,24 +773,24 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "format_datetime(timestamp, pattern) → varchar",
         "Date and time",
         Rewrite,
-        "`to_char(x, <strftime>)` with the Joda pattern translated; the pattern must be a literal and unknown pattern letters are refused.",
+        "`to_char(x, <strftime>)` with the Joda pattern translated; the pattern must be a literal and unknown pattern letters are refused. `Z` / `ZZ` / `ZZZ` print `+0000` / `+00:00` / `UTC` (timestamps are UTC instants).",
         ["to_char"]
     ),
     shim!(
         "from_iso8601_date",
         "from_iso8601_date(varchar) → date",
         "Date and time",
-        Rewrite,
-        "`to_date(x)`",
-        ["to_date"]
+        Udf,
+        "Rust UDF: strict ISO-8601 calendar date (`YYYY-MM-DD`, also `YYYY-MM` / `YYYY`); anything else (`2024-1-1`, ordinal or week dates) is an error.",
+        ["from_iso8601_date"]
     ),
     shim!(
         "from_iso8601_timestamp",
         "from_iso8601_timestamp(varchar) → timestamp with time zone",
         "Date and time",
-        Rewrite,
-        "`to_timestamp_millis(x)`; the instant is preserved but rendered in UTC rather than the input's offset.",
-        ["to_timestamp_millis"]
+        Udf,
+        "Rust UDF: strict ISO-8601 (`YYYY-MM-DD[THH[:mm[:ss[.fff]]]][Z|±HH:mm]`); a space separator or single-digit fields are errors, as in Trino. The instant is returned as a UTC `timestamp(3)` (the input's offset is applied, not preserved).",
+        ["from_iso8601_timestamp"]
     ),
     shim!(
         "from_unixtime",
@@ -853,7 +853,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "parse_datetime(varchar, pattern) → timestamp",
         "Date and time",
         Rewrite,
-        "`to_timestamp(x, <strftime>)` with the Joda pattern translated; the pattern must be a literal.",
+        "`to_timestamp(x, <strftime>)` with the Joda pattern translated; the pattern must be a literal. `SSS` / `SSSSSS` parse exactly that many fractional digits (Joda accepts fewer).",
         ["to_timestamp"]
     ),
     shim!(
@@ -942,7 +942,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "ceil(x)",
         "Math",
         Passthrough,
-        "DataFusion `ceil`",
+        "DataFusion `ceil` (on DECIMAL inputs the result keeps the input's scale — `2.0` where Trino gives `2`)",
         ["ceil"]
     ),
     shim!(
@@ -966,7 +966,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "floor(x)",
         "Math",
         Passthrough,
-        "DataFusion `floor`",
+        "DataFusion `floor` (on DECIMAL inputs the result keeps the input's scale — `-2.0` where Trino gives `-2`)",
         ["floor"]
     ),
     shim!(
@@ -1084,10 +1084,10 @@ pub static FUNCTIONS: &[FunctionShim] = &[
     ),
     shim!(
         "truncate",
-        "truncate(x) → double",
+        "truncate(x[, n])",
         "Math",
         Rewrite,
-        "`trunc(x)`",
+        "`trunc(x[, n])`. On DECIMAL inputs the one-argument form keeps the input's scale (`2.0` where Trino gives `2`); Trino's two-argument form is defined for DECIMAL inputs and DataFusion computes it in double precision, so `truncate(d, n)` returns a double here.",
         ["trunc"]
     ),
     // --- Array -------------------------------------------------------------
@@ -1144,7 +1144,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "array_position(array, element) → bigint",
         "Array",
         Rewrite,
-        "`CASE WHEN array IS NULL THEN NULL ELSE coalesce(array_position(array, element), 0) END` — Trino returns 0 for a missing element where DataFusion returns NULL.",
+        "`CASE WHEN array IS NULL THEN NULL ELSE coalesce(CAST(array_position(array, element) AS BIGINT), 0) END` — Trino returns 0 for a missing element where DataFusion returns NULL.",
         ["array_position", "coalesce"]
     ),
     shim!(
@@ -1200,8 +1200,8 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "element_at(array, index)",
         "Array",
         Rewrite,
-        "`array_element(array, index)` (1-based, negative indexes count from the end, NULL when out of range). `element_at` on maps is refused by DataFusion's type check.",
-        ["array_element"]
+        "Rust UDF `trino_element_at`: 1-based, negative indexes count from the end, NULL past either end, `index = 0` is an error (`SQL array indices start at 1`). `element_at` on maps is refused.",
+        ["trino_element_at"]
     ),
     shim!(
         "filter",
@@ -1398,7 +1398,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "SELECT / DISTINCT / WHERE",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "Full projection, `SELECT DISTINCT`, arbitrary predicates.",
+        notes: "Full projection, `SELECT DISTINCT`, arbitrary predicates. Anonymous output columns are named `_col0`, `_col1`, … by position and duplicate output names are allowed, as on Athena.",
         corpus_marker: "SELECT DISTINCT",
     },
     Construct {
@@ -1426,7 +1426,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Window functions",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "`OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` and named windows.",
+        notes: "`OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` and named windows. Ranking functions return `bigint` (cast from DataFusion's unsigned result).",
         corpus_marker: "OVER (",
     },
     Construct {
@@ -1468,7 +1468,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "CAST",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "Trino type names (`VARCHAR`, `BIGINT`, `INTEGER`, `DOUBLE`, `REAL`, `DECIMAL(p,s)`, `BOOLEAN`, `DATE`, `TIMESTAMP`, `VARBINARY`) map to Arrow types. `JSON`, `ROW`, `MAP` targets are refused by the planner.",
+        notes: "Trino type names (`VARCHAR[(n)]`, `BIGINT`, `INTEGER`, `SMALLINT`, `TINYINT`, `DOUBLE`, `REAL`, `DECIMAL(p,s)`, `BOOLEAN`, `DATE`, `TIMESTAMP`) map to Arrow types. Double/decimal → integer rounds half away from zero (`CAST(2.5 AS BIGINT)` is 3) and fails on overflow (`INVALID_CAST_ARGUMENT`; NULL under `TRY_CAST`). `CAST(... AS VARCHAR)` uses Trino's text forms (`2024-01-05 10:30:00.000`, `1.0E20`) and `VARCHAR(n)` truncates to `n` characters. `VARBINARY`, `JSON`, `ROW`, `MAP` targets are refused by name.",
         corpus_marker: "CAST(",
     },
     Construct {
@@ -1503,22 +1503,50 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "ARRAY[...] literals and 1-based subscripts",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "`arr[1]` is the first element, like Trino; out-of-range subscripts raise an error in Trino but return NULL here.",
+        notes: "`arr[1]` is the first element; `arr[0]`, negative, and out-of-range subscripts are errors, as in Trino (use `element_at` for NULL instead).",
         corpus_marker: "ARRAY[",
     },
     Construct {
         name: "EXTRACT(field FROM x) / POSITION / SUBSTRING / TRIM syntax",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "",
+        notes: "`EXTRACT` fields: YEAR, QUARTER, MONTH, WEEK, DAY, DAY_OF_MONTH, DAY_OF_WEEK/DOW (1 = Monday … 7 = Sunday, Trino numbering), DAY_OF_YEAR/DOY, HOUR, MINUTE, SECOND; other fields are refused by name. `SUBSTRING` follows `substr`'s rules; `POSITION` returns bigint.",
         corpus_marker: "EXTRACT(",
     },
     Construct {
         name: "Identifiers",
         category: "Semantics",
         status: ConstructStatus::Supported,
-        notes: "Unquoted identifiers are lower-cased; double-quoted identifiers keep their case (Trino rules). Glue catalogs are lower-case, so quoted mixed-case column names fail to resolve as they do on Athena.",
+        notes: "Identifiers are case-insensitive whether quoted or not, as in Trino: `\"Name\"` and `name` resolve to the same column. Output aliases keep the case they were written in (`AS \"CustomerName\"`), so an `ORDER BY` that repeats a mixed-case quoted alias must write it the same way.",
         corpus_marker: "\"",
+    },
+    Construct {
+        name: "Numeric literals",
+        category: "Semantics",
+        status: ConstructStatus::Supported,
+        notes: "`1.5` is `DECIMAL(2,1)` and `1e2` is `DOUBLE`, as in Trino, so `0.1 + 0.2` is exactly `0.3`. Decimal arithmetic follows DataFusion's result precision/scale rules (division and `avg` keep more fractional digits than Trino: `1.5 / 2` is `0.75000` here, `0.8` on Athena) and math functions compute decimal arguments in double precision.",
+        corpus_marker: "0.5",
+    },
+    Construct {
+        name: "Integer overflow",
+        category: "Semantics",
+        status: ConstructStatus::Supported,
+        notes: "`bigint` `+`, `-`, `*`, and `sum` fail with `NUMERIC_VALUE_OUT_OF_RANGE` on overflow, as in Trino (DataFusion alone wraps around). Division by zero is `DIVISION_BY_ZERO`.",
+        corpus_marker: "9223372036854775807",
+    },
+    Construct {
+        name: "Operator type checking",
+        category: "Semantics",
+        status: ConstructStatus::Supported,
+        notes: "Comparisons, arithmetic, `||`, `IN`, and `BETWEEN` between types Trino does not combine (`varchar = integer`, `'a' || 1`, `date = varchar`) are refused with `TYPE_MISMATCH` instead of being coerced. Numeric types compare with each other and `date` with `timestamp`, as in Trino.",
+        corpus_marker: "'1' = 1",
+    },
+    Construct {
+        name: "Runtime errors",
+        category: "Semantics",
+        status: ConstructStatus::Supported,
+        notes: "Failures caused by the query's data (an invalid cast, an unparsable date, a bad subscript) are user errors (Athena `ErrorCategory` 2) with Trino's error code; only I/O and engine failures are category 1.",
+        corpus_marker: "CAST('abc' AS INTEGER)",
     },
     Construct {
         name: "Read-only statements",
