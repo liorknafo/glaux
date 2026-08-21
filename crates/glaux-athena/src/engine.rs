@@ -299,7 +299,6 @@ pub(crate) fn plan_error(err: DataFusionError) -> EngineError {
 #[derive(Default)]
 struct ScanAccountant {
     bytes: u64,
-    saw_file_scan: bool,
 }
 
 impl ExecutionPlanVisitor for ScanAccountant {
@@ -309,7 +308,6 @@ impl ExecutionPlanVisitor for ScanAccountant {
         if let Some(exec) = (plan as &dyn Any).downcast_ref::<DataSourceExec>() {
             let source: &dyn Any = exec.data_source().as_ref();
             if let Some(config) = source.downcast_ref::<FileScanConfig>() {
-                self.saw_file_scan = true;
                 let metered = plan
                     .metrics()
                     .and_then(|m| m.sum_by_name("bytes_scanned"))

@@ -981,6 +981,166 @@ async fn client_request_token_is_idempotent() {
     assert_eq!(first, second);
     let err = start("SELECT 2").await.unwrap_err().into_service_error();
     assert!(err.is_invalid_request_exception(), "{err:?}");
+
+    // Same SQL, different OutputLocation: the idempotent parameters differ,
+    // so the replay is rejected rather than silently ignoring the new location.
+    let err = h
+        .client
+        .start_query_execution()
+        .query_string("SELECT 1")
+        .client_request_token("token-0123456789abcdef0123456789abcdef")
+        .result_configuration(
+            ResultConfiguration::builder()
+                .output_location("s3://results/elsewhere/")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    assert!(err.is_invalid_request_exception(), "{err:?}");
+
+    // The replays created exactly one execution.
+    let listed = h.client.list_query_executions().send().await.unwrap();
+    assert_eq!(listed.query_execution_ids(), [first.as_str()]);
+}
+
+#[tokio::test]
+async fn validation_branches_return_explicit_errors() {
+    let h = start().await;
+
+    // ExecutionParameters (parameterized queries) are refused explicitly.
+    let err = h
+        .client
+        .start_query_execution()
+        .query_string("SELECT ?")
+        .execution_parameters("1")
+        .result_configuration(
+            ResultConfiguration::builder()
+                .output_location(OUTPUT)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    match err {
+        StartQueryExecutionError::InvalidRequestException(e) => {
+            assert!(
+                e.message().unwrap().contains("ExecutionParameters"),
+                "{e:?}"
+            );
+        }
+        other => panic!("expected InvalidRequestException, got {other:?}"),
+    }
+
+    // An invalid WorkGroup name is rejected.
+    for bad in ["has space", "slash/name", &"x".repeat(129)] {
+        let err = h
+            .client
+            .create_work_group()
+            .name(bad)
+            .send()
+            .await
+            .unwrap_err()
+            .into_service_error();
+        assert!(err.is_invalid_request_exception(), "{bad:?}: {err:?}");
+    }
+
+    // EnforceWorkGroupConfiguration overrides a client-supplied OutputLocation.
+    h.client
+        .create_work_group()
+        .name("enforced")
+        .configuration(
+            WorkGroupConfiguration::builder()
+                .enforce_work_group_configuration(true)
+                .result_configuration(
+                    ResultConfiguration::builder()
+                        .output_location("s3://results/enforced/")
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("CreateWorkGroup");
+    let id = h
+        .client
+        .start_query_execution()
+        .query_string("SELECT 1")
+        .work_group("enforced")
+        .result_configuration(
+            ResultConfiguration::builder()
+                .output_location("s3://results/client-chosen/")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap()
+        .query_execution_id
+        .unwrap();
+    let qe = wait_terminal(&h, &id).await;
+    assert_eq!(
+        qe.status().unwrap().state(),
+        Some(&QueryExecutionState::Succeeded),
+        "{qe:?}"
+    );
+    assert_eq!(
+        qe.result_configuration().and_then(|r| r.output_location()),
+        Some("s3://results/enforced/")
+    );
+    h.storage
+        .get_object("results", &format!("enforced/{id}.csv"))
+        .await
+        .expect("CSV lands under the workgroup's enforced location");
+
+    // MaxResults outside the allowed range is rejected on both paging APIs.
+    for bad in [0, 1001] {
+        let err = h
+            .client
+            .get_query_results()
+            .query_execution_id(&id)
+            .max_results(bad)
+            .send()
+            .await
+            .unwrap_err()
+            .into_service_error();
+        assert!(
+            err.is_invalid_request_exception(),
+            "GetQueryResults MaxResults={bad}: {err:?}"
+        );
+    }
+    for bad in [0, 51] {
+        let err = h
+            .client
+            .list_query_executions()
+            .max_results(bad)
+            .send()
+            .await
+            .unwrap_err()
+            .into_service_error();
+        assert!(
+            err.is_invalid_request_exception(),
+            "ListQueryExecutions MaxResults={bad}: {err:?}"
+        );
+    }
+
+    // A NextToken past the end of the result set is INVALID_NEXT_TOKEN.
+    let err = h
+        .client
+        .get_query_results()
+        .query_execution_id(&id)
+        .next_token("99")
+        .send()
+        .await
+        .unwrap_err()
+        .into_service_error();
+    match err {
+        GetQueryResultsError::InvalidRequestException(e) => {
+            assert_eq!(e.athena_error_code(), Some("INVALID_NEXT_TOKEN"), "{e:?}");
+        }
+        other => panic!("expected InvalidRequestException, got {other:?}"),
+    }
 }
 
 #[tokio::test]
