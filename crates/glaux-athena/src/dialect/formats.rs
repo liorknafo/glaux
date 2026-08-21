@@ -9,9 +9,25 @@
 
 use super::error::GlauxSqlError;
 
+/// Which direction a format string is used in. Parsing and printing differ
+/// for fractional seconds: Trino prints `%f` as 6 digits but accepts 1-9
+/// digits when parsing, and chrono's fixed-width `%6f` would reject
+/// `.123`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// `date_parse` / `parse_datetime`: string → timestamp.
+    Parse,
+    /// `date_format` / `format_datetime`: timestamp → string.
+    Format,
+}
+
 /// Translate a MySQL-style format (Trino `date_parse` / `date_format`) to a
 /// chrono `strftime` format. `function` is used for error messages.
-pub fn mysql_to_chrono(function: &str, format: &str) -> Result<String, GlauxSqlError> {
+pub fn mysql_to_chrono(
+    function: &str,
+    format: &str,
+    direction: Direction,
+) -> Result<String, GlauxSqlError> {
     let mut out = String::with_capacity(format.len() + 8);
     let mut chars = format.chars();
     while let Some(c) = chars.next() {
@@ -41,8 +57,27 @@ pub fn mysql_to_chrono(function: &str, format: &str) -> Result<String, GlauxSqlE
             'l' => "%-I",      // hour 1-12
             'i' => "%M",       // minutes 00-59
             's' | 'S' => "%S", // seconds 00-59
-            'f' => "%6f",      // microseconds (Trino: fraction of second, 6 digits)
-            'p' => "%p",       // AM/PM
+            // Fraction of a second: printed as 6 digits. When parsing,
+            // Trino accepts 1-9 digits; chrono's flexible fraction parser
+            // is `%.f`, which also consumes the preceding '.', so `.%f`
+            // becomes `%.f`. (chrono's bare `%f` reads a nanosecond count,
+            // which would make `.123` mean 123 ns.)
+            'f' => match direction {
+                Direction::Format => "%6f",
+                Direction::Parse => {
+                    if out.pop() != Some('.') {
+                        return Err(GlauxSqlError::invalid_arguments(
+                            function,
+                            format!(
+                                "format {format:?}: %f is only supported directly after a '.' \
+                                 when parsing (e.g. '%s.%f')"
+                            ),
+                        ));
+                    }
+                    "%.f"
+                }
+            },
+            'p' => "%p", // AM/PM
             'r' => "%I:%M:%S %p",
             'T' => "%H:%M:%S",
             'W' => "%A", // weekday name
@@ -68,7 +103,11 @@ pub fn mysql_to_chrono(function: &str, format: &str) -> Result<String, GlauxSqlE
 
 /// Translate a Joda-Time pattern (Trino `format_datetime` /
 /// `parse_datetime`) to a chrono `strftime` format.
-pub fn joda_to_chrono(function: &str, pattern: &str) -> Result<String, GlauxSqlError> {
+pub fn joda_to_chrono(
+    function: &str,
+    pattern: &str,
+    direction: Direction,
+) -> Result<String, GlauxSqlError> {
     let mut out = String::with_capacity(pattern.len() + 8);
     let chars: Vec<char> = pattern.chars().collect();
     let mut i = 0;
@@ -144,6 +183,12 @@ pub fn joda_to_chrono(function: &str, pattern: &str) -> Result<String, GlauxSqlE
             ('S', 3) => "%3f",
             ('S', 6) => "%6f",
             ('S', 9) => "%9f",
+            // Zone offset / id. glaux timestamps are UTC instants (AT TIME
+            // ZONE is refused), so the offset is always zero; chrono's `%z`
+            // cannot format a zone-less timestamp at all.
+            ('Z', 1) if direction == Direction::Format => "+0000",
+            ('Z', 2) if direction == Direction::Format => "+00:00",
+            ('Z', _) if direction == Direction::Format => "UTC",
             ('Z', _) => "%z",
             ('z', _) | ('K', _) | ('k', _) | ('G', _) | ('C', _) | ('S', _) => {
                 return Err(GlauxSqlError::invalid_arguments(
@@ -181,55 +226,83 @@ mod tests {
     #[test]
     fn mysql_formats_translate_specifier_by_specifier() {
         assert_eq!(
-            mysql_to_chrono("date_parse", "%Y-%m-%d %H:%i:%s").unwrap(),
+            mysql_to_chrono("date_parse", "%Y-%m-%d %H:%i:%s", Direction::Parse).unwrap(),
             "%Y-%m-%d %H:%M:%S"
         );
         assert_eq!(
-            mysql_to_chrono("date_format", "%d/%b/%Y %T %p 100%%").unwrap(),
+            mysql_to_chrono("date_format", "%d/%b/%Y %T %p 100%%", Direction::Format).unwrap(),
             "%d/%b/%Y %H:%M:%S %p 100%%"
         );
         assert_eq!(
-            mysql_to_chrono("date_parse", "%Y%m%d%H%i%s%f").unwrap(),
-            "%Y%m%d%H%M%S%6f"
+            mysql_to_chrono("date_format", "%Y%m%d%H%i%s.%f", Direction::Format).unwrap(),
+            "%Y%m%d%H%M%S.%6f"
         );
+        // Parsing accepts 1-9 fractional digits: chrono's `%.f` takes the
+        // dot and the digits.
+        assert_eq!(
+            mysql_to_chrono("date_parse", "%Y%m%d%H%i%s.%f", Direction::Parse).unwrap(),
+            "%Y%m%d%H%M%S%.f"
+        );
+        let err = mysql_to_chrono("date_parse", "%Y%m%d%H%i%s%f", Direction::Parse).unwrap_err();
+        assert!(err.to_string().contains("after a '.'"), "{err}");
     }
 
     #[test]
     fn unknown_mysql_specifiers_are_refused_by_name() {
-        let err = mysql_to_chrono("date_parse", "%Y-%Q").unwrap_err();
+        let err = mysql_to_chrono("date_parse", "%Y-%Q", Direction::Parse).unwrap_err();
         assert!(err.to_string().contains("%Q"), "{err}");
         assert!(err.to_string().contains("date_parse"), "{err}");
-        let err = mysql_to_chrono("date_parse", "%Y-%").unwrap_err();
+        let err = mysql_to_chrono("date_parse", "%Y-%", Direction::Parse).unwrap_err();
         assert!(err.to_string().contains("dangling"), "{err}");
     }
 
     #[test]
     fn joda_patterns_translate_by_run_length() {
         assert_eq!(
-            joda_to_chrono("format_datetime", "yyyy-MM-dd HH:mm:ss").unwrap(),
+            joda_to_chrono("format_datetime", "yyyy-MM-dd HH:mm:ss", Direction::Format).unwrap(),
             "%Y-%m-%d %H:%M:%S"
         );
         assert_eq!(
-            joda_to_chrono("format_datetime", "yyyy-MM-dd'T'HH:mm:ss.SSS").unwrap(),
+            joda_to_chrono(
+                "format_datetime",
+                "yyyy-MM-dd'T'HH:mm:ss.SSS",
+                Direction::Format
+            )
+            .unwrap(),
             "%Y-%m-%dT%H:%M:%S.%3f"
         );
         assert_eq!(
-            joda_to_chrono("format_datetime", "EEE, d MMM yy h:mm a").unwrap(),
+            joda_to_chrono("format_datetime", "EEE, d MMM yy h:mm a", Direction::Format).unwrap(),
             "%a, %-d %b %y %-I:%M %p"
         );
         assert_eq!(
-            joda_to_chrono("format_datetime", "'o''clock'").unwrap(),
+            joda_to_chrono("format_datetime", "'o''clock'", Direction::Format).unwrap(),
             "o'clock"
+        );
+        // Zone offsets print as UTC when formatting (timestamps are UTC
+        // instants) and parse as offsets.
+        assert_eq!(
+            joda_to_chrono("format_datetime", "HH:mm Z", Direction::Format).unwrap(),
+            "%H:%M +0000"
+        );
+        assert_eq!(
+            joda_to_chrono("format_datetime", "HH:mm ZZ", Direction::Format).unwrap(),
+            "%H:%M +00:00"
+        );
+        assert_eq!(
+            joda_to_chrono("parse_datetime", "HH:mm Z", Direction::Parse).unwrap(),
+            "%H:%M %z"
         );
     }
 
     #[test]
     fn unknown_joda_letters_are_refused_by_name() {
-        let err = joda_to_chrono("format_datetime", "yyyy z").unwrap_err();
+        let err = joda_to_chrono("format_datetime", "yyyy z", Direction::Format).unwrap_err();
         assert!(err.to_string().contains("'z'"), "{err}");
-        let err = joda_to_chrono("format_datetime", "yyyy 'unterminated").unwrap_err();
+        let err =
+            joda_to_chrono("format_datetime", "yyyy 'unterminated", Direction::Format).unwrap_err();
         assert!(err.to_string().contains("unterminated"), "{err}");
-        let err = joda_to_chrono("format_datetime", "SSSS").unwrap_err();
+        let err = joda_to_chrono("format_datetime", "SSSS", Direction::Format).unwrap_err();
         assert!(err.to_string().contains("'S'"), "{err}");
     }
 }
