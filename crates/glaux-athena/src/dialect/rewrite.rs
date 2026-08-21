@@ -23,18 +23,19 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    AccessExpr, BinaryOperator, CaseWhen, CastKind, CharacterLength, DataType, DateTimeField,
-    Distinct, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr,
+    AccessExpr, BinaryOperator, CaseWhen, CastKind, CeilFloorKind, CharacterLength, DataType,
+    DateTimeField, Distinct, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident,
     JoinConstraint, JoinOperator, NamedWindowExpr, ObjectName, ObjectNamePart, OrderByExpr,
     OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Subscript, TableAlias, TableFactor,
-    TimezoneInfo, TypedString, UnaryOperator, Value, VisitMut, VisitorMut, WindowType,
+    TimezoneInfo, UnaryOperator, Value, VisitMut, VisitorMut, WindowType,
 };
 
 use super::error::GlauxSqlError;
 use super::formats::{Direction, joda_to_chrono, mysql_to_chrono};
 use super::naming;
 use super::registry::{self, ShimKind};
+use super::udf::timestamps::parse_trino_timestamp;
 
 /// Rewrite `statement` in place. On error the statement is left partially
 /// rewritten and must not be used.
@@ -459,24 +460,36 @@ fn default_call_nulls_last(f: &mut Function) -> Result<(), GlauxSqlError> {
     Ok(())
 }
 
-/// Refuse `TIMESTAMP '... <zone>'` literals: DataFusion would silently
-/// convert the instant to UTC and drop the zone, while `AT TIME ZONE` and
-/// zoned arithmetic are refused, so the value could never be interpreted
-/// the way the query meant it.
-fn check_typed_string(typed: &TypedString) -> Result<(), GlauxSqlError> {
+/// Typed literals. `TIMESTAMP '...'` and `DATE '...'` go through glaux's
+/// strict parsers (DataFusion's would accept zone suffixes, `T` separators,
+/// and trailing time parts Trino rejects, and would overflow on years
+/// outside Arrow's nanosecond window); `DECIMAL '1.5'` becomes the
+/// `decimal(2,1)` literal Trino types it as (DataFusion would make it
+/// `decimal(38,10)`); zoned timestamp / time literals and every other typed
+/// literal are refused by name.
+fn rewrite_typed_string(expr: &mut Expr) -> Result<(), GlauxSqlError> {
+    let Expr::TypedString(typed) = expr else {
+        unreachable!("rewrite_typed_string called on a non-typed-string expression");
+    };
+    let text = match &typed.value.value {
+        Value::SingleQuotedString(s) => s.clone(),
+        other => {
+            return Err(GlauxSqlError::unsupported(
+                format!("{} literal", typed.data_type),
+                format!("`{other}` is not a single-quoted string"),
+            ));
+        }
+    };
     let zoned_type = matches!(
         typed.data_type,
         DataType::Timestamp(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz)
             | DataType::Time(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz)
     );
-    let text = match &typed.value.value {
-        Value::SingleQuotedString(s) => s.as_str(),
-        _ => "",
+    let has_zone_suffix = match typed.data_type {
+        DataType::Timestamp(..) => parse_trino_timestamp(&text).is_some_and(|p| p.has_zone),
+        DataType::Time(..) => literal_has_zone(&text),
+        _ => false,
     };
-    let has_zone_suffix = matches!(
-        typed.data_type,
-        DataType::Timestamp(..) | DataType::Time(..)
-    ) && literal_has_zone(text);
     if zoned_type || has_zone_suffix {
         return Err(GlauxSqlError::unsupported(
             "timestamp with time zone literal",
@@ -486,7 +499,68 @@ fn check_typed_string(typed: &TypedString) -> Result<(), GlauxSqlError> {
             ),
         ));
     }
-    Ok(())
+    match &typed.data_type {
+        DataType::Timestamp(precision, _) => {
+            if let Some(p) = precision
+                && *p != 3
+            {
+                return Err(GlauxSqlError::unsupported(
+                    format!("TIMESTAMP({p}) literal"),
+                    "glaux only carries timestamp(3), Athena's precision",
+                ));
+            }
+            *expr = func("trino_timestamp_literal", vec![str_lit(&text)]);
+            Ok(())
+        }
+        DataType::Date => {
+            *expr = func("trino_date", vec![str_lit(&text)]);
+            Ok(())
+        }
+        DataType::Time(..) => Ok(()),
+        DataType::Decimal(_) | DataType::Numeric(_) | DataType::Dec(_) => {
+            *expr = decimal_literal(&text).ok_or_else(|| {
+                GlauxSqlError::unsupported(
+                    "DECIMAL literal",
+                    format!("`{typed}` is not a plain decimal number (digits with an optional sign and point)"),
+                )
+            })?;
+            Ok(())
+        }
+        other => Err(GlauxSqlError::unsupported(
+            format!("{other} literal"),
+            format!(
+                "`{typed}`: typed literals other than DATE, TIME, TIMESTAMP, and DECIMAL are not supported"
+            ),
+        )),
+    }
+}
+
+/// `DECIMAL 'text'` → `CAST('text' AS DECIMAL(p, s))` with Trino's
+/// precision (all digits, ignoring leading zeros, at least 1) and scale
+/// (digits after the point). `None` when the text is not a decimal number.
+fn decimal_literal(text: &str) -> Option<Expr> {
+    let trimmed = text.trim();
+    let unsigned = trimmed.strip_prefix(['-', '+']).unwrap_or(trimmed);
+    let (int_part, frac_part) = match unsigned.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (unsigned, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty()
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = int_part.trim_start_matches('0').len() + frac_part.len();
+    let precision = digits.max(1) as u64;
+    let scale = frac_part.len() as i64;
+    if precision > 38 {
+        return None;
+    }
+    Some(cast_to(
+        str_lit(trimmed),
+        DataType::Decimal(ExactNumberInfo::PrecisionAndScale(precision, scale)),
+    ))
 }
 
 /// Whether a timestamp / time literal text has a trailing zone (`Z`, an
@@ -780,7 +854,7 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
         Expr::Identifier(id)
             if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("localtimestamp") =>
         {
-            *expr = func("now", vec![]);
+            *expr = func("trino_timestamp", vec![func("now", vec![])]);
             Ok(())
         }
         Expr::Identifier(id) => {
@@ -800,6 +874,34 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             *expr = cast_to(str_lit(text), double());
             Ok(())
         }
+        // An integer literal beyond bigint is a DECIMAL in Trino; DataFusion
+        // would type it as an unsigned 64-bit integer (which Athena cannot
+        // return) or refuse it.
+        Expr::Value(v) if is_oversized_integer_literal(&v.value) => {
+            let Value::Number(text, _) = &v.value else {
+                unreachable!()
+            };
+            let digits = text.trim_start_matches('0').len().max(1);
+            if digits > 38 {
+                return Err(GlauxSqlError::unsupported(
+                    "DECIMAL precision above 38",
+                    format!(
+                        "the literal {text} has {digits} digits; Trino decimals hold at most 38"
+                    ),
+                ));
+            }
+            *expr = cast_to(
+                str_lit(text),
+                DataType::Decimal(ExactNumberInfo::PrecisionAndScale(digits as u64, 0)),
+            );
+            Ok(())
+        }
+        Expr::Value(v) if matches!(v.value, Value::HexStringLiteral(_)) => {
+            Err(GlauxSqlError::unsupported(
+                "binary literal",
+                "`0x1F` is not Trino syntax and `X'1F'` varbinary literals are not supported in v0.1",
+            ))
+        }
         Expr::Cast {
             kind: CastKind::DoubleColon,
             ..
@@ -816,7 +918,7 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
         )),
         Expr::Cast { .. } => rewrite_cast(expr),
         Expr::Extract { .. } => rewrite_extract(expr),
-        Expr::TypedString(typed) => check_typed_string(typed),
+        Expr::TypedString(_) => rewrite_typed_string(expr),
         Expr::Array(array) if !array.named => Err(GlauxSqlError::unsupported(
             "[...] array literal",
             "`[1, 2]` is not Trino syntax; use ARRAY[1, 2]",
@@ -880,6 +982,54 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             *expr = current;
             Ok(())
         }
+        // sqlparser reads `ceil(x)` / `floor(x)` into dedicated nodes (for
+        // the `CEIL(x TO unit)` syntax), so they never reach the function
+        // registry; route them to the Trino UDFs here.
+        Expr::Ceil { .. } | Expr::Floor { .. } => {
+            let name = if matches!(expr, Expr::Ceil { .. }) {
+                "ceil"
+            } else {
+                "floor"
+            };
+            let (Expr::Ceil { expr: inner, field } | Expr::Floor { expr: inner, field }) = expr
+            else {
+                unreachable!()
+            };
+            if !matches!(
+                field,
+                CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)
+            ) {
+                return Err(GlauxSqlError::unsupported(
+                    format!("{}(x TO unit) / {}(x, scale)", name.to_uppercase(), name),
+                    "not Trino syntax; use date_trunc or round",
+                ));
+            }
+            let arg = take(inner);
+            *expr = func(&format!("trino_{name}"), vec![arg]);
+            Ok(())
+        }
+        Expr::Like {
+            any,
+            pattern,
+            escape_char,
+            ..
+        } => {
+            if *any {
+                return Err(GlauxSqlError::unsupported(
+                    "LIKE ANY",
+                    "not Trino syntax; combine LIKE predicates with OR",
+                ));
+            }
+            rewrite_like_pattern(pattern, escape_char.take())
+        }
+        Expr::ILike { .. } => Err(GlauxSqlError::unsupported(
+            "ILIKE",
+            "not Trino syntax; use lower(x) LIKE lower(pattern)",
+        )),
+        Expr::SimilarTo { .. } | Expr::RLike { .. } => Err(GlauxSqlError::unsupported(
+            "SIMILAR TO / RLIKE",
+            "not Trino syntax; use regexp_like",
+        )),
         Expr::Lambda(_) => Err(GlauxSqlError::unsupported(
             "lambda expression",
             "`x -> ...` arguments are not translated; express the logic with explicit SQL",
@@ -898,8 +1048,116 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
     }
 }
 
+/// `LIKE` patterns: Trino has no default escape character, so `\` is a
+/// literal backslash unless an `ESCAPE` clause names it; DataFusion (and
+/// Arrow) always treat `\` as the escape. The pattern is rewritten so
+/// DataFusion's backslash-escaped form means what Trino's pattern meant:
+/// every backslash is doubled, and with an `ESCAPE` clause the escape
+/// sequences (`#%`, `#_`, `##`) become `\%`, `\_`, `#`; any other use of
+/// the escape character is an error, as in Trino.
+fn rewrite_like_pattern(
+    pattern: &mut Expr,
+    escape: Option<sqlparser::ast::ValueWithSpan>,
+) -> Result<(), GlauxSqlError> {
+    let escape = match escape {
+        None => None,
+        Some(v) => match &v.value {
+            Value::SingleQuotedString(e) => {
+                let mut chars = e.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => Some(c),
+                    _ => {
+                        return Err(GlauxSqlError::invalid_arguments(
+                            "LIKE",
+                            format!("Escape string must be a single character, got {e:?}"),
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(GlauxSqlError::invalid_arguments(
+                    "LIKE",
+                    format!("the ESCAPE clause must be a string literal, got {other}"),
+                ));
+            }
+        },
+    };
+    let literal = match pattern {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(p) => Some(p.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    match (literal, escape) {
+        (Some(text), escape) => {
+            *pattern = str_lit(&translate_like_pattern(&text, escape)?);
+        }
+        (None, None) => {
+            // A computed pattern: double every backslash at run time.
+            let source = take(pattern);
+            *pattern = func("replace", vec![source, str_lit("\\"), str_lit("\\\\")]);
+        }
+        (None, Some(_)) => {
+            return Err(GlauxSqlError::unsupported(
+                "LIKE ... ESCAPE with a non-literal pattern",
+                "the pattern must be a string literal for glaux to translate the escape \
+                 character",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Translate a Trino `LIKE` pattern (with optional escape character) to
+/// DataFusion's backslash-escaped form.
+fn translate_like_pattern(pattern: &str, escape: Option<char>) -> Result<String, GlauxSqlError> {
+    let mut out = String::with_capacity(pattern.len() + 4);
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            match chars.next() {
+                Some(next @ ('%' | '_')) => {
+                    out.push('\\');
+                    out.push(next);
+                }
+                Some(next) if next == c => {
+                    if c == '\\' {
+                        out.push_str("\\\\");
+                    } else {
+                        out.push(c);
+                    }
+                }
+                _ => {
+                    return Err(GlauxSqlError::invalid_arguments(
+                        "LIKE",
+                        format!(
+                            "Escape character must be followed by '%', '_' or the escape \
+                             character itself (pattern {pattern:?}, escape {c:?})"
+                        ),
+                    ));
+                }
+            }
+        } else if c == '\\' {
+            out.push_str("\\\\");
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
 fn is_exponent_literal(value: &Value) -> bool {
     matches!(value, Value::Number(text, _) if text.contains(['e', 'E']))
+}
+
+/// A plain integer literal that does not fit in a signed 64-bit integer.
+fn is_oversized_integer_literal(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Number(text, _)
+            if !text.contains(['e', 'E', '.']) && text.parse::<i64>().is_err()
+    )
 }
 
 fn is_row_or_map(data_type: &DataType) -> bool {
@@ -952,10 +1210,64 @@ fn rewrite_cast(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             }
             Ok(())
         }
-        DataType::Varchar(length)
-        | DataType::CharacterVarying(length)
-        | DataType::Char(length)
-        | DataType::Character(length) => {
+        DataType::Char(_) | DataType::Character(_) => Err(GlauxSqlError::unsupported(
+            "CAST(... AS CHAR(n))",
+            "Trino's CHAR type pads to n characters and compares ignoring trailing spaces; \
+             glaux does not model it. Use VARCHAR(n)",
+        )),
+        DataType::Timestamp(precision, TimezoneInfo::None) => {
+            if let Some(p) = precision
+                && *p != 3
+            {
+                return Err(GlauxSqlError::unsupported(
+                    format!("CAST(... AS TIMESTAMP({p}))"),
+                    "glaux only carries timestamp(3), Athena's precision",
+                ));
+            }
+            let name = match kind {
+                CastKind::TryCast => "trino_try_timestamp",
+                _ => "trino_timestamp",
+            };
+            *expr = func(name, vec![take(inner)]);
+            Ok(())
+        }
+        DataType::Timestamp(_, _)
+        | DataType::Time(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
+            Err(GlauxSqlError::unsupported(
+                "CAST(... AS TIMESTAMP WITH TIME ZONE)",
+                "time-zone aware casts are not supported in v0.1",
+            ))
+        }
+        DataType::Date => {
+            let name = match kind {
+                CastKind::TryCast => "trino_try_date",
+                _ => "trino_date",
+            };
+            *expr = func(name, vec![take(inner)]);
+            Ok(())
+        }
+        DataType::Boolean | DataType::Bool => {
+            let name = match kind {
+                CastKind::TryCast => "trino_try_boolean",
+                _ => "trino_boolean",
+            };
+            *expr = func(name, vec![take(inner)]);
+            Ok(())
+        }
+        DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => {
+            let (precision, scale) = match info {
+                ExactNumberInfo::None => (38, 0),
+                ExactNumberInfo::Precision(p) => (*p as i64, 0),
+                ExactNumberInfo::PrecisionAndScale(p, s) => (*p as i64, *s),
+            };
+            let name = match kind {
+                CastKind::TryCast => "trino_try_to_decimal",
+                _ => "trino_to_decimal",
+            };
+            *expr = func(name, vec![take(inner), num_lit(precision), num_lit(scale)]);
+            Ok(())
+        }
+        DataType::Varchar(length) | DataType::CharacterVarying(length) => {
             let limit = match length {
                 None | Some(CharacterLength::Max) => None,
                 Some(CharacterLength::IntegerLength { length, .. }) => Some(*length),
@@ -964,10 +1276,13 @@ fn rewrite_cast(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             if let Some(n) = limit {
                 args.push(num_lit(n as i64));
             }
-            // TRY_CAST(x AS VARCHAR) cannot fail for castable types; the
-            // type errors it would mask are refused at plan time either way.
-            let _ = kind;
-            *expr = func("trino_varchar", args);
+            // TRY_CAST matters for bounded targets: a non-varchar value whose
+            // text exceeds `n` is an error under CAST and NULL under TRY_CAST.
+            let name = match kind {
+                CastKind::TryCast => "trino_try_varchar",
+                _ => "trino_varchar",
+            };
+            *expr = func(name, args);
             Ok(())
         }
         DataType::String(_) | DataType::Text => {
@@ -1135,7 +1450,11 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             case_when(cond, then, it.next())
         }
         // String
-        "codepoint" => return simple_rename("ascii", &[1]),
+        "codepoint" => return simple_rename("trino_codepoint", &[1]),
+        "lpad" => return simple_rename("trino_lpad", &[3]),
+        "rpad" => return simple_rename("trino_rpad", &[3]),
+        "upper" => return simple_rename("trino_upper", &[1]),
+        "lower" => return simple_rename("trino_lower", &[1]),
         "replace" => {
             arity(name, &args, &[2, 3])?;
             let mut full = args.clone();
@@ -1172,50 +1491,40 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
         // Regular expressions
         "regexp_replace" => {
             arity(name, &args, &[2, 3])?;
-            let mut it = args.into_iter();
-            let (s, p) = (it.next().unwrap(), it.next().unwrap());
-            let r = it.next().unwrap_or_else(|| str_lit(""));
-            if matches!(r, Expr::Lambda(_)) {
+            if matches!(args.get(2), Some(Expr::Lambda(_))) {
                 return Err(GlauxSqlError::unsupported(
                     "lambda expression",
                     "regexp_replace with a lambda replacement is not translated",
                 ));
             }
-            // Java replacement syntax ($1, \$) → Rust regex syntax.
-            let r = func("trino_regexp_replacement", vec![r]);
-            func("regexp_replace", vec![s, p, r, str_lit("g")])
+            return simple_rename("trino_regexp_replace", &[2, 3]);
         }
+        "regexp_like" => return simple_rename("trino_regexp_like", &[2]),
         "regexp_extract" => {
             arity(name, &args, &[2, 3])?;
-            let group = match args.get(2) {
-                Some(g) => integer_literal(name, "group", g)?,
-                None => 0,
-            };
-            let wrapped = match &args[1] {
-                Expr::Value(v) if matches!(v.value, Value::SingleQuotedString(_)) => {
-                    let Value::SingleQuotedString(p) = &v.value else {
-                        unreachable!()
-                    };
-                    str_lit(&format!("({p})"))
-                }
-                other => binary(
-                    binary(str_lit("("), BinaryOperator::StringConcat, other.clone()),
-                    BinaryOperator::StringConcat,
-                    str_lit(")"),
-                ),
-            };
+            if let Some(g) = args.get(2) {
+                integer_literal(name, "group", g)?;
+            }
+            return simple_rename("trino_regexp_extract", &[2, 3]);
+        }
+        // Date and time
+        "date" => return simple_rename("trino_date", &[1]),
+        // Trino's `current_timestamp` / `now()` are `timestamp(3) with time
+        // zone` (UTC on Athena); `localtimestamp` is a zone-less
+        // `timestamp(3)`. DataFusion's `now()` is nanosecond-precise.
+        "current_timestamp" | "now" => {
+            arity(name, &args, &[0])?;
             func(
-                "array_element",
+                "arrow_cast",
                 vec![
-                    func("regexp_match", vec![args[0].clone(), wrapped]),
-                    num_lit(group + 1),
+                    func("trino_timestamp_millis", vec![func("now", vec![])]),
+                    str_lit("Timestamp(Millisecond, Some(\"UTC\"))"),
                 ],
             )
         }
-        // Date and time
-        "date" => {
-            arity(name, &args, &[1])?;
-            cast_to(args.into_iter().next().unwrap(), DataType::Date)
+        "localtimestamp" => {
+            arity(name, &args, &[0])?;
+            func("trino_timestamp", vec![func("now", vec![])])
         }
         "date_parse" | "parse_datetime" => {
             arity(name, &args, &[2])?;
@@ -1225,7 +1534,22 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             } else {
                 joda_to_chrono(name, &fmt, Direction::Parse)?
             };
-            func("to_timestamp", vec![args[0].clone(), str_lit(&chrono)])
+            // `date_parse` is a zone-less `timestamp(3)`; `parse_datetime`
+            // is a `timestamp(3) with time zone` (UTC). DataFusion's
+            // `to_timestamp` is nanosecond-precise; the cast truncates like
+            // Joda's fraction parser.
+            let target = if name == "date_parse" {
+                "Timestamp(Millisecond, None)"
+            } else {
+                "Timestamp(Millisecond, Some(\"UTC\"))"
+            };
+            func(
+                "arrow_cast",
+                vec![
+                    func("to_timestamp", vec![args[0].clone(), str_lit(&chrono)]),
+                    str_lit(target),
+                ],
+            )
         }
         "date_format" | "format_datetime" => {
             arity(name, &args, &[2])?;
@@ -1237,7 +1561,6 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             };
             func("to_char", vec![args[0].clone(), str_lit(&chrono)])
         }
-        "localtimestamp" => return simple_rename("now", &[0]),
         "date_trunc" => return simple_rename("trino_date_trunc", &[2]),
         "from_unixtime" => {
             if args.len() > 1 {
@@ -1249,12 +1572,14 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             }
             arity(name, &args, &[1])?;
             // Trino rounds to the millisecond (`from_unixtime(1.9999)` is
-            // `...:02.000`); a plain cast would truncate.
+            // `...:02.000`); a plain cast would truncate. The argument is a
+            // double in Trino, so an integer argument is widened first
+            // (integer arithmetic would be overflow-checked).
             let millis = cast_to(
                 func(
                     "round",
                     vec![binary(
-                        args.into_iter().next().unwrap(),
+                        cast_to(args.into_iter().next().unwrap(), double()),
                         BinaryOperator::Multiply,
                         num_lit(1000),
                     )],
@@ -1293,7 +1618,18 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
                 it.next().unwrap(),
             )
         }
-        "ceiling" => return simple_rename("ceil", &[1]),
+        "ceiling" | "ceil" => return simple_rename("trino_ceil", &[1]),
+        "floor" => return simple_rename("trino_floor", &[1]),
+        "round" => return simple_rename("trino_round", &[1, 2]),
+        // Trino: power(x, p) → double, whatever the argument types;
+        // DataFusion keeps integer arguments integral.
+        "pow" | "power" => {
+            arity(name, &args, &[2])?;
+            func(
+                "power",
+                args.into_iter().map(|a| cast_to(a, double())).collect(),
+            )
+        }
         // Trino: NULL if any argument is NULL; DataFusion skips NULLs.
         "greatest" | "least" => {
             require_scalar_call(name, f)?;
@@ -1319,15 +1655,22 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             )
         }
         "rand" => return simple_rename("random", &[0]),
-        "sign" => return simple_rename("signum", &[1]),
-        "truncate" => return simple_rename("trunc", &[1, 2]),
+        "sign" => return simple_rename("trino_sign", &[1]),
+        "truncate" => return simple_rename("trino_truncate", &[1, 2]),
         // Arrays
-        "array_join" => return simple_rename("array_to_string", &[2, 3]),
+        "array_join" => return simple_rename("trino_array_join", &[2, 3]),
+        "array_max" => return simple_rename("trino_array_max", &[1]),
+        "array_min" => return simple_rename("trino_array_min", &[1]),
         "array_position" => {
             arity(name, &args, &[2])?;
             let array = args[0].clone();
+            // Trino: NULL for a NULL array *or* a NULL element argument.
             case_when(
-                Expr::IsNull(Box::new(array.clone())),
+                binary(
+                    Expr::IsNull(Box::new(array.clone())),
+                    BinaryOperator::Or,
+                    Expr::IsNull(Box::new(args[1].clone())),
+                ),
                 Expr::Value(Value::Null.with_empty_span()),
                 Some(func(
                     "coalesce",
@@ -1341,7 +1684,7 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
                 )),
             )
         }
-        "array_remove" => return simple_rename("array_remove_all", &[2]),
+        "array_remove" => return simple_rename("trino_array_remove", &[2]),
         "array_sort" => {
             if args.len() == 2 {
                 return Err(GlauxSqlError::invalid_arguments(
@@ -1443,18 +1786,20 @@ mod tests {
     }
 
     #[test]
-    fn regexp_shims_add_global_flag_and_group_wrapping() {
+    fn regexp_shims_route_to_the_checked_udfs() {
         assert_eq!(
-            rewrite("SELECT regexp_replace(s, 'a+') AS a, regexp_extract(s, '\\d+') AS b, regexp_extract(s, '(a)(b)', 2) AS c FROM t").unwrap(),
-            "SELECT regexp_replace(s, 'a+', trino_regexp_replacement(''), 'g') AS a, array_element(regexp_match(s, '(\\d+)'), 1) AS b, array_element(regexp_match(s, '((a)(b))'), 3) AS c FROM t"
+            rewrite("SELECT regexp_replace(s, 'a+') AS a, regexp_extract(s, '\\d+') AS b, regexp_extract(s, '(a)(b)', 2) AS c, regexp_like(s, 'x') AS d FROM t").unwrap(),
+            "SELECT trino_regexp_replace(s, 'a+') AS a, trino_regexp_extract(s, '\\d+') AS b, trino_regexp_extract(s, '(a)(b)', 2) AS c, trino_regexp_like(s, 'x') AS d FROM t"
         );
+        let err = rewrite("SELECT regexp_extract(s, 'x', n) FROM t").unwrap_err();
+        assert!(err.to_string().contains("integer literal"), "{err}");
     }
 
     #[test]
     fn date_functions_translate_formats_and_units() {
         assert_eq!(
-            rewrite("SELECT date_parse(s, '%Y-%m-%d %H:%i:%s') AS a, format_datetime(ts, 'yyyy-MM-dd') AS b FROM t").unwrap(),
-            "SELECT to_timestamp(s, '%Y-%m-%d %H:%M:%S') AS a, to_char(ts, '%Y-%m-%d') AS b FROM t"
+            rewrite("SELECT date_parse(s, '%Y-%m-%d %H:%i:%s') AS a, format_datetime(ts, 'yyyy-MM-dd') AS b, parse_datetime(s, 'yyyy') AS c FROM t").unwrap(),
+            "SELECT arrow_cast(to_timestamp(s, '%Y-%m-%d %H:%M:%S'), 'Timestamp(Millisecond, None)') AS a, to_char(ts, '%Y-%m-%d') AS b, arrow_cast(to_timestamp(s, '%Y'), 'Timestamp(Millisecond, Some(\"UTC\"))') AS c FROM t"
         );
         assert_eq!(
             rewrite("SELECT day_of_week(d) AS a, month(d) AS b FROM t").unwrap(),
@@ -1462,7 +1807,7 @@ mod tests {
         );
         assert_eq!(
             rewrite("SELECT from_unixtime(t) AS a, to_unixtime(ts) AS b, date_trunc('day', ts) AS c FROM t").unwrap(),
-            "SELECT arrow_cast(CAST(round(t * 1000) AS BIGINT), 'Timestamp(Millisecond, None)') AS a, trino_to_unixtime(ts) AS b, trino_date_trunc('day', ts) AS c FROM t"
+            "SELECT arrow_cast(CAST(round(CAST(t AS DOUBLE) * 1000) AS BIGINT), 'Timestamp(Millisecond, None)') AS a, trino_to_unixtime(ts) AS b, trino_date_trunc('day', ts) AS c FROM t"
         );
     }
 

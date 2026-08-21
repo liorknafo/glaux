@@ -14,16 +14,35 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray};
-use arrow::datatypes::{DataType, Float32Type, Float64Type, SchemaRef};
+use arrow::datatypes::{DataType, Float32Type, Float64Type, Int64Type, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 
+use crate::dialect::udf::timestamps::to_millis_rounded;
 use crate::model::{ColumnInfo, Datum, Row};
 
 /// Athena's timestamp text form: `2024-01-31 12:34:56.789`.
 pub const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
 /// Athena's date text form.
 pub const DATE_FORMAT: &str = "%Y-%m-%d";
+/// Athena's time text form: `12:34:56.789`.
+pub const TIME_FORMAT: &str = "%H:%M:%S%.3f";
+
+/// Render a timestamp value (in `unit`) the way Athena prints a
+/// `timestamp(3)`: rounded half up to the millisecond, and for a zoned
+/// timestamp followed by the zone (`UTC` for the UTC offset).
+pub fn timestamp_text(value: i64, unit: TimeUnit, tz: Option<&str>) -> String {
+    let millis = to_millis_rounded(value, unit);
+    let text = match chrono::DateTime::from_timestamp_millis(millis) {
+        Some(t) => t.naive_utc().format(TIMESTAMP_FORMAT).to_string(),
+        None => format!("{millis} ms"),
+    };
+    match tz {
+        None => text,
+        Some("UTC" | "+00:00" | "+0000" | "Z" | "Etc/UTC") => format!("{text} UTC"),
+        Some(tz) => format!("{text} {tz}"),
+    }
+}
 
 /// Render a `double` the way Trino (Java's `Double.toString`) does:
 /// plain decimal with at least one fractional digit for magnitudes in
@@ -283,6 +302,7 @@ pub fn format_options() -> FormatOptions<'static> {
         .with_timestamp_format(Some(TIMESTAMP_FORMAT))
         .with_timestamp_tz_format(Some(TIMESTAMP_FORMAT))
         .with_date_format(Some(DATE_FORMAT))
+        .with_time_format(Some(TIME_FORMAT))
         .with_datetime_format(Some(TIMESTAMP_FORMAT))
 }
 
@@ -293,7 +313,7 @@ fn format_value(
     array: &ArrayRef,
     index: usize,
 ) -> Result<Option<String>, ResultError> {
-    if array.is_null(index) {
+    if array.is_null(index) || array.data_type() == &DataType::Null {
         return Ok(None);
     }
     let format_error = |message: String| ResultError::Format {
@@ -343,6 +363,15 @@ fn format_value(
         }
         DataType::Float64 => java_double_text(array.as_primitive::<Float64Type>().value(index)),
         DataType::Float32 => java_float_text(array.as_primitive::<Float32Type>().value(index)),
+        DataType::Timestamp(unit, tz) => {
+            let value = arrow::compute::cast(array, &DataType::Int64)
+                .map_err(|e| format_error(e.to_string()))?;
+            timestamp_text(
+                value.as_primitive::<Int64Type>().value(index),
+                *unit,
+                tz.as_deref(),
+            )
+        }
         DataType::Binary
         | DataType::LargeBinary
         | DataType::BinaryView
@@ -604,6 +633,26 @@ mod tests {
         assert_eq!(java_float_text(1.5), "1.5");
         assert_eq!(java_float_text(1e10), "1.0E10");
         assert_eq!(java_float_text(0.1), "0.1");
+    }
+
+    #[test]
+    fn timestamps_round_to_millis_and_name_their_zone() {
+        assert_eq!(
+            timestamp_text(1_704_450_600_999_600_000, TimeUnit::Nanosecond, None),
+            "2024-01-05 10:30:01.000"
+        );
+        assert_eq!(
+            timestamp_text(1_704_450_600_123, TimeUnit::Millisecond, Some("+00:00")),
+            "2024-01-05 10:30:00.123 UTC"
+        );
+        assert_eq!(
+            timestamp_text(1_704_450_600, TimeUnit::Second, Some("UTC")),
+            "2024-01-05 10:30:00.000 UTC"
+        );
+        assert_eq!(
+            timestamp_text(253_402_300_800_000, TimeUnit::Millisecond, None),
+            "+10000-01-01 00:00:00.000"
+        );
     }
 
     #[test]

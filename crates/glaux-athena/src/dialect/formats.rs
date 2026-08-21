@@ -189,8 +189,20 @@ pub fn joda_to_chrono(
             ('Z', 1) if direction == Direction::Format => "+0000",
             ('Z', 2) if direction == Direction::Format => "+00:00",
             ('Z', _) if direction == Direction::Format => "UTC",
-            ('Z', _) => "%z",
-            ('z', _) | ('K', _) | ('k', _) | ('G', _) | ('C', _) | ('S', _) => {
+            // Parsing an offset would make Trino keep it in a `timestamp
+            // with time zone`; glaux cannot carry that, and applying the
+            // offset instead would change `hour(x)` and the printed text.
+            ('Z', _) | ('z', _) => {
+                return Err(GlauxSqlError::unsupported(
+                    "timestamp with time zone",
+                    format!(
+                        "{function}: pattern letter '{c}' in {pattern:?} parses a zone, which \
+                         Trino keeps in a `timestamp with time zone`; glaux cannot return that \
+                         in v0.1"
+                    ),
+                ));
+            }
+            ('K', _) | ('k', _) | ('G', _) | ('C', _) | ('S', _) => {
                 return Err(GlauxSqlError::invalid_arguments(
                     function,
                     format!(
@@ -289,9 +301,10 @@ mod tests {
             joda_to_chrono("format_datetime", "HH:mm ZZ", Direction::Format).unwrap(),
             "%H:%M +00:00"
         );
-        assert_eq!(
-            joda_to_chrono("parse_datetime", "HH:mm Z", Direction::Parse).unwrap(),
-            "%H:%M %z"
+        let err = joda_to_chrono("parse_datetime", "HH:mm Z", Direction::Parse).unwrap_err();
+        assert!(
+            err.to_string().contains("timestamp with time zone"),
+            "{err}"
         );
     }
 

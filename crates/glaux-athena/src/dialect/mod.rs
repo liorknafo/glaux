@@ -40,11 +40,13 @@ use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::execution::SessionStateBuilder;
+use datafusion::optimizer::Analyzer;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DFStatement;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::Dialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 
 pub use error::GlauxSqlError;
 pub use naming::OutputRenames;
@@ -118,6 +120,7 @@ pub fn translate(sql: &str) -> Result<Statement, GlauxSqlError> {
 
 /// [`translate`], also returning the output renames the engine must apply.
 pub fn translate_full(sql: &str) -> Result<Translation, GlauxSqlError> {
+    reject_digit_identifiers(sql)?;
     let mut statements =
         Parser::parse_sql(&AthenaDialect, sql).map_err(|e| GlauxSqlError::Parse {
             message: e.to_string(),
@@ -137,11 +140,80 @@ pub fn translate_full(sql: &str) -> Result<Translation, GlauxSqlError> {
         }
     }
     let mut statement = statements.remove(0);
+    naming::check_order_by_ambiguity(&statement)?;
     // Naming runs first so it sees aliases as written (case preserved) and
     // can map the folded names back; the rewriter then folds everything.
     let renames = naming::name_outputs(&mut statement);
     rewrite::rewrite_statement(&mut statement)?;
     Ok(Translation { statement, renames })
+}
+
+/// Trino lexes a digit run glued to identifier characters (`1_000`, `1AS`,
+/// `0x1F`) as one token and rejects it ("identifier must not start with a
+/// digit"); sqlparser splits it into a number and an identifier, which would
+/// make `SELECT 1_000` a query returning `1` aliased `_000`.
+fn reject_digit_identifiers(sql: &str) -> Result<(), GlauxSqlError> {
+    let tokens = Tokenizer::new(&AthenaDialect, sql)
+        .tokenize_with_location()
+        .map_err(|e| GlauxSqlError::Parse {
+            message: e.to_string(),
+        })?;
+    for pair in tokens.windows(2) {
+        if let (Token::Number(number, _), Token::Word(word)) = (&pair[0].token, &pair[1].token)
+            && word.quote_style.is_none()
+            && pair[0].span.end == pair[1].span.start
+        {
+            return Err(GlauxSqlError::Parse {
+                message: format!(
+                    "identifier must not start with a digit: {number}{}; surround the identifier \
+                     with double quotes or separate the number from it",
+                    word.value
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Result types Athena cannot return: an `interval` (DataFusion produces one
+/// for `interval + interval`) or a decimal above precision 38. Checked on
+/// the planned output schema so the refusal is a planning error naming the
+/// type.
+fn check_output_types(plan: &datafusion::logical_expr::LogicalPlan) -> Result<(), GlauxSqlError> {
+    for field in plan.schema().fields() {
+        match field.data_type() {
+            arrow::datatypes::DataType::Interval(_) | arrow::datatypes::DataType::Duration(_) => {
+                return Err(GlauxSqlError::unsupported(
+                    "interval result",
+                    format!(
+                        "column {} is an interval; glaux cannot return interval values in v0.1 \
+                         (apply the interval to a date or timestamp instead)",
+                        field.name()
+                    ),
+                ));
+            }
+            arrow::datatypes::DataType::Decimal256(..) => {
+                return Err(GlauxSqlError::unsupported(
+                    "DECIMAL precision above 38",
+                    format!(
+                        "column {} exceeds Trino's maximum decimal precision",
+                        field.name()
+                    ),
+                ));
+            }
+            arrow::datatypes::DataType::Decimal128(p, _) if *p > 38 => {
+                return Err(GlauxSqlError::unsupported(
+                    "DECIMAL precision above 38",
+                    format!(
+                        "column {} exceeds Trino's maximum decimal precision",
+                        field.name()
+                    ),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Rename result columns back to the names Athena reports.
@@ -207,8 +279,13 @@ impl TrinoEngine {
             .options_mut()
             .sql_parser
             .parse_float_as_decimal = true;
+        // Trino's typing rules must see the operand types before DataFusion
+        // coerces them, so the rule goes in front of the default analyzer
+        // rules (type coercion included).
+        let mut rules = Analyzer::default().rules;
+        rules.insert(0, Arc::new(udf::arithmetic::TrinoSemantics));
         let state = SessionStateBuilder::new_from_existing(state)
-            .with_analyzer_rule(Arc::new(udf::arithmetic::CheckedIntegerArithmetic))
+            .with_analyzer_rules(rules)
             .build();
         Self {
             inner: DataFusionEngine::new(SessionContext::new_with_state(state), default_catalog),
@@ -233,6 +310,7 @@ impl QueryEngine for TrinoEngine {
             .await
             .map_err(crate::engine::plan_error)?;
         strict::check(&plan)?;
+        check_output_types(&plan)?;
         let output = crate::engine::run_logical_plan(&ctx, plan, started).await?;
         Ok(restore_names(output, &renames))
     }
@@ -261,6 +339,18 @@ mod tests {
         assert!(
             matches!(translate("SELEC 1"), Err(GlauxSqlError::Parse { message }) if message.contains("SELEC"))
         );
+    }
+
+    #[test]
+    fn digit_identifiers_are_syntax_errors() {
+        for sql in ["SELECT 1_000", "SELECT 1AS x", "SELECT 1.5x FROM t"] {
+            let err = translate(sql).unwrap_err();
+            assert!(
+                matches!(&err, GlauxSqlError::Parse { message } if message.contains("must not start with a digit")),
+                "{sql}: {err}"
+            );
+        }
+        translate("SELECT 1 AS x, 1e5, 2.5 FROM t WHERE a = 1").unwrap();
     }
 
     #[test]

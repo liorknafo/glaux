@@ -137,6 +137,17 @@ pub(crate) fn comparable(left: &DataType, right: &DataType) -> bool {
     compatible(class(left), class(right), Operator::Eq)
 }
 
+/// The Trino name of a DataFusion function the rewriter emitted.
+fn trino_function_name(name: &str) -> &str {
+    match name {
+        "character_length" => "length",
+        "btrim" => "trim",
+        "levenshtein" => "levenshtein_distance",
+        "to_timestamp" => "date_parse",
+        other => other,
+    }
+}
+
 fn operator_text(op: Operator) -> String {
     match op {
         Operator::IsDistinctFrom => "IS DISTINCT FROM".to_string(),
@@ -223,6 +234,56 @@ fn date_argument(name: &str) -> Option<usize> {
     }
 }
 
+/// DataFusion string functions the registry passes through, with the
+/// argument positions Trino types as `varchar`. DataFusion would stringify
+/// a number or a date there (`length(123)` is 3); Trino has no such
+/// signature.
+fn string_arguments(name: &str) -> &'static [usize] {
+    match name {
+        "character_length" | "ltrim" | "rtrim" | "btrim" => &[0],
+        "starts_with" | "strpos" | "levenshtein" | "regexp_match" => &[0, 1],
+        "replace" | "translate" => &[0, 1, 2],
+        // `date_parse(x, fmt)`: the parsed text must be a varchar.
+        "to_timestamp" => &[0],
+        _ => &[],
+    }
+}
+
+/// Whether Trino has a cast between these type classes (varchar sources are
+/// validated at run time; the pairs here are the ones Trino refuses at
+/// planning, such as `CAST(DATE ... AS BIGINT)` or `CAST(12 AS DATE)`).
+fn castable(source: Class, target: Class) -> bool {
+    use Class::*;
+    matches!(
+        (source, target),
+        (Null | Other, _)
+            | (_, Other)
+            | (String, _)
+            | (Number, Number | String | Boolean)
+            | (Boolean, Boolean | Number | String)
+            | (Date, Date | Timestamp | String)
+            | (Timestamp, Timestamp | Date | Time | String)
+            | (Time, Time | String)
+            | (Interval, Interval | String)
+            | (Array, Array)
+            | (Binary, Binary)
+    )
+}
+
+fn check_cast(source: &Expr, target: &DataType, schema: &DFSchema) -> Result<(), GlauxSqlError> {
+    let Ok(source_type) = source.get_type(schema) else {
+        return Ok(());
+    };
+    if castable(class(&source_type), class(target)) {
+        return Ok(());
+    }
+    Err(GlauxSqlError::type_mismatch(format!(
+        "Cannot cast {} to {}",
+        trino_type_name(&source_type),
+        trino_type_name(target)
+    )))
+}
+
 fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
     match expr {
         Expr::BinaryExpr(binary) => check_operands(&binary.left, binary.op, &binary.right, schema),
@@ -268,6 +329,8 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
             }
             check_common_type("CASE results", &results, schema)
         }
+        Expr::Cast(cast) => check_cast(&cast.expr, cast.field.data_type(), schema),
+        Expr::TryCast(cast) => check_cast(&cast.expr, cast.field.data_type(), schema),
         Expr::ScalarFunction(call) => {
             let name = call.func.name();
             match name {
@@ -294,6 +357,21 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
                              date_parse or CAST)",
                             trino_type_name(&t)
                         )));
+                    }
+                    for index in string_arguments(name) {
+                        if let Some(arg) = call.args.get(*index)
+                            && let Ok(t) = arg.get_type(schema)
+                            && !matches!(class(&t), Class::String | Class::Null)
+                            && !(name == "character_length" && class(&t) == Class::Binary)
+                        {
+                            return Err(GlauxSqlError::type_mismatch(format!(
+                                "Unexpected parameters ({}) for function {}: expected varchar \
+                                 (Trino does not convert {} to varchar implicitly; use CAST)",
+                                trino_type_name(&t),
+                                trino_function_name(name),
+                                trino_type_name(&t)
+                            )));
+                        }
                     }
                     Ok(())
                 }
@@ -372,6 +450,22 @@ pub fn check(plan: &LogicalPlan) -> Result<(), GlauxSqlError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cast_matrix_follows_trino() {
+        use Class::*;
+        assert!(castable(String, Timestamp));
+        assert!(castable(Number, String));
+        assert!(castable(Number, Boolean));
+        assert!(castable(Date, Timestamp));
+        assert!(castable(Timestamp, Date));
+        assert!(!castable(Number, Date));
+        assert!(!castable(Number, Timestamp));
+        assert!(!castable(Date, Number));
+        assert!(!castable(Timestamp, Number));
+        assert!(!castable(Boolean, Date));
+        assert!(castable(Null, Date));
+    }
 
     #[test]
     fn class_compatibility_follows_trino() {

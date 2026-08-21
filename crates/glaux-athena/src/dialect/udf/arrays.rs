@@ -9,14 +9,21 @@
 //!   is string-only and would stringify an array).
 //! - `contains(array, x)` / `arrays_overlap(a, b)`: `NULL`, not `false`,
 //!   when no match is found but a `NULL` element could have been one.
+//! - `array_max` / `array_min`: `NULL` when any element is `NULL`
+//!   (DataFusion skips NULL elements).
+//! - `array_remove(array, x)`: keeps `NULL` elements (DataFusion drops them)
+//!   and is `NULL` for a `NULL` `x`.
+//! - `array_join(array, sep[, null_replacement])`: elements rendered in
+//!   Trino's text forms (`1.0`, `2024-01-05 10:00:00.000`).
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanBuilder, Int64Array, ListArray, StringBuilder,
+    Array, ArrayRef, AsArray, BooleanBuilder, Int64Array, ListArray, StringBuilder, new_null_array,
 };
-use arrow::compute::{cast, take};
+use arrow::buffer::OffsetBuffer;
+use arrow::compute::{SortOptions, cast, sort_to_indices, take};
 use arrow::datatypes::{DataType, Field};
 use datafusion::common::{Result, ScalarValue, plan_err};
 use datafusion::logical_expr::{
@@ -26,7 +33,7 @@ use datafusion::logical_expr::{
 
 use super::{data_error, int64_array, string_array, type_mismatch};
 use crate::dialect::strict::comparable;
-use crate::dialect::udf::casts::trino_type_name;
+use crate::dialect::udf::casts::{to_varchar, trino_type_name};
 
 /// The array UDFs.
 pub fn all() -> Vec<ScalarUDF> {
@@ -36,7 +43,17 @@ pub fn all() -> Vec<ScalarUDF> {
         ScalarUDF::new_from_impl(TrinoReverse::new()),
         ScalarUDF::new_from_impl(TrinoContains::new()),
         ScalarUDF::new_from_impl(TrinoArraysOverlap::new()),
+        ScalarUDF::new_from_impl(TrinoArrayExtreme::new(true)),
+        ScalarUDF::new_from_impl(TrinoArrayExtreme::new(false)),
+        ScalarUDF::new_from_impl(TrinoArrayRemove::new()),
+        ScalarUDF::new_from_impl(TrinoArrayJoin::new()),
     ]
+}
+
+/// Whether element `i` of `array` is NULL, also for `NullArray` values
+/// (whose physical null buffer is absent).
+fn is_null_at(array: &dyn Array, i: usize) -> bool {
+    array.data_type() == &DataType::Null || array.is_null(i)
 }
 
 /// Normalise every Arrow list flavour to `List<i32>` so one code path
@@ -322,7 +339,7 @@ fn row_scalars(list: &ListArray, i: usize) -> Result<(Vec<ScalarValue>, bool)> {
     let mut out = Vec::with_capacity(end - start);
     let mut saw_null = false;
     for j in start..end {
-        if values.is_null(j) {
+        if is_null_at(values.as_ref(), j) {
             saw_null = true;
         } else {
             out.push(ScalarValue::try_from_array(values.as_ref(), j)?);
@@ -380,7 +397,7 @@ impl ScalarUDFImpl for TrinoContains {
         };
         let mut out = BooleanBuilder::with_capacity(rows);
         for i in 0..rows {
-            if list.is_null(i) || needle.is_null(i) {
+            if list.is_null(i) || is_null_at(needle.as_ref(), i) {
                 out.append_null();
                 continue;
             }
@@ -466,6 +483,264 @@ impl ScalarUDFImpl for TrinoArraysOverlap {
             let a: HashSet<ScalarValue> = a.into_iter().collect();
             let found = b.iter().any(|v| a.contains(v));
             out.append_option(membership(found, a_null || b_null));
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// array_max / array_min / array_remove / array_join
+// ---------------------------------------------------------------------------
+
+/// `trino_array_max(x)` / `trino_array_min(x)`: `NULL` for an empty array
+/// or when any element is `NULL`, as in Trino.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoArrayExtreme {
+    signature: Signature,
+    max: bool,
+}
+
+impl TrinoArrayExtreme {
+    /// New instance.
+    pub fn new(max: bool) -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+            max,
+        }
+    }
+
+    fn function(&self) -> &'static str {
+        if self.max { "array_max" } else { "array_min" }
+    }
+}
+
+impl ScalarUDFImpl for TrinoArrayExtreme {
+    fn name(&self) -> &str {
+        if self.max {
+            "trino_array_max"
+        } else {
+            "trino_array_min"
+        }
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        match element_type(&arg_types[0]) {
+            Some(t) => Ok(t.clone()),
+            None => Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function {}. Expected: {}(array(T))",
+                trino_type_name(&arg_types[0]),
+                self.function(),
+                self.function()
+            ))),
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let list = as_list(self.function(), args.args[0].to_array(rows)?)?;
+        let values = list.values();
+        let offsets = list.value_offsets();
+        let options = SortOptions {
+            descending: self.max,
+            nulls_first: false,
+        };
+        let mut positions: Vec<Option<i64>> = Vec::with_capacity(rows);
+        for i in 0..rows {
+            let (start, end) = (offsets[i] as usize, offsets[i + 1] as usize);
+            if list.is_null(i) || start == end {
+                positions.push(None);
+                continue;
+            }
+            let slice = values.slice(start, end - start);
+            if (0..slice.len()).any(|j| is_null_at(slice.as_ref(), j)) {
+                positions.push(None);
+                continue;
+            }
+            let order = sort_to_indices(slice.as_ref(), Some(options), Some(1))?;
+            positions.push(Some(start as i64 + i64::from(order.value(0))));
+        }
+        let taken = take(values.as_ref(), &Int64Array::from(positions), None)?;
+        Ok(ColumnarValue::Array(taken))
+    }
+}
+
+/// `trino_array_remove(array, x)`: every element equal to `x` removed,
+/// `NULL` elements kept, `NULL` when `x` is `NULL`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoArrayRemove {
+    signature: Signature,
+}
+
+impl Default for TrinoArrayRemove {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoArrayRemove {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoArrayRemove {
+    fn name(&self) -> &str {
+        "trino_array_remove"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        check_element_comparable("array_remove", &arg_types[0], &arg_types[1])?;
+        let element = element_type(&arg_types[0]).expect("checked above");
+        Ok(DataType::List(Arc::new(Field::new(
+            "item",
+            element.clone(),
+            true,
+        ))))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let list = as_list("array_remove", args.args[0].to_array(rows)?)?;
+        let element = list.values().data_type().clone();
+        let needle = args.args[1].to_array(rows)?;
+        let needle = if needle.data_type() == &element || element == DataType::Null {
+            needle
+        } else {
+            cast(&needle, &element)?
+        };
+        let values = list.values();
+        let offsets = list.value_offsets();
+        let mut kept: Vec<i64> = Vec::with_capacity(values.len());
+        let mut new_offsets: Vec<i32> = Vec::with_capacity(rows + 1);
+        let mut validity: Vec<bool> = Vec::with_capacity(rows);
+        new_offsets.push(0);
+        for i in 0..rows {
+            if list.is_null(i) || is_null_at(needle.as_ref(), i) {
+                validity.push(false);
+                new_offsets.push(kept.len() as i32);
+                continue;
+            }
+            let wanted = ScalarValue::try_from_array(needle.as_ref(), i)?;
+            for j in offsets[i] as usize..offsets[i + 1] as usize {
+                let keep = is_null_at(values.as_ref(), j)
+                    || ScalarValue::try_from_array(values.as_ref(), j)? != wanted;
+                if keep {
+                    kept.push(j as i64);
+                }
+            }
+            validity.push(true);
+            new_offsets.push(kept.len() as i32);
+        }
+        let taken = take(values.as_ref(), &Int64Array::from(kept), None)?;
+        let result = ListArray::try_new(
+            Arc::new(Field::new("item", taken.data_type().clone(), true)),
+            OffsetBuffer::new(new_offsets.into()),
+            taken,
+            Some(validity.into()),
+        )?;
+        Ok(ColumnarValue::Array(Arc::new(result)))
+    }
+}
+
+/// `trino_array_join(array, separator[, null_replacement])`: elements in
+/// Trino's text forms; `NULL` elements are skipped unless a replacement is
+/// given.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoArrayJoin {
+    signature: Signature,
+}
+
+impl Default for TrinoArrayJoin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoArrayJoin {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::one_of(
+                vec![TypeSignature::Any(2), TypeSignature::Any(3)],
+                Volatility::Immutable,
+            ),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoArrayJoin {
+    fn name(&self) -> &str {
+        "trino_array_join"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        let Some(element) = element_type(&arg_types[0]) else {
+            return Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function array_join. Expected: \
+                 array_join(array(T), varchar)",
+                trino_type_name(&arg_types[0])
+            )));
+        };
+        if matches!(
+            element,
+            DataType::List(_) | DataType::LargeList(_) | DataType::Struct(_) | DataType::Map(..)
+        ) {
+            return Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function array_join: elements must be scalar",
+                trino_type_name(&arg_types[0])
+            )));
+        }
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let list = as_list("array_join", args.args[0].to_array(rows)?)?;
+        let separators = string_array("array_join", &args.args[1], rows)?;
+        let replacements = match args.args.get(2) {
+            Some(r) => Some(string_array("array_join", r, rows)?),
+            None => None,
+        };
+        let values = list.values();
+        let texts = if values.data_type() == &DataType::Null {
+            to_varchar(&new_null_array(&DataType::Utf8, values.len()))?
+        } else {
+            to_varchar(values)?
+        };
+        let offsets = list.value_offsets();
+        let mut out = StringBuilder::new();
+        for i in 0..rows {
+            let replacement_null = replacements.as_ref().is_some_and(|r| r.is_null(i));
+            if list.is_null(i) || separators.is_null(i) || replacement_null {
+                out.append_null();
+                continue;
+            }
+            let mut parts: Vec<&str> = Vec::new();
+            for j in offsets[i] as usize..offsets[i + 1] as usize {
+                if is_null_at(values.as_ref(), j) {
+                    if let Some(r) = &replacements {
+                        parts.push(r.value(i));
+                    }
+                } else {
+                    parts.push(texts.value(j));
+                }
+            }
+            out.append_value(parts.join(separators.value(i)));
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }

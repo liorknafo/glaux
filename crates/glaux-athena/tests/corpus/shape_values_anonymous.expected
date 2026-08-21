@@ -1,4 +1,4 @@
-types: bigint, varchar
+types: integer, varchar
 +-------+-------+
 | _col0 | _col1 |
 +-------+-------+

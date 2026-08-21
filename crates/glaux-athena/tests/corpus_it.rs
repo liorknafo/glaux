@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Float64Array, Int64Array, ListBuilder, RecordBatch,
-    StringArray, StringBuilder, TimestampMillisecondArray,
+    StringArray, StringBuilder, TimestampMillisecondArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::util::pretty::pretty_format_batches;
@@ -213,9 +213,37 @@ fn orders() -> (Arc<Schema>, RecordBatch) {
     (schema, batch)
 }
 
+/// `events`: id, at (timestamp with nanosecond precision, as a Glue
+/// `timestamp` column read from Parquet micros/nanos arrives).
+fn events() -> (Arc<Schema>, RecordBatch) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("at", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+    ]));
+    let base = millis(2024, 1, 5, 10, 0, 0) * 1_000_000;
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            Arc::new(TimestampNanosecondArray::from(vec![
+                Some(base + 999_600_000),
+                Some(base + 123_456_789),
+                Some(base + 500_000),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+    (schema, batch)
+}
+
 fn engine() -> TrinoEngine {
     let ctx = SessionContext::new();
-    for (name, (schema, batch)) in [("customers", customers()), ("orders", orders())] {
+    for (name, (schema, batch)) in [
+        ("customers", customers()),
+        ("orders", orders()),
+        ("events", events()),
+    ] {
         ctx.register_table(
             name,
             Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),

@@ -1,4 +1,4 @@
-types: bigint, bigint, bigint, varchar
+types: bigint, bigint, integer, varchar
 +---+---+----+----+
 | n | m | v1 | v2 |
 +---+---+----+----+

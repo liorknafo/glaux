@@ -2055,6 +2055,7 @@ dependencies = [
  "glaux-catalog",
  "object_store",
  "parquet",
+ "regex",
  "serde",
  "serde_json",
  "sqlparser",

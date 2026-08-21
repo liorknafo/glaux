@@ -9,13 +9,20 @@
 //!   follows only ever sees integral values. Out-of-range values still fail
 //!   in that cast (`INVALID_CAST_ARGUMENT`) or become `NULL` under
 //!   `TRY_CAST`, as in Trino.
-//! - `trino_varchar(x[, n])`: `CAST(x AS VARCHAR[(n)])` with Trino's text
-//!   forms — timestamps as `2024-01-05 10:30:00.000`, doubles as Java
-//!   prints them — and truncation to `n` characters for bounded targets.
+//! - `trino_varchar(x[, n])` / `trino_try_varchar`: `CAST(x AS
+//!   VARCHAR[(n)])` with Trino's text forms — timestamps as `2024-01-05
+//!   10:30:00.000`, doubles as Java prints them. A bounded target truncates
+//!   a *varchar* source to `n` characters but refuses any other source whose
+//!   text is longer (`CAST(12345 AS VARCHAR(2))` is an error on Trino).
+//! - `trino_boolean(x)` / `trino_try_boolean`: `CAST(x AS BOOLEAN)`: only
+//!   `true` / `false` / `t` / `f` / `1` / `0` (any case) from varchar, where
+//!   DataFusion also accepts `yes` / `on`; numbers are `!= 0`.
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, PrimitiveArray, StringArray, StringBuilder};
+use arrow::array::{
+    Array, ArrayRef, AsArray, BooleanBuilder, PrimitiveArray, StringArray, StringBuilder,
+};
 use arrow::compute::cast;
 use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Decimal128Type, Float32Type, Float64Type, Int64Type,
@@ -27,14 +34,17 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
-use super::{data_error, int64_array, user_err};
-use crate::results::{format_options, java_double_text, java_float_text};
+use super::{data_error, int64_array, string_array, type_mismatch, user_err};
+use crate::results::{format_options, java_double_text, java_float_text, timestamp_text};
 
 /// The cast UDFs.
 pub fn all() -> Vec<ScalarUDF> {
     vec![
         ScalarUDF::new_from_impl(TrinoRoundForCast::new()),
-        ScalarUDF::new_from_impl(TrinoVarchar::new()),
+        ScalarUDF::new_from_impl(TrinoVarchar::new(false)),
+        ScalarUDF::new_from_impl(TrinoVarchar::new(true)),
+        ScalarUDF::new_from_impl(TrinoBoolean::new(false)),
+        ScalarUDF::new_from_impl(TrinoBoolean::new(true)),
     ]
 }
 
@@ -165,22 +175,18 @@ impl ScalarUDFImpl for TrinoRoundForCast {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TrinoVarchar {
     signature: Signature,
-}
-
-impl Default for TrinoVarchar {
-    fn default() -> Self {
-        Self::new()
-    }
+    try_cast: bool,
 }
 
 impl TrinoVarchar {
     /// New instance.
-    pub fn new() -> Self {
+    pub fn new(try_cast: bool) -> Self {
         Self {
             signature: Signature::one_of(
                 vec![TypeSignature::Any(1), TypeSignature::Any(2)],
                 Volatility::Immutable,
             ),
+            try_cast,
         }
     }
 }
@@ -221,7 +227,7 @@ pub(crate) fn trino_type_name(data_type: &DataType) -> String {
 }
 
 /// Convert any castable array to Trino's `varchar` text.
-fn to_varchar(input: &ArrayRef) -> Result<StringArray> {
+pub(crate) fn to_varchar(input: &ArrayRef) -> Result<StringArray> {
     let rows = input.len();
     let text: StringArray = match input.data_type() {
         DataType::Utf8 => input.as_string::<i32>().clone(),
@@ -262,7 +268,16 @@ fn to_varchar(input: &ArrayRef) -> Result<StringArray> {
         | DataType::Decimal256(_, _)
         | DataType::Date32
         | DataType::Date64 => cast(input, &DataType::Utf8)?.as_string::<i32>().clone(),
-        DataType::Timestamp(_, _) | DataType::Time32(_) | DataType::Time64(_) => {
+        DataType::Timestamp(unit, tz) => {
+            let ints = cast(input, &DataType::Int64)?;
+            let ints = ints.as_primitive::<Int64Type>();
+            let mut out = StringBuilder::new();
+            for v in ints.iter() {
+                out.append_option(v.map(|v| timestamp_text(v, *unit, tz.as_deref())));
+            }
+            out.finish()
+        }
+        DataType::Time32(_) | DataType::Time64(_) => {
             let options = format_options();
             let formatter = ArrayFormatter::try_new(input.as_ref(), &options)?;
             let mut out = StringBuilder::new();
@@ -287,7 +302,11 @@ fn to_varchar(input: &ArrayRef) -> Result<StringArray> {
 
 impl ScalarUDFImpl for TrinoVarchar {
     fn name(&self) -> &str {
-        "trino_varchar"
+        if self.try_cast {
+            "trino_try_varchar"
+        } else {
+            "trino_varchar"
+        }
     }
 
     fn signature(&self) -> &Signature {
@@ -320,6 +339,10 @@ impl ScalarUDFImpl for TrinoVarchar {
             return Ok(ColumnarValue::Array(Arc::new(text)));
         };
         let limits: PrimitiveArray<Int64Type> = int64_array("CAST", "varchar length", limit, rows)?;
+        let source_is_varchar = matches!(
+            input.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Null
+        );
         let mut out = StringBuilder::new();
         for i in 0..rows {
             if text.is_null(i) || limits.is_null(i) {
@@ -330,9 +353,123 @@ impl ScalarUDFImpl for TrinoVarchar {
             if n < 0 {
                 return user_err!("CAST", "varchar length must not be negative, got {n}");
             }
-            out.append_value(text.value(i).chars().take(n as usize).collect::<String>());
+            let value = text.value(i);
+            if !source_is_varchar && value.chars().count() > n as usize {
+                // Trino truncates varchar → varchar(n) but refuses to
+                // shorten the text of any other type.
+                if self.try_cast {
+                    out.append_null();
+                    continue;
+                }
+                return Err(data_error(
+                    "INVALID_CAST_ARGUMENT",
+                    format!("Value {value} cannot be represented as varchar({n})"),
+                ));
+            }
+            out.append_value(value.chars().take(n as usize).collect::<String>());
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+/// `trino_boolean(x)` / `trino_try_boolean(x)`: `CAST(x AS BOOLEAN)`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoBoolean {
+    signature: Signature,
+    try_cast: bool,
+}
+
+impl TrinoBoolean {
+    /// New instance.
+    pub fn new(try_cast: bool) -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+            try_cast,
+        }
+    }
+}
+
+/// Trino's varchar → boolean rule (no trimming, case-insensitive).
+pub(crate) fn parse_trino_boolean(text: &str) -> Option<bool> {
+    match text.to_ascii_lowercase().as_str() {
+        "true" | "t" | "1" => Some(true),
+        "false" | "f" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+impl ScalarUDFImpl for TrinoBoolean {
+    fn name(&self) -> &str {
+        if self.try_cast {
+            "trino_try_boolean"
+        } else {
+            "trino_boolean"
+        }
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        match &arg_types[0] {
+            DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View => Ok(DataType::Boolean),
+            other => Err(type_mismatch(format!(
+                "Cannot cast {} to boolean",
+                trino_type_name(other)
+            ))),
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let input = args.args[0].to_array(rows)?;
+        let out: ArrayRef = match input.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                let strings = string_array("CAST", &args.args[0], rows)?;
+                let mut out = BooleanBuilder::with_capacity(rows);
+                for i in 0..rows {
+                    if strings.is_null(i) {
+                        out.append_null();
+                        continue;
+                    }
+                    match parse_trino_boolean(strings.value(i)) {
+                        Some(b) => out.append_value(b),
+                        None if self.try_cast => out.append_null(),
+                        None => {
+                            return Err(data_error(
+                                "INVALID_CAST_ARGUMENT",
+                                format!("Cannot cast '{}' to BOOLEAN", strings.value(i)),
+                            ));
+                        }
+                    }
+                }
+                Arc::new(out.finish())
+            }
+            // Trino: a decimal is true when non-zero.
+            DataType::Decimal128(_, _) => {
+                let decimals = input.as_primitive::<Decimal128Type>();
+                let mut out = BooleanBuilder::with_capacity(rows);
+                for v in decimals.iter() {
+                    out.append_option(v.map(|v| v != 0));
+                }
+                Arc::new(out.finish())
+            }
+            // Arrow's numeric → boolean cast is `!= 0`, as Trino's.
+            _ => cast(&input, &DataType::Boolean)?,
+        };
+        Ok(ColumnarValue::Array(out))
     }
 }
 
@@ -358,6 +495,25 @@ mod tests {
     fn floats_round_half_away_from_zero() {
         let rounded = round_floats(&Float64Array::from(vec![2.5, -2.5, 120.5, 0.49, -0.5]));
         assert_eq!(rounded.values().as_ref(), &[3.0, -3.0, 121.0, 0.0, -1.0]);
+    }
+
+    #[test]
+    fn boolean_text_follows_trino() {
+        for (text, expected) in [
+            ("true", Some(true)),
+            ("TRUE", Some(true)),
+            ("t", Some(true)),
+            ("1", Some(true)),
+            ("false", Some(false)),
+            ("F", Some(false)),
+            ("0", Some(false)),
+            ("yes", None),
+            ("on", None),
+            (" true", None),
+            ("", None),
+        ] {
+            assert_eq!(parse_trino_boolean(text), expected, "{text}");
+        }
     }
 
     #[test]

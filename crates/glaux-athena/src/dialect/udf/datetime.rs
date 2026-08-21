@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, AsArray, Float64Array, TimestampNanosecondArray};
+use arrow::array::{Array, AsArray, Float64Array};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, TimeUnit, TimestampMicrosecondType};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, TimeDelta};
@@ -18,7 +18,7 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
-use super::{Unit, naive, to_nanos, type_mismatch, unit_arg, user_err};
+use super::{Unit, from_naive, to_naive, type_mismatch, unit_arg, user_err};
 use crate::dialect::udf::casts::trino_type_name;
 
 /// The date/time UDFs.
@@ -39,10 +39,10 @@ pub fn truncate(ts: NaiveDateTime, unit: Unit) -> Option<NaiveDateTime> {
     let day = ts.date();
     Some(match unit {
         Unit::Millisecond | Unit::Second | Unit::Minute | Unit::Hour | Unit::Day => {
-            let nanos = unit.fixed_nanos()?;
-            let since_midnight = (ts - day.and_hms_opt(0, 0, 0)?).num_nanoseconds()?;
+            let millis = unit.fixed_millis()?;
+            let since_midnight = (ts - day.and_hms_opt(0, 0, 0)?).num_milliseconds();
             day.and_hms_opt(0, 0, 0)?
-                + TimeDelta::nanoseconds(since_midnight - since_midnight % nanos)
+                + TimeDelta::milliseconds(since_midnight - since_midnight % millis)
         }
         Unit::Week => {
             let monday = day - TimeDelta::days(i64::from(day.weekday().num_days_from_monday()));
@@ -110,24 +110,21 @@ impl ScalarUDFImpl for TrinoDateTrunc {
                 format!("{unit:?}").to_lowercase()
             );
         }
-        let (nanos, tz) = to_nanos("date_trunc", &input)?;
         let mut out = Vec::with_capacity(rows);
-        for i in 0..rows {
-            if nanos.is_null(i) {
-                out.push(None);
-                continue;
-            }
-            let truncated = naive(nanos.value(i))
-                .and_then(|ts| truncate(ts, unit))
-                .and_then(|ts| ts.and_utc().timestamp_nanos_opt());
-            match truncated {
-                Some(v) => out.push(Some(v)),
-                None => return user_err!("date_trunc", "timestamp out of range"),
+        for ts in to_naive("date_trunc", &input)? {
+            match ts {
+                None => out.push(None),
+                Some(ts) => match truncate(ts, unit) {
+                    Some(v) => out.push(Some(v)),
+                    None => return user_err!("date_trunc", "{ts} is out of range"),
+                },
             }
         }
-        let result = TimestampNanosecondArray::from(out).with_timezone_opt(tz);
-        let result = cast(&(Arc::new(result) as ArrayRef), &input_type)?;
-        Ok(ColumnarValue::Array(result))
+        Ok(ColumnarValue::Array(from_naive(
+            "date_trunc",
+            out,
+            &input_type,
+        )?))
     }
 }
 
