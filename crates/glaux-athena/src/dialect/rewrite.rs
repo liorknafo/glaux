@@ -850,10 +850,18 @@ fn rewrite_typed_string(expr: &mut Expr) -> Result<(), GlauxSqlError> {
         }
         DataType::Time(..) => Ok(()),
         DataType::Decimal(_) | DataType::Numeric(_) | DataType::Dec(_) => {
-            *expr = decimal_literal(&text).ok_or_else(|| {
+            *expr = decimal_literal(&text).map_err(|why| {
                 GlauxSqlError::unsupported(
                     "DECIMAL literal",
-                    format!("`{typed}` is not a plain decimal number (digits with an optional sign and point)"),
+                    match why {
+                        DecimalLiteralError::NotANumber => format!(
+                            "`{typed}` is not a plain decimal number (digits with an optional \
+                             sign and point)"
+                        ),
+                        DecimalLiteralError::TooManyDigits(digits) => {
+                            format!("`{typed}` has {digits} digits; Trino decimals hold at most 38")
+                        }
+                    },
                 )
             })?;
             Ok(())
@@ -870,7 +878,7 @@ fn rewrite_typed_string(expr: &mut Expr) -> Result<(), GlauxSqlError> {
 /// `DECIMAL 'text'` → `CAST('text' AS DECIMAL(p, s))` with Trino's
 /// precision (all digits, ignoring leading zeros, at least 1) and scale
 /// (digits after the point). `None` when the text is not a decimal number.
-fn decimal_literal(text: &str) -> Option<Expr> {
+fn decimal_literal(text: &str) -> Result<Expr, DecimalLiteralError> {
     let trimmed = text.trim();
     let unsigned = trimmed.strip_prefix(['-', '+']).unwrap_or(trimmed);
     let (int_part, frac_part) = match unsigned.split_once('.') {
@@ -881,18 +889,31 @@ fn decimal_literal(text: &str) -> Option<Expr> {
         || !int_part.bytes().all(|b| b.is_ascii_digit())
         || !frac_part.bytes().all(|b| b.is_ascii_digit())
     {
-        return None;
+        return Err(DecimalLiteralError::NotANumber);
     }
-    let digits = int_part.trim_start_matches('0').len() + frac_part.len();
-    let precision = digits.max(1) as u64;
+    let digits = decimal_digits(int_part, frac_part);
     let scale = frac_part.len() as i64;
-    if precision > 38 {
-        return None;
+    if digits > 38 {
+        return Err(DecimalLiteralError::TooManyDigits(digits));
     }
-    Some(cast_to(
+    Ok(cast_to(
         str_lit(trimmed),
-        DataType::Decimal(ExactNumberInfo::PrecisionAndScale(precision, scale)),
+        DataType::Decimal(ExactNumberInfo::PrecisionAndScale(digits as u64, scale)),
     ))
+}
+
+/// Why a `DECIMAL '...'` literal could not be typed.
+enum DecimalLiteralError {
+    /// Not digits with an optional sign and point.
+    NotANumber,
+    /// More significant digits than a Trino decimal holds.
+    TooManyDigits(usize),
+}
+
+/// Trino's precision for a decimal literal: significant integer digits plus
+/// every fractional digit, at least one.
+fn decimal_digits(int_part: &str, frac_part: &str) -> usize {
+    (int_part.trim_start_matches('0').len() + frac_part.len()).max(1)
 }
 
 /// Whether a timestamp / time literal text has a trailing zone (`Z`, an
@@ -1210,31 +1231,35 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             *expr = func("trino_double", vec![str_lit(text)]);
             Ok(())
         }
-        // An integer literal beyond bigint is a DECIMAL in Trino; DataFusion
-        // would type it as an unsigned 64-bit integer (which Athena cannot
-        // return) or refuse it.
+        // An integer literal beyond bigint is a *parse* error in Trino, not a
+        // decimal. Its grammar has one production for a digits-only token
+        // (`number : MINUS? INTEGER_VALUE #integerLiteral`), `AstBuilder`
+        // turns it into a `LongLiteral`, and that constructor parses with
+        // `Long.parseLong` and raises `Invalid numeric literal: ...` when it
+        // does not fit; the `#decimalLiteral` production needs a decimal
+        // point. glaux relies on exactly that rule for the (correct)
+        // `-9223372036854775808` → bigint fold, so it has to hold here too.
+        // Handing back a `decimal(20,0)` value would be a value where Athena
+        // refuses the query.
         Expr::Value(v) if is_oversized_integer_literal(&v.value) => {
             let Value::Number(text, _) = &v.value else {
                 unreachable!()
             };
-            let digits = text
-                .trim_start_matches(['-', '+'])
-                .trim_start_matches('0')
-                .len()
-                .max(1);
-            if digits > 38 {
-                return Err(GlauxSqlError::unsupported(
-                    "DECIMAL precision above 38",
-                    format!(
-                        "the literal {text} has {digits} digits; Trino decimals hold at most 38"
-                    ),
-                ));
-            }
-            *expr = cast_to(
-                str_lit(text),
-                DataType::Decimal(ExactNumberInfo::PrecisionAndScale(digits as u64, 0)),
-            );
-            Ok(())
+            let digits = decimal_digits(text.trim_start_matches(['-', '+']), "");
+            let hint = if digits > 38 {
+                "and it has more digits than a Trino decimal holds, so DECIMAL '...' will not \
+                 carry it either"
+                    .to_string()
+            } else {
+                format!("write DECIMAL '{text}' for a decimal of that value")
+            };
+            Err(GlauxSqlError::Parse {
+                message: format!(
+                    "Invalid numeric literal: {text} — Trino reads a digits-only literal as a \
+                     bigint and has no production taking it to a decimal, so a value beyond \
+                     bigint is refused at parse time; {hint}"
+                ),
+            })
         }
         Expr::Value(v) if matches!(v.value, Value::HexStringLiteral(_)) => {
             Err(GlauxSqlError::unsupported(
@@ -2673,11 +2698,14 @@ mod tests {
                 .unwrap(),
             "SELECT -9223372036854775808 AS a, -1 AS b, -(1) AS c, 3 - 1 AS d, -1.5 AS e, -trino_double('1e2') AS f, -x AS g FROM t"
         );
-        // Beyond bigint either way: a decimal with the digit count of the
-        // magnitude.
-        assert_eq!(
-            rewrite("SELECT -99999999999999999999 AS a").unwrap(),
-            "SELECT CAST('-99999999999999999999' AS DECIMAL(20,0)) AS a"
+        // Beyond bigint either way: Trino's grammar reads the whole thing as
+        // one integer literal and `Long.parseLong` refuses it, so glaux does
+        // too (it used to answer a decimal(20,0)).
+        let err = rewrite("SELECT -99999999999999999999 AS a").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid numeric literal: -99999999999999999999"),
+            "{err}"
         );
         // Set operations other than EXCEPT ALL keep their quantifiers.
         rewrite("SELECT 1 INTERSECT ALL SELECT 1").unwrap();
