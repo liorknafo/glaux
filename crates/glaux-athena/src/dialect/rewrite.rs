@@ -172,10 +172,19 @@ impl VisitorMut for Rewriter {
 fn rewrite_query(query: &mut Query, wrap_values: bool) -> Result<(), GlauxSqlError> {
     // CTE names are identifiers too.
     if let Some(with) = &mut query.with {
+        if with.recursive {
+            return Err(GlauxSqlError::unsupported(
+                "WITH RECURSIVE",
+                "recursive CTEs are not supported in v0.1: DataFusion's recursive execution has \
+                 not been vetted against Trino's semantics (its type unification differs); \
+                 rewrite the recursion as an explicit UNION ALL of the levels",
+            ));
+        }
         for cte in &mut with.cte_tables {
             fold_alias(&mut cte.alias);
         }
     }
+    rewrite_fetch(query)?;
     if !query.locks.is_empty() {
         return Err(GlauxSqlError::unsupported(
             "FOR UPDATE / FOR SHARE",
@@ -212,6 +221,53 @@ fn rewrite_query(query: &mut Query, wrap_values: bool) -> Result<(), GlauxSqlErr
         check_using_references(select, query.order_by.as_ref())?;
     }
     rewrite_set_expr(&mut query.body)
+}
+
+/// `FETCH FIRST n ROWS ONLY` is Trino syntax equivalent to `LIMIT n`;
+/// DataFusion's planner does not implement the `fetch` clause, so it is
+/// rewritten onto the limit clause here. `WITH TIES` (keep the rows tying
+/// with the last one, per the `ORDER BY`) and `PERCENT` have no DataFusion
+/// equivalent and are refused by name.
+fn rewrite_fetch(query: &mut Query) -> Result<(), GlauxSqlError> {
+    let Some(fetch) = query.fetch.take() else {
+        return Ok(());
+    };
+    if fetch.with_ties {
+        return Err(GlauxSqlError::unsupported(
+            "FETCH FIRST n ROWS WITH TIES",
+            "ties have no DataFusion equivalent; use `FETCH FIRST n ROWS ONLY` / LIMIT, or rank \
+             with a window function and filter",
+        ));
+    }
+    if fetch.percent {
+        return Err(GlauxSqlError::unsupported(
+            "FETCH FIRST n PERCENT ROWS",
+            "not Trino syntax (Trino's FETCH takes a row count)",
+        ));
+    }
+    // `FETCH FIRST ROW ONLY` (no quantity) is one row.
+    let quantity = fetch.quantity.unwrap_or_else(|| num_lit(1));
+    match &mut query.limit_clause {
+        None => {
+            query.limit_clause = Some(sqlparser::ast::LimitClause::LimitOffset {
+                limit: Some(quantity),
+                offset: None,
+                limit_by: vec![],
+            });
+            Ok(())
+        }
+        Some(sqlparser::ast::LimitClause::LimitOffset {
+            limit: limit @ None,
+            limit_by,
+            ..
+        }) if limit_by.is_empty() => {
+            *limit = Some(quantity);
+            Ok(())
+        }
+        Some(_) => Err(GlauxSqlError::Parse {
+            message: "LIMIT and FETCH cannot be combined".to_string(),
+        }),
+    }
 }
 
 /// The selects of a query body: the select itself or, for a set
@@ -1137,6 +1193,20 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             "lambda expression",
             "`x -> ...` arguments are not translated; express the logic with explicit SQL",
         )),
+        // `interval * n` / `interval / n` are valid Trino (an interval
+        // result, which glaux cannot return in v0.1); DataFusion's planner
+        // would fail with an unnamed `Cannot get result type for temporal
+        // operation` error, so they are refused by name here.
+        Expr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::Multiply | BinaryOperator::Divide)
+                && (is_interval_operand(left) || is_interval_operand(right)) =>
+        {
+            Err(GlauxSqlError::unsupported(
+                "interval * n",
+                "multiplying or dividing an interval produces an INTERVAL in Trino, which glaux \
+                 cannot return in v0.1; use date_add with a computed count instead",
+            ))
+        }
         Expr::BinaryOp { op, .. }
             if !matches!(
                 op,
@@ -1577,6 +1647,19 @@ fn fold_negative_integer_literal(expr: &mut Expr) {
     }
 }
 
+/// Whether an operand is an interval literal (possibly parenthesised).
+fn is_interval_operand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Interval(_) => true,
+        Expr::Nested(inner) => is_interval_operand(inner),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus | UnaryOperator::Minus,
+            expr: inner,
+        } => is_interval_operand(inner),
+        _ => false,
+    }
+}
+
 fn is_exponent_literal(value: &Value) -> bool {
     matches!(value, Value::Number(text, _) if text.contains(['e', 'E']))
 }
@@ -1826,8 +1909,63 @@ fn rewrite_function(expr: &mut Expr) -> Result<(), GlauxSqlError> {
     Ok(())
 }
 
+/// The window offset arguments Trino validates (`LeadFunction` /
+/// `NthValueFunction` / `NtileFunction` raise `INVALID_FUNCTION_ARGUMENT`)
+/// but DataFusion silently reinterprets: `lead(x, -1)` runs as `lag`,
+/// `lead(x, NULL)` returns `x`, `nth_value(x, 0)` returns NULL, `ntile(0)`
+/// fails with the wrong error code. Validated here on the literal; a
+/// non-literal offset is refused, because it could only be validated row by
+/// row at execution.
+fn check_window_offset(name: &str, f: &Function) -> Result<(), GlauxSqlError> {
+    let (index, minimum) = match name {
+        "lead" | "lag" => (1, 0),
+        "nth_value" => (1, 1),
+        "ntile" => (0, 1),
+        _ => return Ok(()),
+    };
+    let FunctionArguments::List(list) = &f.args else {
+        return Ok(());
+    };
+    let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(offset))) = list.args.get(index) else {
+        return Ok(());
+    };
+    let what = if name == "ntile" { "Buckets" } else { "Offset" };
+    match offset {
+        Expr::Value(v) => match &v.value {
+            Value::Number(text, _) => match text.parse::<i64>() {
+                Ok(n) if n >= minimum => Ok(()),
+                Ok(_) => Err(GlauxSqlError::invalid_arguments(
+                    name,
+                    format!("{what} must be at least {minimum}"),
+                )),
+                Err(_) => Err(GlauxSqlError::invalid_arguments(
+                    name,
+                    format!("{what} must be an integer, got {text}"),
+                )),
+            },
+            Value::Null => Err(GlauxSqlError::invalid_arguments(
+                name,
+                format!("{what} must not be null"),
+            )),
+            other => Err(GlauxSqlError::invalid_arguments(
+                name,
+                format!("{what} must be an integer literal, got {other}"),
+            )),
+        },
+        _ => Err(GlauxSqlError::invalid_arguments(
+            name,
+            format!(
+                "the {} argument must be an integer literal (glaux validates it at translation, \
+                 where Trino would check every row at execution)",
+                what.to_lowercase()
+            ),
+        )),
+    }
+}
+
 /// Passthroughs whose Trino overloads go beyond what DataFusion implements.
 fn check_passthrough_arity(name: &str, f: &Function) -> Result<(), GlauxSqlError> {
+    check_window_offset(name, f)?;
     let count = match &f.args {
         FunctionArguments::List(list) => list.args.len(),
         _ => return Ok(()),
@@ -2144,29 +2282,11 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
         "array_join" => return simple_rename("trino_array_join", &[2, 3]),
         "array_max" => return simple_rename("trino_array_max", &[1]),
         "array_min" => return simple_rename("trino_array_min", &[1]),
-        "array_position" => {
-            arity(name, &args, &[2])?;
-            let array = args[0].clone();
-            // Trino: NULL for a NULL array *or* a NULL element argument.
-            case_when(
-                binary(
-                    Expr::IsNull(Box::new(array.clone())),
-                    BinaryOperator::Or,
-                    Expr::IsNull(Box::new(args[1].clone())),
-                ),
-                Expr::Value(Value::Null.with_empty_span()),
-                Some(func(
-                    "coalesce",
-                    vec![
-                        cast_to(
-                            func("array_position", vec![array, args[1].clone()]),
-                            bigint(),
-                        ),
-                        num_lit(0),
-                    ],
-                )),
-            )
-        }
+        // The Rust UDF: NULL for a NULL array or element argument, 0 when
+        // absent, IEEE equality for float elements (DataFusion's
+        // `array_position` would return NULL when absent and treat NaN as
+        // equal to NaN).
+        "array_position" => return simple_rename("trino_array_position", &[2]),
         "array_remove" => return simple_rename("trino_array_remove", &[2]),
         "array_sort" => {
             if args.len() == 2 {
