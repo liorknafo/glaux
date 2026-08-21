@@ -1864,7 +1864,7 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
                      arrays of percentages)",
                 ));
             }
-            rename(f, "approx_percentile_cont");
+            rename(f, "trino_approx_percentile");
             return Ok(None);
         }
         "arbitrary" => {
@@ -2247,7 +2247,7 @@ mod tests {
                 "SELECT arbitrary(x) AS a, every(b) AS e, approx_percentile(v, 0.9) AS p FROM t"
             )
             .unwrap(),
-            "SELECT first_value(x) AS a, bool_and(b) AS e, approx_percentile_cont(v, 0.9) AS p FROM t"
+            "SELECT first_value(x) AS a, bool_and(b) AS e, trino_approx_percentile(v, 0.9) AS p FROM t"
         );
     }
 

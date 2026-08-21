@@ -345,6 +345,18 @@ impl AggregateUDFImpl for TrinoApproxPercentile {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        // Trino has an array-of-percentages overload returning an array;
+        // glaux refuses it (the rewrite layer cannot see types, so the
+        // refusal lives here).
+        if matches!(
+            arg_types[1],
+            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
+        ) {
+            return Err(type_mismatch(
+                "approx_percentile(x, percentages) with an array of percentages is not \
+                 supported; call approx_percentile once per percentage",
+            ));
+        }
         result_type(&arg_types[0])
     }
 
@@ -533,7 +545,7 @@ mod tests {
 
     #[test]
     fn large_inputs_compress_and_stay_monotonic() {
-        let values: Vec<f64> = (0..10_000).map(|i| f64::from(i)).collect();
+        let values: Vec<f64> = (0..10_000).map(f64::from).collect();
         let mut d = digest_of(&values);
         assert!(d.means.len() < 1000);
         let mut last = f64::NEG_INFINITY;
@@ -544,6 +556,26 @@ mod tests {
             last = v;
         }
         assert_eq!(d.value_at(1.0), 9_999.0);
+    }
+
+    #[test]
+    fn merged_partial_digests_agree_with_a_single_digest() {
+        // The distributed path: two partial digests serialised and merged
+        // must answer like one digest over all the values (exactly, while
+        // nothing compresses).
+        let all = [120.5, 35.0, 80.25, 15.0, 240.0, 60.0, 10.0];
+        let mut left = digest_of(&all[..4]);
+        let mut right = digest_of(&all[4..]);
+        let mut merged = TDigest::new();
+        let (m, w, min, max) = left.serialized();
+        let (m, w, min, max) = (m.to_vec(), w.to_vec(), min, max);
+        merged.merge_with(&m, &w, min, max);
+        let (m, w, min, max) = right.serialized();
+        let (m, w, min, max) = (m.to_vec(), w.to_vec(), min, max);
+        merged.merge_with(&m, &w, min, max);
+        for q in [0.0, 0.25, 0.5, 0.75, 0.9, 1.0] {
+            assert_eq!(merged.value_at(q), digest_of(&all).value_at(q), "{q}");
+        }
     }
 
     #[test]

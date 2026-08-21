@@ -32,6 +32,7 @@ pub mod math;
 pub mod nullable;
 pub mod regex;
 pub mod strings;
+pub mod tdigest;
 pub mod timestamps;
 
 use std::sync::Arc;
@@ -114,6 +115,7 @@ pub fn all() -> Vec<ScalarUDF> {
 pub fn all_aggregates() -> Vec<AggregateUDF> {
     let mut udafs = arithmetic::aggregate_udfs();
     udafs.extend(decimal::aggregate_udfs());
+    udafs.extend(tdigest::aggregate_udfs());
     udafs
 }
 

@@ -112,8 +112,8 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "approx_percentile(x, percentage) → same as x",
         "Aggregate",
         Rewrite,
-        "`approx_percentile_cont(x, percentage)` (t-digest). The weighted and array-of-percentages forms are refused.",
-        ["approx_percentile_cont"]
+        "`trino_approx_percentile(x, percentage)`, a port of airlift's `TDigest` (the structure Trino uses, same merge rule and `valueAt` interpolation; compression 100), so small inputs give exactly Trino's answer and large ones the same approximation scheme, where Trino's own result already depends on how the input was split across workers. DataFusion's `approx_percentile_cont` is not used: its t-digest interpolates differently (`approx_percentile(amount, 0.9)` over the corpus `orders` gives `216.1` there and `240.0` on Trino). Overloads: `bigint` (result `Math.round`-ed), `real`, `double`; a DECIMAL argument is refused, as are the weighted and array-of-percentages forms.",
+        ["trino_approx_percentile"]
     ),
     shim!(
         "arbitrary",
