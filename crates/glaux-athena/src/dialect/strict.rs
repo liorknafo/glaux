@@ -21,6 +21,9 @@
 //! `date - date` and `timestamp - timestamp` are refused too, for a
 //! different reason: Trino returns an `interval`, which glaux cannot carry
 //! in v0.1 (DataFusion would return a bigint day count or a duration).
+//! Comparisons between intervals are refused as well: Trino compares the
+//! normalised value (`INTERVAL '1' DAY = INTERVAL '24' HOUR` is true),
+//! DataFusion the month/day/nanosecond triple.
 
 use arrow::datatypes::DataType;
 use datafusion::common::DFSchema;
@@ -147,6 +150,20 @@ fn trino_function_name(name: &str) -> &str {
     }
 }
 
+fn is_comparison(op: Operator) -> bool {
+    matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+            | Operator::IsDistinctFrom
+            | Operator::IsNotDistinctFrom
+    )
+}
+
 fn operator_text(op: Operator) -> String {
     match op {
         Operator::IsDistinctFrom => "IS DISTINCT FROM".to_string(),
@@ -181,6 +198,26 @@ fn check_types(left: &DataType, op: Operator, right: &DataType) -> Result<(), Gl
                 "`{} - {}` produces an INTERVAL in Trino, which glaux cannot return in v0.1; \
                  use date_diff(unit, a, b)",
                 trino_type_name(left),
+                trino_type_name(right)
+            ),
+        ));
+    }
+    if is_comparison(op) && (l == Class::Interval || r == Class::Interval) {
+        // Trino compares a day-to-second interval by its total milliseconds
+        // and a year-to-month one by its total months (`INTERVAL '1' DAY =
+        // INTERVAL '24' HOUR` is true) and refuses to mix the two kinds;
+        // DataFusion compares its month/day/nanosecond triple structurally,
+        // so the same query would be false. Comparison operators on
+        // intervals are refused rather than answered differently.
+        return Err(GlauxSqlError::unsupported(
+            "interval comparison",
+            format!(
+                "`{} {} {}`: Trino compares intervals by their normalised value (day-to-second \
+                 in milliseconds, year-to-month in months), which DataFusion's structural \
+                 interval comparison does not reproduce; compare the dates or timestamps the \
+                 intervals are applied to, or use date_diff",
+                trino_type_name(left),
+                operator_text(op),
                 trino_type_name(right)
             ),
         ));
