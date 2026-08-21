@@ -1,0 +1,16 @@
+-- Java/Joni regex semantics: \d \w \s \b are ASCII-only, $ also matches before a final newline.
+SELECT regexp_like('٣', '\d') AS arabic_digit,
+       regexp_extract('x٣', '\d') AS extract_arabic,
+       regexp_replace('x٣', '\d', '') AS replace_arabic,
+       regexp_like('é', '\w') AS accent_word,
+       regexp_replace('José', '\W', '') AS strip_non_word,
+       regexp_like(chr(160), '\s') AS nbsp_space,
+       regexp_like(chr(9), '\s') AS tab_space,
+       regexp_replace('aé b', '\b', '|') AS ascii_boundary,
+       regexp_like('ab' || chr(10), 'b$') AS dollar_before_final_newline,
+       regexp_replace('ab' || chr(10), 'b$', 'x') || '|' AS replace_before_final_newline,
+       regexp_like('ab' || chr(10) || chr(10), 'b$') AS dollar_not_two_newlines,
+       regexp_like('a$', '[$]') AS dollar_in_class,
+       regexp_extract('a1b22', '\d+') AS ascii_digits,
+       regexp_replace('a-b_c', '[\W]', '.') AS class_with_word_escape,
+       regexp_like('x' || chr(10) || 'y', '(?m)x$') AS multiline_flag
