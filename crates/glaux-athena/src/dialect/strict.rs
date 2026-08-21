@@ -6,13 +6,21 @@
 //! query that works on glaux but fails on Athena (or, worse, matches
 //! different rows) would be silently wrong. [`check`] walks the logical
 //! plan DataFusion produced *before* its type-coercion pass and rejects
-//! comparisons, arithmetic, concatenation, `IN` lists, and `BETWEEN` whose
-//! operand classes Trino does not combine.
+//! comparisons, arithmetic, concatenation, `IN` lists and subqueries,
+//! `BETWEEN`, join conditions (`ON` and `USING`), simple `CASE` operands
+//! and `CASE` / `if` results, `nullif` / `coalesce` / `greatest` / `least`
+//! arguments, set-operation columns, and varchar arguments to the
+//! date-part functions, wherever the operand classes are ones Trino does
+//! not combine.
 //!
 //! The rules are deliberately the permissive end of Trino's: every
 //! numeric type compares with every other numeric type, `date` with
 //! `timestamp`, and `NULL` with anything. Only the combinations Trino
 //! always refuses are refused here.
+//!
+//! `date - date` and `timestamp - timestamp` are refused too, for a
+//! different reason: Trino returns an `interval`, which glaux cannot carry
+//! in v0.1 (DataFusion would return a bigint day count or a duration).
 
 use arrow::datatypes::DataType;
 use datafusion::common::DFSchema;
@@ -123,6 +131,12 @@ fn compatible(left: Class, right: Class, op: Operator) -> bool {
     }
 }
 
+/// Whether Trino compares values of these two types (`=`, `IN`, `CASE x
+/// WHEN`, `contains`, ...).
+pub(crate) fn comparable(left: &DataType, right: &DataType) -> bool {
+    compatible(class(left), class(right), Operator::Eq)
+}
+
 fn operator_text(op: Operator) -> String {
     match op {
         Operator::IsDistinctFrom => "IS DISTINCT FROM".to_string(),
@@ -142,15 +156,71 @@ fn check_operands(
     let (Ok(left_type), Ok(right_type)) = (left.get_type(schema), right.get_type(schema)) else {
         return Ok(());
     };
-    if compatible(class(&left_type), class(&right_type), op) {
+    check_types(&left_type, op, &right_type)
+}
+
+fn check_types(left: &DataType, op: Operator, right: &DataType) -> Result<(), GlauxSqlError> {
+    let (l, r) = (class(left), class(right));
+    if op == Operator::Minus
+        && matches!(l, Class::Date | Class::Timestamp)
+        && matches!(r, Class::Date | Class::Timestamp)
+    {
+        return Err(GlauxSqlError::unsupported(
+            "date subtraction",
+            format!(
+                "`{} - {}` produces an INTERVAL in Trino, which glaux cannot return in v0.1; \
+                 use date_diff(unit, a, b)",
+                trino_type_name(left),
+                trino_type_name(right)
+            ),
+        ));
+    }
+    if compatible(l, r, op) {
         return Ok(());
     }
     Err(GlauxSqlError::type_mismatch(format!(
         "Cannot apply operator: {} {} {}",
-        trino_type_name(&left_type),
+        trino_type_name(left),
         operator_text(op),
-        trino_type_name(&right_type)
+        trino_type_name(right)
     )))
+}
+
+/// Trino requires the results of `CASE` / `if` / `coalesce` / `nullif` /
+/// `greatest` / `least` to share a type; `what` names the construct in the
+/// diagnostic.
+fn check_common_type(what: &str, exprs: &[&Expr], schema: &DFSchema) -> Result<(), GlauxSqlError> {
+    let mut types: Vec<DataType> = Vec::new();
+    for e in exprs {
+        if let Ok(t) = e.get_type(schema) {
+            types.push(t);
+        }
+    }
+    let Some(first) = types.iter().find(|t| class(t) != Class::Null) else {
+        return Ok(());
+    };
+    for t in &types {
+        if !comparable(first, t) {
+            return Err(GlauxSqlError::type_mismatch(format!(
+                "All {what} must be the same type or coercible to a common type. Cannot find \
+                 common type between {} and {}",
+                trino_type_name(first),
+                trino_type_name(t)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// DataFusion functions the rewriter emits for Trino's date-part functions
+/// (`year(x)`, `date_format(x, ...)`, `EXTRACT`); Trino refuses varchar
+/// arguments where DataFusion parses them.
+fn date_argument(name: &str) -> Option<usize> {
+    match name {
+        "date_part" => Some(1),
+        "to_char" => Some(0),
+        _ => None,
+    }
 }
 
 fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
@@ -162,9 +232,109 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
             }
             Ok(())
         }
+        Expr::InSubquery(in_subquery) => {
+            let Ok(left) = in_subquery.expr.get_type(schema) else {
+                return Ok(());
+            };
+            let Some(field) = in_subquery.subquery.subquery.schema().fields().first() else {
+                return Ok(());
+            };
+            check_types(&left, Operator::Eq, field.data_type()).map_err(|_| {
+                GlauxSqlError::type_mismatch(format!(
+                    "value and result of subquery must be of the same type for IN expression: \
+                     {} vs {}",
+                    trino_type_name(&left),
+                    trino_type_name(field.data_type())
+                ))
+            })
+        }
         Expr::Between(between) => {
             check_operands(&between.expr, Operator::GtEq, &between.low, schema)?;
             check_operands(&between.expr, Operator::LtEq, &between.high, schema)
+        }
+        Expr::Case(case) => {
+            if let Some(operand) = &case.expr {
+                for (when, _) in &case.when_then_expr {
+                    check_operands(operand, Operator::Eq, when, schema)?;
+                }
+            }
+            let mut results: Vec<&Expr> = case
+                .when_then_expr
+                .iter()
+                .map(|(_, t)| t.as_ref())
+                .collect();
+            if let Some(otherwise) = &case.else_expr {
+                results.push(otherwise);
+            }
+            check_common_type("CASE results", &results, schema)
+        }
+        Expr::ScalarFunction(call) => {
+            let name = call.func.name();
+            match name {
+                "nullif" | "coalesce" | "greatest" | "least" => {
+                    let args: Vec<&Expr> = call.args.iter().collect();
+                    check_common_type(&format!("{} operands", name.to_uppercase()), &args, schema)
+                }
+                _ => {
+                    if let Some(index) = date_argument(name)
+                        && let Some(arg) = call.args.get(index)
+                        && let Ok(t) = arg.get_type(schema)
+                        && !matches!(
+                            class(&t),
+                            Class::Date
+                                | Class::Timestamp
+                                | Class::Time
+                                | Class::Interval
+                                | Class::Null
+                        )
+                    {
+                        return Err(GlauxSqlError::type_mismatch(format!(
+                            "Unexpected parameters ({}) for date/time function: expected date, \
+                             timestamp, or interval (Trino does not parse varchar here; use \
+                             date_parse or CAST)",
+                            trino_type_name(&t)
+                        )));
+                    }
+                    Ok(())
+                }
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Plan-level checks: join conditions and set-operation columns.
+fn check_plan_node(node: &LogicalPlan, schema: &DFSchema) -> Result<(), GlauxSqlError> {
+    match node {
+        LogicalPlan::Join(join) => {
+            for (left, right) in &join.on {
+                check_operands(left, Operator::Eq, right, schema)?;
+            }
+            Ok(())
+        }
+        LogicalPlan::Union(union) => {
+            let Some(first) = union.inputs.first() else {
+                return Ok(());
+            };
+            for other in union.inputs.iter().skip(1) {
+                for (i, (a, b)) in first
+                    .schema()
+                    .fields()
+                    .iter()
+                    .zip(other.schema().fields())
+                    .enumerate()
+                {
+                    if !comparable(a.data_type(), b.data_type()) {
+                        return Err(GlauxSqlError::type_mismatch(format!(
+                            "column {} in UNION query has incompatible types: {}, {}",
+                            i + 1,
+                            trino_type_name(a.data_type()),
+                            trino_type_name(b.data_type())
+                        )));
+                    }
+                }
+            }
+            Ok(())
         }
         _ => Ok(()),
     }
@@ -177,6 +347,10 @@ pub fn check(plan: &LogicalPlan) -> Result<(), GlauxSqlError> {
     let mut failure: Option<GlauxSqlError> = None;
     let visit = plan.apply_with_subqueries(|node| {
         let schema = input_schema(node);
+        if let Err(err) = check_plan_node(node, &schema) {
+            failure = Some(err);
+            return Ok(TreeNodeRecursion::Stop);
+        }
         node.apply_expressions(|expr| {
             expr.apply(|e| match check_expr(e, &schema) {
                 Ok(()) => Ok(TreeNodeRecursion::Continue),

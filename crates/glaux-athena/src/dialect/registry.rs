@@ -504,11 +504,11 @@ pub static FUNCTIONS: &[FunctionShim] = &[
     ),
     shim!(
         "reverse",
-        "reverse(varchar)",
+        "reverse(varchar) → varchar, reverse(array) → array",
         "String",
-        Passthrough,
-        "DataFusion `reverse`",
-        ["reverse"]
+        Rewrite,
+        "Rust UDF `trino_reverse`: reverses a string's code points or an array's elements (DataFusion's `reverse` is string-only and would stringify an array)",
+        ["trino_reverse"]
     ),
     shim!(
         "rpad",
@@ -531,8 +531,8 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "split(varchar, delimiter) → array(varchar)",
         "String",
         Rewrite,
-        "`string_to_array(x, delimiter)`. The 3-argument `split(x, delimiter, limit)` form is refused.",
-        ["string_to_array"]
+        "Rust UDF `trino_split`: `split('', ',')` is `['']` and an empty delimiter splits into characters, as in Trino. The 3-argument `split(x, delimiter, limit)` form is refused.",
+        ["trino_split"]
     ),
     shim!(
         "split_part",
@@ -714,11 +714,11 @@ pub static FUNCTIONS: &[FunctionShim] = &[
     ),
     shim!(
         "date_trunc",
-        "date_trunc(unit, timestamp) → timestamp",
+        "date_trunc(unit, x) → same as x",
         "Date and time",
-        Passthrough,
-        "DataFusion `date_trunc` (same argument order and unit names)",
-        ["date_trunc"]
+        Rewrite,
+        "Rust UDF `trino_date_trunc`: a `date` input stays a `date` (DataFusion's `date_trunc` returns a timestamp), sub-day units on a `date` are refused, and varchar input is refused (`TYPE_MISMATCH`, as in Trino). Weeks start on Monday.",
+        ["trino_date_trunc"]
     ),
     shim!(
         "day",
@@ -797,8 +797,8 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "from_unixtime(double) → timestamp",
         "Date and time",
         Rewrite,
-        "`arrow_cast(CAST(x * 1000 AS BIGINT), 'Timestamp(Millisecond, None)')` (millisecond precision, like Athena). The zone-argument forms are refused.",
-        ["arrow_cast"]
+        "`arrow_cast(CAST(round(x * 1000) AS BIGINT), 'Timestamp(Millisecond, None)')` (rounded to the millisecond, like Athena: `from_unixtime(1.9999)` is `…:02.000`). The zone-argument forms are refused.",
+        ["arrow_cast", "round"]
     ),
     shim!(
         "hour",
@@ -885,8 +885,8 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "to_unixtime(timestamp) → double",
         "Date and time",
         Rewrite,
-        "`CAST(arrow_cast(arrow_cast(x, 'Timestamp(Microsecond, None)'), 'Int64') AS DOUBLE) / 1000000` (keeps fractional seconds)",
-        ["arrow_cast"]
+        "Rust UDF `trino_to_unixtime` (microsecond resolution). Varchar input is refused (`TYPE_MISMATCH`, as in Trino).",
+        ["trino_to_unixtime"]
     ),
     shim!(
         "week",
@@ -973,16 +973,16 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "greatest",
         "greatest(a, b, ...)",
         "Math",
-        Passthrough,
-        "DataFusion `greatest`",
+        Rewrite,
+        "`CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE greatest(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type.",
         ["greatest"]
     ),
     shim!(
         "least",
         "least(a, b, ...)",
         "Math",
-        Passthrough,
-        "DataFusion `least`",
+        Rewrite,
+        "`CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE least(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type.",
         ["least"]
     ),
     shim!(
@@ -1159,8 +1159,8 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "array_sort",
         "array_sort(array) → array",
         "Array",
-        Passthrough,
-        "DataFusion `array_sort` (ascending). The comparator-lambda form is refused.",
+        Rewrite,
+        "`array_sort(x, 'ASC', 'NULLS LAST')`: ascending with NULL elements last, as in Trino (DataFusion's default puts them first). The comparator-lambda form is refused.",
         ["array_sort"]
     ),
     shim!(
@@ -1175,9 +1175,9 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "arrays_overlap",
         "arrays_overlap(a, b) → boolean",
         "Array",
-        Passthrough,
-        "DataFusion `arrays_overlap`",
-        ["arrays_overlap"]
+        Rewrite,
+        "Rust UDF `trino_arrays_overlap`: NULL (not false) when no element matches but either array has a NULL element, as in Trino. Element types must be comparable.",
+        ["trino_arrays_overlap"]
     ),
     shim!(
         "cardinality",
@@ -1192,8 +1192,8 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "contains(array, element) → boolean",
         "Array",
         Rewrite,
-        "`array_has(array, element)`",
-        ["array_has"]
+        "Rust UDF `trino_contains`: NULL (not false) when the element is not found but the array has a NULL element, or when the element is NULL, as in Trino. The element type must be comparable with the array's.",
+        ["trino_contains"]
     ),
     shim!(
         "element_at",
@@ -1398,14 +1398,14 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "SELECT / DISTINCT / WHERE",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "Full projection, `SELECT DISTINCT`, arbitrary predicates. Anonymous output columns are named `_col0`, `_col1`, … by position and duplicate output names are allowed, as on Athena.",
+        notes: "Full projection, `SELECT DISTINCT`, arbitrary predicates. Anonymous output columns are named `_col0`, `_col1`, … by position (also inside derived tables and CTEs) and duplicate output names are allowed, as on Athena. `DISTINCT ON`, `QUALIFY`, `GROUP BY ALL`, `TOP`, `SELECT INTO`, `TABLESAMPLE`, `FOR UPDATE`, and `SELECT * EXCLUDE` are refused as non-Trino syntax.",
         corpus_marker: "SELECT DISTINCT",
     },
     Construct {
         name: "JOIN (INNER, LEFT, RIGHT, FULL, CROSS)",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "`ON` and `USING` forms.",
+        notes: "`ON` and `USING` forms; join keys must have comparable types (`TYPE_MISMATCH` otherwise). `NATURAL`, `SEMI` / `ANTI`, `APPLY`, and `ASOF` joins are refused as non-Trino syntax.",
         corpus_marker: "FULL OUTER JOIN",
     },
     Construct {
@@ -1426,7 +1426,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Window functions",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "`OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` and named windows. Ranking functions return `bigint` (cast from DataFusion's unsigned result).",
+        notes: "`OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` and named windows. Ranking functions return `bigint` (cast from DataFusion's unsigned result). Window `ORDER BY` sorts NULLs last by default, as in Trino.",
         corpus_marker: "OVER (",
     },
     Construct {
@@ -1440,35 +1440,35 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "ORDER BY / LIMIT / OFFSET",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "`NULLS FIRST/LAST` honoured. Trino's default (NULLS LAST for ASC) is applied when unspecified.",
+        notes: "`NULLS FIRST/LAST` honoured. Trino's default — NULLs last whatever the direction, also for window `ORDER BY` and aggregate `ORDER BY` arguments — is applied when unspecified (DataFusion's own default would sort NULLs first under `DESC`). `ORDER BY ALL` is refused.",
         corpus_marker: "OFFSET",
     },
     Construct {
         name: "UNION / UNION ALL / INTERSECT / EXCEPT",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "",
+        notes: "Corresponding columns must have comparable types (`SELECT 1 UNION SELECT 'a'` is a `TYPE_MISMATCH`, as on Athena).",
         corpus_marker: "UNION ALL",
     },
     Construct {
         name: "VALUES",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "Inline tables, also as a `FROM` source with column aliases.",
+        notes: "Inline tables, also as a `FROM` source with column aliases; anonymous columns are `_col0`, `_col1`, … as on Athena.",
         corpus_marker: "VALUES",
     },
     Construct {
         name: "CASE",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "Simple and searched forms.",
+        notes: "Simple and searched forms. The operand must be comparable with the `WHEN` values and all results must share a type (`TYPE_MISMATCH` otherwise, as on Athena); the same applies to `if`, `nullif`, and `coalesce`.",
         corpus_marker: "CASE WHEN",
     },
     Construct {
         name: "CAST",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "Trino type names (`VARCHAR[(n)]`, `BIGINT`, `INTEGER`, `SMALLINT`, `TINYINT`, `DOUBLE`, `REAL`, `DECIMAL(p,s)`, `BOOLEAN`, `DATE`, `TIMESTAMP`) map to Arrow types. Double/decimal → integer rounds half away from zero (`CAST(2.5 AS BIGINT)` is 3) and fails on overflow (`INVALID_CAST_ARGUMENT`; NULL under `TRY_CAST`). `CAST(... AS VARCHAR)` uses Trino's text forms (`2024-01-05 10:30:00.000`, `1.0E20`) and `VARCHAR(n)` truncates to `n` characters. `VARBINARY`, `JSON`, `ROW`, `MAP` targets are refused by name.",
+        notes: "Trino type names (`VARCHAR[(n)]`, `BIGINT`, `INTEGER`, `SMALLINT`, `TINYINT`, `DOUBLE`, `REAL`, `DECIMAL(p,s)`, `BOOLEAN`, `DATE`, `TIMESTAMP`) map to Arrow types. The `x::type` form is refused as non-Trino syntax. Double/decimal → integer rounds half away from zero (`CAST(2.5 AS BIGINT)` is 3) and fails on overflow (`INVALID_CAST_ARGUMENT`; NULL under `TRY_CAST`). `CAST(... AS VARCHAR)` uses Trino's text forms (`2024-01-05 10:30:00.000`, `1.0E20`) and `VARCHAR(n)` truncates to `n` characters. `VARBINARY`, `JSON`, `ROW`, `MAP` targets are refused by name.",
         corpus_marker: "CAST(",
     },
     Construct {
@@ -1482,7 +1482,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "INTERVAL literals",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "`INTERVAL '1' DAY`, `INTERVAL '2' HOUR`, and `timestamp ± interval` arithmetic.",
+        notes: "`INTERVAL '1' DAY`, `INTERVAL '2' HOUR`, and `timestamp ± interval` arithmetic. `date - date` and `timestamp - timestamp` (an `interval` result in Trino) are refused; use `date_diff`.",
         corpus_marker: "INTERVAL '",
     },
     Construct {
@@ -1503,7 +1503,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "ARRAY[...] literals and 1-based subscripts",
         category: "Expressions",
         status: ConstructStatus::Supported,
-        notes: "`arr[1]` is the first element; `arr[0]`, negative, and out-of-range subscripts are errors, as in Trino (use `element_at` for NULL instead).",
+        notes: "`arr[1]` is the first element; `arr[0]`, negative, and out-of-range subscripts are errors, as in Trino (use `element_at` for NULL instead). The bare `[1, 2]` form is refused as non-Trino syntax.",
         corpus_marker: "ARRAY[",
     },
     Construct {
@@ -1517,7 +1517,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Identifiers",
         category: "Semantics",
         status: ConstructStatus::Supported,
-        notes: "Identifiers are case-insensitive whether quoted or not, as in Trino: `\"Name\"` and `name` resolve to the same column. Output aliases keep the case they were written in (`AS \"CustomerName\"`), so an `ORDER BY` that repeats a mixed-case quoted alias must write it the same way.",
+        notes: "Identifiers are case-insensitive whether quoted or not, as in Trino: `\"Name\"` and `name` resolve to the same column. Output aliases are reported in the case they were written (`AS \"Total\"` is column `Total`) and resolve case-insensitively (`ORDER BY total`, `ORDER BY \"TOTAL\"`), also from outer queries.",
         corpus_marker: "\"",
     },
     Construct {
@@ -1538,7 +1538,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "Operator type checking",
         category: "Semantics",
         status: ConstructStatus::Supported,
-        notes: "Comparisons, arithmetic, `||`, `IN`, and `BETWEEN` between types Trino does not combine (`varchar = integer`, `'a' || 1`, `date = varchar`) are refused with `TYPE_MISMATCH` instead of being coerced. Numeric types compare with each other and `date` with `timestamp`, as in Trino.",
+        notes: "Comparisons, arithmetic, `||`, `IN` (lists and subqueries), `BETWEEN`, join keys, simple `CASE` operands, `CASE` / `if` / `nullif` / `coalesce` / `greatest` / `least` results, and set-operation columns between types Trino does not combine (`varchar = integer`, `'a' || 1`, `date = varchar`) are refused with `TYPE_MISMATCH` instead of being coerced, and the date-part functions (`year`, `date_trunc`, `date_format`, `to_unixtime`, `EXTRACT`) refuse varchar arguments. Numeric types compare with each other and `date` with `timestamp`, as in Trino.",
         corpus_marker: "'1' = 1",
     },
     Construct {
@@ -1567,6 +1567,27 @@ pub static CONSTRUCTS: &[Construct] = &[
         category: "Unsupported",
         status: ConstructStatus::Unsupported,
         notes: "Refused in v0.1; timestamps are handled as UTC instants.",
+        corpus_marker: "",
+    },
+    Construct {
+        name: "timestamp with time zone literal",
+        category: "Unsupported",
+        status: ConstructStatus::Unsupported,
+        notes: "`TIMESTAMP '2024-01-05 10:00:00 America/New_York'` (and `Z` / offset suffixes) are refused rather than silently converted to a zone-less UTC instant.",
+        corpus_marker: "",
+    },
+    Construct {
+        name: "date subtraction",
+        category: "Unsupported",
+        status: ConstructStatus::Unsupported,
+        notes: "`date - date` and `timestamp - timestamp` produce an `interval` in Trino, which glaux cannot return in v0.1; use `date_diff(unit, a, b)`.",
+        corpus_marker: "",
+    },
+    Construct {
+        name: "Non-Trino syntax",
+        category: "Unsupported",
+        status: ConstructStatus::Unsupported,
+        notes: "Syntax DataFusion accepts but Trino does not is refused by name instead of running with DataFusion semantics: `DISTINCT ON`, `QUALIFY`, `GROUP BY ALL`, `ORDER BY ALL`, `TABLESAMPLE`, `FOR UPDATE`, `NATURAL` / `SEMI` / `ANTI` / `APPLY` / `ASOF` joins, `[1, 2]` array literals, `x::type` casts, `TOP`, `SELECT INTO`, `SELECT * EXCLUDE`, PostgreSQL operators.",
         corpus_marker: "",
     },
     Construct {

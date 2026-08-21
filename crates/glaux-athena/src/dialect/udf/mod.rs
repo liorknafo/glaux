@@ -8,7 +8,10 @@
 //!   out of range), Java-syntax `regexp_replace` replacement strings;
 //! - [`casts`]: `CAST` helpers — HALF_UP rounding for double → integer and
 //!   Trino's text forms for `CAST(... AS VARCHAR)`;
-//! - [`arrays`]: `element_at` and `arr[i]` with Trino's index rules;
+//! - [`arrays`]: `element_at` and `arr[i]` with Trino's index rules,
+//!   `reverse` for arrays, `contains` / `arrays_overlap` with NULL results;
+//! - [`datetime`]: `date_trunc` keeping a `DATE` input's type and
+//!   `to_unixtime` refusing varchar input;
 //! - [`iso8601`]: strict `from_iso8601_timestamp` / `from_iso8601_date`;
 //! - [`arithmetic`]: overflow-checked bigint `+ - *` and `sum`.
 //!
@@ -21,6 +24,7 @@
 pub mod arithmetic;
 pub mod arrays;
 pub mod casts;
+pub mod datetime;
 pub mod iso8601;
 pub mod strings;
 
@@ -45,6 +49,14 @@ pub(crate) fn user_error(function: &str, message: impl Into<String>) -> DataFusi
     DataFusionError::External(Box::new(GlauxSqlError::invalid_arguments(
         function, message,
     )))
+}
+
+/// A planning failure because the argument types are ones Trino refuses
+/// (`year('2024-01-05')`, `contains(ARRAY[1], 'a')`). Carried as a
+/// [`GlauxSqlError::TypeMismatch`] so the client sees `TYPE_MISMATCH`, as
+/// on Athena.
+pub(crate) fn type_mismatch(message: impl Into<String>) -> DataFusionError {
+    DataFusionError::External(Box::new(GlauxSqlError::type_mismatch(message)))
 }
 
 /// A runtime failure caused by the data (overflow, a bad subscript). Carried
@@ -80,6 +92,7 @@ pub fn all() -> Vec<ScalarUDF> {
     udfs.extend(strings::all());
     udfs.extend(casts::all());
     udfs.extend(arrays::all());
+    udfs.extend(datetime::all());
     udfs.extend(iso8601::all());
     udfs.extend(arithmetic::scalar_udfs());
     udfs
@@ -139,22 +152,31 @@ pub(crate) fn int64_array(
 // Date/time units
 // ---------------------------------------------------------------------------
 
-/// The units Trino's `date_add` / `date_diff` accept.
+/// The units Trino's `date_add` / `date_diff` / `date_trunc` accept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Unit {
+pub enum Unit {
+    /// `millisecond`
     Millisecond,
+    /// `second`
     Second,
+    /// `minute`
     Minute,
+    /// `hour`
     Hour,
+    /// `day`
     Day,
+    /// `week`
     Week,
+    /// `month`
     Month,
+    /// `quarter`
     Quarter,
+    /// `year`
     Year,
 }
 
 impl Unit {
-    fn parse(function: &str, unit: &str) -> Result<Self> {
+    pub(crate) fn parse(function: &str, unit: &str) -> Result<Self> {
         Ok(match unit.to_ascii_lowercase().as_str() {
             "millisecond" => Self::Millisecond,
             "second" => Self::Second,
@@ -176,7 +198,7 @@ impl Unit {
     }
 
     /// Whether the unit is whole days or coarser (valid on `DATE` values).
-    fn is_calendar(self) -> bool {
+    pub(crate) fn is_calendar(self) -> bool {
         matches!(
             self,
             Self::Day | Self::Week | Self::Month | Self::Quarter | Self::Year
@@ -184,7 +206,7 @@ impl Unit {
     }
 
     /// Length in nanoseconds for fixed-length units.
-    fn fixed_nanos(self) -> Option<i64> {
+    pub(crate) fn fixed_nanos(self) -> Option<i64> {
         Some(match self {
             Self::Millisecond => 1_000_000,
             Self::Second => 1_000_000_000,
@@ -198,7 +220,7 @@ impl Unit {
 }
 
 /// The literal unit string from the first argument.
-fn unit_arg(function: &str, arg: &ColumnarValue) -> Result<Unit> {
+pub(crate) fn unit_arg(function: &str, arg: &ColumnarValue) -> Result<Unit> {
     match arg {
         ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
         | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s)))
@@ -216,7 +238,7 @@ fn unit_arg(function: &str, arg: &ColumnarValue) -> Result<Unit> {
 
 /// Cast a `DATE`/`TIMESTAMP` column to nanosecond timestamps (keeping its
 /// timezone) so the arithmetic below has one representation to handle.
-fn to_nanos(
+pub(crate) fn to_nanos(
     function: &str,
     array: &ArrayRef,
 ) -> Result<(PrimitiveArray<TimestampNanosecondType>, Option<Arc<str>>)> {
@@ -237,7 +259,7 @@ fn to_nanos(
     Ok((casted.as_primitive::<TimestampNanosecondType>().clone(), tz))
 }
 
-fn naive(nanos: i64) -> Option<NaiveDateTime> {
+pub(crate) fn naive(nanos: i64) -> Option<NaiveDateTime> {
     DateTime::from_timestamp_nanos(nanos).naive_utc().into()
 }
 

@@ -8,36 +8,54 @@
 //! error naming the function.
 //!
 //! Besides functions, the rewriter handles the syntax whose DataFusion
-//! semantics differ from Trino's: identifiers (folded to lower case, quoted
-//! or not, as Trino resolves them), `CAST` to integer / `VARCHAR` targets,
-//! `EXTRACT`, `SUBSTRING`, `POSITION`, array subscripts, and exponent
-//! literals (`1e2` is a `double` in Trino, a decimal in DataFusion).
+//! semantics differ from Trino's: identifiers and aliases (folded to lower
+//! case, quoted or not, as Trino resolves them), `ORDER BY` without an
+//! explicit null placement (Trino sorts NULLs last in both directions;
+//! DataFusion follows PostgreSQL), `CAST` to integer / `VARCHAR` targets,
+//! `EXTRACT`, `SUBSTRING`, `POSITION`, array subscripts, exponent literals
+//! (`1e2` is a `double` in Trino, a decimal in DataFusion), anonymous
+//! columns of nested queries and `VALUES` (`_colN`), and it refuses the
+//! syntax DataFusion accepts but Trino does not (`DISTINCT ON`, `QUALIFY`,
+//! `GROUP BY ALL`, `[1, 2]` literals, `::` casts, ...), so a query that
+//! would fail on Athena never quietly runs here.
 
 use std::ops::ControlFlow;
 
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, CaseWhen, CastKind, CharacterLength, DataType, DateTimeField,
-    ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, ObjectName, ObjectNamePart, Query, Statement, Subscript, TableAlias,
-    TableFactor, Value, VisitMut, VisitorMut,
+    Distinct, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident,
+    JoinConstraint, JoinOperator, NamedWindowExpr, ObjectName, ObjectNamePart, OrderByExpr,
+    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Subscript, TableAlias, TableFactor,
+    TimezoneInfo, TypedString, UnaryOperator, Value, VisitMut, VisitorMut, WindowType,
 };
 
 use super::error::GlauxSqlError;
 use super::formats::{Direction, joda_to_chrono, mysql_to_chrono};
+use super::naming;
 use super::registry::{self, ShimKind};
 
 /// Rewrite `statement` in place. On error the statement is left partially
 /// rewritten and must not be used.
 pub fn rewrite_statement(statement: &mut Statement) -> Result<(), GlauxSqlError> {
-    let mut visitor = Rewriter;
+    let mut visitor = Rewriter::default();
     match statement.visit(&mut visitor) {
         ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(err) => Err(*err),
     }
 }
 
-struct Rewriter;
+/// Alias of the derived table [`wrap_values`] synthesises around a `VALUES`
+/// body; its inner query must not be wrapped again.
+const VALUES_WRAPPER_ALIAS: &str = "__glaux_values";
+
+#[derive(Default)]
+struct Rewriter {
+    /// Set when entering the synthetic `VALUES` wrapper, consumed by the
+    /// very next `pre_visit_query` (the wrapper's inner query).
+    inside_values_wrapper: bool,
+}
 
 impl VisitorMut for Rewriter {
     type Break = Box<GlauxSqlError>;
@@ -61,13 +79,11 @@ impl VisitorMut for Rewriter {
     }
 
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-        // CTE names are identifiers too.
-        if let Some(with) = &mut query.with {
-            for cte in &mut with.cte_tables {
-                fold_alias(&mut cte.alias);
-            }
+        let wrap_values = !std::mem::take(&mut self.inside_values_wrapper);
+        match rewrite_query(query, wrap_values) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(e) => ControlFlow::Break(Box::new(e)),
         }
-        ControlFlow::Continue(())
     }
 
     fn pre_visit_table_factor(
@@ -75,6 +91,11 @@ impl VisitorMut for Rewriter {
         table_factor: &mut TableFactor,
     ) -> ControlFlow<Self::Break> {
         match table_factor {
+            TableFactor::Derived {
+                alias: Some(alias), ..
+            } if alias.name.value == VALUES_WRAPPER_ALIAS => {
+                self.inside_values_wrapper = true;
+            }
             TableFactor::Table {
                 alias: Some(alias), ..
             }
@@ -101,6 +122,15 @@ impl VisitorMut for Rewriter {
                 "UNNEST",
                 "`CROSS JOIN UNNEST(...)` is not supported in v0.1",
             )),
+            TableFactor::Table {
+                sample: Some(_), ..
+            }
+            | TableFactor::Derived {
+                sample: Some(_), ..
+            } => Some((
+                "TABLESAMPLE",
+                "Trino's `TABLESAMPLE BERNOULLI / SYSTEM` has no DataFusion equivalent",
+            )),
             TableFactor::Table { args: Some(_), .. } => {
                 Some(("table function", "table functions are not supported"))
             }
@@ -117,6 +147,362 @@ impl VisitorMut for Rewriter {
             None => ControlFlow::Continue(()),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Queries and select lists
+// ---------------------------------------------------------------------------
+
+/// Query-level rewrites: CTE names, `ORDER BY` null placement, `VALUES`
+/// column names (unless `wrap_values` is off because this *is* the
+/// wrapper's inner query), and the per-select rewrites of every select in
+/// the body.
+fn rewrite_query(query: &mut Query, wrap_values: bool) -> Result<(), GlauxSqlError> {
+    // CTE names are identifiers too.
+    if let Some(with) = &mut query.with {
+        for cte in &mut with.cte_tables {
+            fold_alias(&mut cte.alias);
+        }
+    }
+    if !query.locks.is_empty() {
+        return Err(GlauxSqlError::unsupported(
+            "FOR UPDATE / FOR SHARE",
+            "row locking clauses are not Trino syntax",
+        ));
+    }
+    if query.for_clause.is_some() || query.settings.is_some() || query.format_clause.is_some() {
+        return Err(GlauxSqlError::unsupported(
+            "FOR XML / SETTINGS / FORMAT",
+            "these query suffixes are not Trino syntax",
+        ));
+    }
+    if !query.pipe_operators.is_empty() {
+        return Err(GlauxSqlError::unsupported(
+            "pipe operator (|>)",
+            "pipe syntax is not Trino syntax",
+        ));
+    }
+    if let Some(order_by) = &mut query.order_by {
+        match &mut order_by.kind {
+            OrderByKind::All(_) => {
+                return Err(GlauxSqlError::unsupported(
+                    "ORDER BY ALL",
+                    "not Trino syntax; list the sort columns",
+                ));
+            }
+            OrderByKind::Expressions(items) => default_nulls_last(items)?,
+        }
+    }
+    if wrap_values && matches!(query.body.as_ref(), SetExpr::Values(_)) {
+        wrap_values_body(&mut query.body);
+    }
+    rewrite_set_expr(&mut query.body)
+}
+
+/// Trino sorts NULLs last whatever the direction; DataFusion (like
+/// PostgreSQL) sorts them first for `DESC`. Make the default explicit.
+fn default_nulls_last(items: &mut [OrderByExpr]) -> Result<(), GlauxSqlError> {
+    for item in items {
+        if item.with_fill.is_some() {
+            return Err(GlauxSqlError::unsupported(
+                "ORDER BY ... WITH FILL",
+                "not Trino syntax",
+            ));
+        }
+        if item.options.nulls_first.is_none() {
+            item.options.nulls_first = Some(false);
+        }
+    }
+    Ok(())
+}
+
+/// Trino names the columns of an anonymous `VALUES` table `_col0`, `_col1`,
+/// … where DataFusion uses `column1`, `column2`, …. Wrap the rows in a
+/// select that renames them; a column alias list on the derived table
+/// (`AS t(a, b)`) still applies to the wrapper's output.
+fn wrap_values_body(body: &mut Box<SetExpr>) {
+    let SetExpr::Values(values) = body.as_ref() else {
+        return;
+    };
+    let width = values.rows.first().map_or(0, |row| row.len());
+    let projection = (0..width)
+        .map(|i| SelectItem::ExprWithAlias {
+            expr: Expr::Identifier(ident(&format!("column{}", i + 1))),
+            alias: ident(&format!("_col{i}")),
+        })
+        .collect();
+    let inner = Query {
+        with: None,
+        body: std::mem::replace(
+            body,
+            Box::new(SetExpr::Values(sqlparser::ast::Values {
+                explicit_row: false,
+                value_keyword: false,
+                rows: vec![],
+            })),
+        ),
+        order_by: None,
+        limit_clause: None,
+        fetch: None,
+        locks: vec![],
+        for_clause: None,
+        settings: None,
+        format_clause: None,
+        pipe_operators: vec![],
+    };
+    let mut select = Select {
+        select_token: AttachedToken::empty(),
+        optimizer_hints: vec![],
+        distinct: None,
+        select_modifiers: None,
+        top: None,
+        top_before_distinct: false,
+        projection,
+        exclude: None,
+        into: None,
+        from: vec![sqlparser::ast::TableWithJoins {
+            relation: TableFactor::Derived {
+                lateral: false,
+                subquery: Box::new(inner),
+                alias: Some(TableAlias {
+                    at: None,
+                    explicit: true,
+                    name: ident(VALUES_WRAPPER_ALIAS),
+                    columns: vec![],
+                }),
+                sample: None,
+            },
+            joins: vec![],
+        }],
+        lateral_views: vec![],
+        prewhere: None,
+        selection: None,
+        connect_by: vec![],
+        group_by: GroupByExpr::Expressions(vec![], vec![]),
+        cluster_by: vec![],
+        distribute_by: vec![],
+        sort_by: vec![],
+        having: None,
+        named_window: vec![],
+        qualify: None,
+        window_before_qualify: false,
+        value_table_mode: None,
+        flavor: sqlparser::ast::SelectFlavor::Standard,
+    };
+    // Defensive: an empty VALUES has no columns to rename.
+    if width == 0 {
+        select.projection = vec![SelectItem::Wildcard(Default::default())];
+    }
+    **body = SetExpr::Select(Box::new(select));
+}
+
+fn rewrite_set_expr(body: &mut SetExpr) -> Result<(), GlauxSqlError> {
+    match body {
+        SetExpr::Select(select) => rewrite_select(select),
+        SetExpr::SetOperation { left, right, .. } => {
+            rewrite_set_expr(left)?;
+            rewrite_set_expr(right)
+        }
+        // Nested queries get their own `pre_visit_query`.
+        SetExpr::Query(_) | SetExpr::Values(_) => Ok(()),
+        SetExpr::Table(_) => Err(GlauxSqlError::unsupported(
+            "TABLE statement",
+            "`TABLE t` is not Trino syntax; use `SELECT * FROM t`",
+        )),
+        SetExpr::Insert(_) | SetExpr::Update(_) | SetExpr::Delete(_) | SetExpr::Merge(_) => {
+            Err(GlauxSqlError::unsupported(
+                "DDL / DML / CTAS / INSERT / UNLOAD",
+                "writes arrive in v0.2",
+            ))
+        }
+    }
+}
+
+/// Per-select rewrites: refuse non-Trino clauses, fold aliases, default the
+/// window `ORDER BY` null placement, and name anonymous columns.
+fn rewrite_select(select: &mut Select) -> Result<(), GlauxSqlError> {
+    let refused: Option<(&str, &str)> = if matches!(select.distinct, Some(Distinct::On(_))) {
+        Some((
+            "DISTINCT ON",
+            "not Trino syntax; use `row_number() OVER (PARTITION BY ...)`",
+        ))
+    } else if select.top.is_some() {
+        Some(("TOP", "not Trino syntax; use LIMIT"))
+    } else if select.into.is_some() {
+        Some(("SELECT INTO", "not Trino syntax"))
+    } else if select.qualify.is_some() {
+        Some((
+            "QUALIFY",
+            "not Trino syntax; filter window results in an outer query",
+        ))
+    } else if matches!(select.group_by, GroupByExpr::All(_)) {
+        Some((
+            "GROUP BY ALL",
+            "not Trino syntax; list the grouping columns",
+        ))
+    } else if !select.lateral_views.is_empty() {
+        Some(("LATERAL VIEW", "not Trino syntax"))
+    } else if select.prewhere.is_some() {
+        Some(("PREWHERE", "not Trino syntax"))
+    } else if !select.connect_by.is_empty() {
+        Some(("CONNECT BY", "not Trino syntax"))
+    } else if !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+    {
+        Some(("CLUSTER BY / DISTRIBUTE BY / SORT BY", "not Trino syntax"))
+    } else if select.value_table_mode.is_some() {
+        Some(("SELECT AS STRUCT / VALUE", "not Trino syntax"))
+    } else if select.exclude.is_some() {
+        Some(("SELECT * EXCLUDE", "not Trino syntax"))
+    } else if select.select_modifiers.is_some() || !select.optimizer_hints.is_empty() {
+        Some(("SELECT modifiers / optimizer hints", "not Trino syntax"))
+    } else if !matches!(select.flavor, sqlparser::ast::SelectFlavor::Standard) {
+        Some(("FROM-first SELECT", "not Trino syntax"))
+    } else {
+        None
+    };
+    if let Some((construct, message)) = refused {
+        return Err(GlauxSqlError::unsupported(construct, message));
+    }
+    for table in &select.from {
+        for join in &table.joins {
+            check_join(&join.join_operator)?;
+        }
+    }
+    for window in &mut select.named_window {
+        fold_ident(&mut window.0);
+        match &mut window.1 {
+            NamedWindowExpr::WindowSpec(spec) => default_nulls_last(&mut spec.order_by)?,
+            NamedWindowExpr::NamedWindow(name) => fold_ident(name),
+        }
+    }
+    naming::name_nested_select(select);
+    for item in &mut select.projection {
+        if let SelectItem::ExprWithAlias { alias, .. } = item {
+            fold_ident(alias);
+        }
+    }
+    Ok(())
+}
+
+fn check_join(operator: &JoinOperator) -> Result<(), GlauxSqlError> {
+    let constraint = match operator {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c)
+        | JoinOperator::CrossJoin(c) => c,
+        JoinOperator::Semi(_)
+        | JoinOperator::LeftSemi(_)
+        | JoinOperator::RightSemi(_)
+        | JoinOperator::Anti(_)
+        | JoinOperator::LeftAnti(_)
+        | JoinOperator::RightAnti(_) => {
+            return Err(GlauxSqlError::unsupported(
+                "SEMI / ANTI JOIN",
+                "not Trino syntax; use `EXISTS` / `NOT EXISTS`",
+            ));
+        }
+        JoinOperator::CrossApply | JoinOperator::OuterApply => {
+            return Err(GlauxSqlError::unsupported(
+                "CROSS APPLY / OUTER APPLY",
+                "not Trino syntax",
+            ));
+        }
+        JoinOperator::AsOf { .. } => {
+            return Err(GlauxSqlError::unsupported("ASOF JOIN", "not Trino syntax"));
+        }
+        JoinOperator::StraightJoin(_) => {
+            return Err(GlauxSqlError::unsupported(
+                "STRAIGHT_JOIN",
+                "not Trino syntax",
+            ));
+        }
+        JoinOperator::ArrayJoin | JoinOperator::LeftArrayJoin | JoinOperator::InnerArrayJoin => {
+            return Err(GlauxSqlError::unsupported(
+                "ARRAY JOIN",
+                "not Trino syntax; UNNEST is not supported in v0.1 either",
+            ));
+        }
+    };
+    if matches!(constraint, JoinConstraint::Natural) {
+        return Err(GlauxSqlError::unsupported(
+            "NATURAL JOIN",
+            "not Trino syntax; write the join condition with ON or USING",
+        ));
+    }
+    Ok(())
+}
+
+/// Default the null placement of the `ORDER BY` clauses attached to a call:
+/// the window specification, `WITHIN GROUP`, and aggregate `ORDER BY`
+/// arguments (`array_agg(x ORDER BY y)`).
+fn default_call_nulls_last(f: &mut Function) -> Result<(), GlauxSqlError> {
+    if let Some(WindowType::WindowSpec(spec)) = &mut f.over {
+        default_nulls_last(&mut spec.order_by)?;
+    }
+    if let Some(WindowType::NamedWindow(name)) = &mut f.over {
+        fold_ident(name);
+    }
+    default_nulls_last(&mut f.within_group)?;
+    if let FunctionArguments::List(list) = &mut f.args {
+        for clause in &mut list.clauses {
+            if let FunctionArgumentClause::OrderBy(items) = clause {
+                default_nulls_last(items)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse `TIMESTAMP '... <zone>'` literals: DataFusion would silently
+/// convert the instant to UTC and drop the zone, while `AT TIME ZONE` and
+/// zoned arithmetic are refused, so the value could never be interpreted
+/// the way the query meant it.
+fn check_typed_string(typed: &TypedString) -> Result<(), GlauxSqlError> {
+    let zoned_type = matches!(
+        typed.data_type,
+        DataType::Timestamp(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz)
+            | DataType::Time(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz)
+    );
+    let text = match &typed.value.value {
+        Value::SingleQuotedString(s) => s.as_str(),
+        _ => "",
+    };
+    let has_zone_suffix = matches!(
+        typed.data_type,
+        DataType::Timestamp(..) | DataType::Time(..)
+    ) && literal_has_zone(text);
+    if zoned_type || has_zone_suffix {
+        return Err(GlauxSqlError::unsupported(
+            "timestamp with time zone literal",
+            format!(
+                "`{typed}` carries a time zone; glaux handles timestamps as zone-less UTC \
+                 instants in v0.1"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a timestamp / time literal text has a trailing zone (`Z`, an
+/// offset, or a region name) after its time-of-day.
+fn literal_has_zone(text: &str) -> bool {
+    let text = text.trim();
+    // Split off the date part if present; the remainder is the time part.
+    let time_part = match text.split_once(' ') {
+        Some((first, rest)) if first.contains('-') => rest.trim_start(),
+        _ => text,
+    };
+    // A time-of-day is digits, ':' and '.'; anything after that is a zone.
+    let end = time_part
+        .find(|c: char| !(c.is_ascii_digit() || c == ':' || c == '.'))
+        .unwrap_or(time_part.len());
+    !time_part[end..].trim().is_empty()
 }
 
 // ---------------------------------------------------------------------------
@@ -414,8 +800,38 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             *expr = cast_to(str_lit(text), double());
             Ok(())
         }
+        Expr::Cast {
+            kind: CastKind::DoubleColon,
+            ..
+        } => Err(GlauxSqlError::unsupported(
+            ":: cast",
+            "`x::type` is not Trino syntax; use CAST(x AS type)",
+        )),
+        Expr::Cast {
+            kind: CastKind::SafeCast,
+            ..
+        } => Err(GlauxSqlError::unsupported(
+            "SAFE_CAST",
+            "not Trino syntax; use TRY_CAST",
+        )),
         Expr::Cast { .. } => rewrite_cast(expr),
         Expr::Extract { .. } => rewrite_extract(expr),
+        Expr::TypedString(typed) => check_typed_string(typed),
+        Expr::Array(array) if !array.named => Err(GlauxSqlError::unsupported(
+            "[...] array literal",
+            "`[1, 2]` is not Trino syntax; use ARRAY[1, 2]",
+        )),
+        Expr::UnaryOp { op, .. }
+            if !matches!(
+                op,
+                UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::Not
+            ) =>
+        {
+            Err(GlauxSqlError::unsupported(
+                format!("unary operator {op}"),
+                "not Trino syntax; use the equivalent function (sqrt, cbrt, abs, ...)",
+            ))
+        }
         Expr::Substring {
             expr: source,
             substring_from,
@@ -621,6 +1037,7 @@ fn rewrite_function(expr: &mut Expr) -> Result<(), GlauxSqlError> {
         unreachable!("rewrite_function called on a non-function expression");
     };
     let name = function_name(f)?;
+    default_call_nulls_last(f)?;
     let Some(shim) = registry::lookup(&name) else {
         return Err(GlauxSqlError::UnknownFunction { name });
     };
@@ -657,10 +1074,6 @@ fn check_passthrough_arity(name: &str, f: &Function) -> Result<(), GlauxSqlError
         ("strpos", 3) => Err(GlauxSqlError::invalid_arguments(
             name,
             "the 3-argument form strpos(string, substring, instance) is not supported",
-        )),
-        ("array_sort", 2) => Err(GlauxSqlError::invalid_arguments(
-            name,
-            "the comparator-lambda form is not supported",
         )),
         _ => Ok(()),
     }
@@ -753,8 +1166,9 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
                     "the 3-argument form split(string, delimiter, limit) is not supported",
                 ));
             }
-            return simple_rename("string_to_array", &[2]);
+            return simple_rename("trino_split", &[2]);
         }
+        "reverse" => return simple_rename("trino_reverse", &[1]),
         // Regular expressions
         "regexp_replace" => {
             arity(name, &args, &[2, 3])?;
@@ -824,6 +1238,7 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             func("to_char", vec![args[0].clone(), str_lit(&chrono)])
         }
         "localtimestamp" => return simple_rename("now", &[0]),
+        "date_trunc" => return simple_rename("trino_date_trunc", &[2]),
         "from_unixtime" => {
             if args.len() > 1 {
                 return Err(GlauxSqlError::invalid_arguments(
@@ -833,11 +1248,16 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
                 ));
             }
             arity(name, &args, &[1])?;
+            // Trino rounds to the millisecond (`from_unixtime(1.9999)` is
+            // `...:02.000`); a plain cast would truncate.
             let millis = cast_to(
-                binary(
-                    args.into_iter().next().unwrap(),
-                    BinaryOperator::Multiply,
-                    num_lit(1000),
+                func(
+                    "round",
+                    vec![binary(
+                        args.into_iter().next().unwrap(),
+                        BinaryOperator::Multiply,
+                        num_lit(1000),
+                    )],
                 ),
                 bigint(),
             );
@@ -846,27 +1266,7 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
                 vec![millis, str_lit("Timestamp(Millisecond, None)")],
             )
         }
-        "to_unixtime" => {
-            arity(name, &args, &[1])?;
-            let micros = func(
-                "arrow_cast",
-                vec![
-                    func(
-                        "arrow_cast",
-                        vec![
-                            args.into_iter().next().unwrap(),
-                            str_lit("Timestamp(Microsecond, None)"),
-                        ],
-                    ),
-                    str_lit("Int64"),
-                ],
-            );
-            binary(
-                cast_to(micros, double()),
-                BinaryOperator::Divide,
-                num_lit(1_000_000),
-            )
-        }
+        "to_unixtime" => return simple_rename("trino_to_unixtime", &[1]),
         "year" | "month" | "day" | "day_of_month" | "hour" | "minute" | "second" | "quarter"
         | "week" | "week_of_year" | "day_of_year" | "doy" => {
             arity(name, &args, &[1])?;
@@ -894,6 +1294,30 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             )
         }
         "ceiling" => return simple_rename("ceil", &[1]),
+        // Trino: NULL if any argument is NULL; DataFusion skips NULLs.
+        "greatest" | "least" => {
+            require_scalar_call(name, f)?;
+            if args.len() < 2 {
+                return Err(GlauxSqlError::invalid_arguments(
+                    name,
+                    format!("{name} needs at least two arguments"),
+                ));
+            }
+            let mut any_null = args
+                .iter()
+                .map(|a| Expr::IsNull(Box::new(a.clone())))
+                .reduce(|acc, e| binary(acc, BinaryOperator::Or, e))
+                .unwrap();
+            any_null = Expr::Nested(Box::new(std::mem::replace(
+                &mut any_null,
+                Expr::Value(Value::Null.with_empty_span()),
+            )));
+            case_when(
+                any_null,
+                Expr::Value(Value::Null.with_empty_span()),
+                Some(func(name, args)),
+            )
+        }
         "rand" => return simple_rename("random", &[0]),
         "sign" => return simple_rename("signum", &[1]),
         "truncate" => return simple_rename("trunc", &[1, 2]),
@@ -918,11 +1342,26 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             )
         }
         "array_remove" => return simple_rename("array_remove_all", &[2]),
+        "array_sort" => {
+            if args.len() == 2 {
+                return Err(GlauxSqlError::invalid_arguments(
+                    name,
+                    "the comparator-lambda form is not supported",
+                ));
+            }
+            arity(name, &args, &[1])?;
+            // Trino sorts NULL elements last; DataFusion's default is first.
+            let mut full = args;
+            full.push(str_lit("ASC"));
+            full.push(str_lit("NULLS LAST"));
+            func("array_sort", full)
+        }
+        "arrays_overlap" => return simple_rename("trino_arrays_overlap", &[2]),
         "cardinality" => {
             arity(name, &args, &[1])?;
             cast_to(func("cardinality", args), bigint())
         }
-        "contains" => return simple_rename("array_has", &[2]),
+        "contains" => return simple_rename("trino_contains", &[2]),
         "element_at" => return simple_rename("trino_element_at", &[2]),
         other => {
             // Every Rewrite entry in the registry must have a rule here; a
@@ -975,51 +1414,55 @@ mod tests {
         assert_eq!(
             rewrite("SELECT count_if(x > 1) FILTER (WHERE y) OVER (PARTITION BY z) FROM t")
                 .unwrap(),
-            "SELECT count(CASE WHEN x > 1 THEN 1 END) FILTER (WHERE y) OVER (PARTITION BY z) FROM t"
+            "SELECT count(CASE WHEN x > 1 THEN 1 END) FILTER (WHERE y) OVER (PARTITION BY z) AS _col0 FROM t"
         );
         assert_eq!(
-            rewrite("SELECT arbitrary(x), every(b), approx_percentile(v, 0.9) FROM t").unwrap(),
-            "SELECT first_value(x), bool_and(b), approx_percentile_cont(v, 0.9) FROM t"
+            rewrite(
+                "SELECT arbitrary(x) AS a, every(b) AS e, approx_percentile(v, 0.9) AS p FROM t"
+            )
+            .unwrap(),
+            "SELECT first_value(x) AS a, bool_and(b) AS e, approx_percentile_cont(v, 0.9) AS p FROM t"
         );
     }
 
     #[test]
     fn nested_calls_are_rewritten_inside_out() {
         assert_eq!(
-            rewrite("SELECT if(cardinality(split(s, ',')) > 1, 'many', 'one') FROM t").unwrap(),
-            "SELECT CASE WHEN CAST(cardinality(string_to_array(s, ',')) AS BIGINT) > 1 THEN 'many' ELSE 'one' END FROM t"
+            rewrite("SELECT if(cardinality(split(s, ',')) > 1, 'many', 'one') AS c FROM t")
+                .unwrap(),
+            "SELECT CASE WHEN CAST(cardinality(trino_split(s, ',')) AS BIGINT) > 1 THEN 'many' ELSE 'one' END AS c FROM t"
         );
     }
 
     #[test]
     fn concat_becomes_null_propagating_operator() {
         assert_eq!(
-            rewrite("SELECT concat(a, '-', b) FROM t").unwrap(),
-            "SELECT a || '-' || b FROM t"
+            rewrite("SELECT concat(a, '-', b) AS c FROM t").unwrap(),
+            "SELECT a || '-' || b AS c FROM t"
         );
     }
 
     #[test]
     fn regexp_shims_add_global_flag_and_group_wrapping() {
         assert_eq!(
-            rewrite("SELECT regexp_replace(s, 'a+'), regexp_extract(s, '\\d+'), regexp_extract(s, '(a)(b)', 2) FROM t").unwrap(),
-            "SELECT regexp_replace(s, 'a+', trino_regexp_replacement(''), 'g'), array_element(regexp_match(s, '(\\d+)'), 1), array_element(regexp_match(s, '((a)(b))'), 3) FROM t"
+            rewrite("SELECT regexp_replace(s, 'a+') AS a, regexp_extract(s, '\\d+') AS b, regexp_extract(s, '(a)(b)', 2) AS c FROM t").unwrap(),
+            "SELECT regexp_replace(s, 'a+', trino_regexp_replacement(''), 'g') AS a, array_element(regexp_match(s, '(\\d+)'), 1) AS b, array_element(regexp_match(s, '((a)(b))'), 3) AS c FROM t"
         );
     }
 
     #[test]
     fn date_functions_translate_formats_and_units() {
         assert_eq!(
-            rewrite("SELECT date_parse(s, '%Y-%m-%d %H:%i:%s'), format_datetime(ts, 'yyyy-MM-dd') FROM t").unwrap(),
-            "SELECT to_timestamp(s, '%Y-%m-%d %H:%M:%S'), to_char(ts, '%Y-%m-%d') FROM t"
+            rewrite("SELECT date_parse(s, '%Y-%m-%d %H:%i:%s') AS a, format_datetime(ts, 'yyyy-MM-dd') AS b FROM t").unwrap(),
+            "SELECT to_timestamp(s, '%Y-%m-%d %H:%M:%S') AS a, to_char(ts, '%Y-%m-%d') AS b FROM t"
         );
         assert_eq!(
-            rewrite("SELECT day_of_week(d), month(d) FROM t").unwrap(),
-            "SELECT CASE WHEN CAST(date_part('dow', d) AS BIGINT) = 0 THEN 7 ELSE CAST(date_part('dow', d) AS BIGINT) END, CAST(date_part('month', d) AS BIGINT) FROM t"
+            rewrite("SELECT day_of_week(d) AS a, month(d) AS b FROM t").unwrap(),
+            "SELECT CASE WHEN CAST(date_part('dow', d) AS BIGINT) = 0 THEN 7 ELSE CAST(date_part('dow', d) AS BIGINT) END AS a, CAST(date_part('month', d) AS BIGINT) AS b FROM t"
         );
         assert_eq!(
-            rewrite("SELECT from_unixtime(t), to_unixtime(ts) FROM t").unwrap(),
-            "SELECT arrow_cast(CAST(t * 1000 AS BIGINT), 'Timestamp(Millisecond, None)'), CAST(arrow_cast(arrow_cast(ts, 'Timestamp(Microsecond, None)'), 'Int64') AS DOUBLE) / 1000000 FROM t"
+            rewrite("SELECT from_unixtime(t) AS a, to_unixtime(ts) AS b, date_trunc('day', ts) AS c FROM t").unwrap(),
+            "SELECT arrow_cast(CAST(round(t * 1000) AS BIGINT), 'Timestamp(Millisecond, None)') AS a, trino_to_unixtime(ts) AS b, trino_date_trunc('day', ts) AS c FROM t"
         );
     }
 
@@ -1030,15 +1473,15 @@ mod tests {
                 "SELECT \"K\", T.Name AS \"CustomerName\" FROM \"Customers\" T WHERE Country = 'US'"
             )
             .unwrap(),
-            "SELECT \"k\", t.name AS \"CustomerName\" FROM \"customers\" t WHERE country = 'US'"
+            "SELECT \"k\", t.name AS \"customername\" FROM \"customers\" t WHERE country = 'US'"
         );
     }
 
     #[test]
     fn casts_get_trino_semantics() {
         assert_eq!(
-            rewrite("SELECT CAST(x AS BIGINT), TRY_CAST(y AS INTEGER), CAST(z AS VARCHAR), CAST(z AS VARCHAR(2)) FROM t").unwrap(),
-            "SELECT CAST(trino_round_for_cast(x) AS BIGINT), TRY_CAST(trino_round_for_cast(y) AS INTEGER), trino_varchar(z), trino_varchar(z, 2) FROM t"
+            rewrite("SELECT CAST(x AS BIGINT) AS a, TRY_CAST(y AS INTEGER) AS b, CAST(z AS VARCHAR) AS c, CAST(z AS VARCHAR(2)) AS d FROM t").unwrap(),
+            "SELECT CAST(trino_round_for_cast(x) AS BIGINT) AS a, TRY_CAST(trino_round_for_cast(y) AS INTEGER) AS b, trino_varchar(z) AS c, trino_varchar(z, 2) AS d FROM t"
         );
         let err = rewrite("SELECT CAST(x AS VARBINARY) FROM t").unwrap_err();
         assert!(
@@ -1048,16 +1491,16 @@ mod tests {
         // Exponent literals are doubles; plain decimals are left for
         // DataFusion's decimal parsing.
         assert_eq!(
-            rewrite("SELECT 1e2, 1.5, 10").unwrap(),
-            "SELECT CAST('1e2' AS DOUBLE), 1.5, 10"
+            rewrite("SELECT 1e2 AS a, 1.5 AS b, 10 AS c").unwrap(),
+            "SELECT CAST('1e2' AS DOUBLE) AS a, 1.5 AS b, 10 AS c"
         );
     }
 
     #[test]
     fn syntax_forms_map_to_trino_udfs() {
         assert_eq!(
-            rewrite("SELECT EXTRACT(DOW FROM d), EXTRACT(YEAR FROM d), substring(s FROM 2 FOR 3), substr(s, -3), position('a' IN s), a[1][2], split_part(s, ',', 2), element_at(a, -1) FROM t").unwrap(),
-            "SELECT CASE WHEN CAST(date_part('dow', d) AS BIGINT) = 0 THEN 7 ELSE CAST(date_part('dow', d) AS BIGINT) END, CAST(date_part('year', d) AS BIGINT), trino_substr(s, 2, 3), trino_substr(s, -3), CAST(strpos(s, 'a') AS BIGINT), trino_subscript(trino_subscript(a, 1), 2), trino_split_part(s, ',', 2), trino_element_at(a, -1) FROM t"
+            rewrite("SELECT EXTRACT(DOW FROM d) AS a, EXTRACT(YEAR FROM d) AS b, substring(s FROM 2 FOR 3) AS c, substr(s, -3) AS d, position('a' IN s) AS e, a[1][2] AS f, split_part(s, ',', 2) AS g, element_at(a, -1) AS h FROM t").unwrap(),
+            "SELECT CASE WHEN CAST(date_part('dow', d) AS BIGINT) = 0 THEN 7 ELSE CAST(date_part('dow', d) AS BIGINT) END AS a, CAST(date_part('year', d) AS BIGINT) AS b, trino_substr(s, 2, 3) AS c, trino_substr(s, -3) AS d, CAST(strpos(s, 'a') AS BIGINT) AS e, trino_subscript(trino_subscript(a, 1), 2) AS f, trino_split_part(s, ',', 2) AS g, trino_element_at(a, -1) AS h FROM t"
         );
         let err = rewrite("SELECT EXTRACT(EPOCH FROM d) FROM t").unwrap_err();
         assert!(
@@ -1069,10 +1512,118 @@ mod tests {
     #[test]
     fn bigint_results_are_cast_for_narrow_or_unsigned_datafusion_types() {
         assert_eq!(
-            rewrite("SELECT length(s), row_number() OVER (ORDER BY s), approx_distinct(s) FROM t")
+            rewrite("SELECT length(s) AS a, row_number() OVER (ORDER BY s) AS b, approx_distinct(s) AS c FROM t")
                 .unwrap(),
-            "SELECT CAST(length(s) AS BIGINT), CAST(row_number() OVER (ORDER BY s) AS BIGINT), CAST(approx_distinct(s) AS BIGINT) FROM t"
+            "SELECT CAST(length(s) AS BIGINT) AS a, CAST(row_number() OVER (ORDER BY s NULLS LAST) AS BIGINT) AS b, CAST(approx_distinct(s) AS BIGINT) AS c FROM t"
         );
+    }
+
+    #[test]
+    fn order_by_defaults_to_nulls_last_everywhere() {
+        assert_eq!(
+            rewrite(
+                "SELECT rank() OVER (ORDER BY a DESC) AS r, array_agg(b ORDER BY b DESC) AS g, \
+                 sum(c) OVER w AS s FROM t WINDOW w AS (PARTITION BY p ORDER BY q) \
+                 ORDER BY a DESC, b NULLS FIRST, c ASC"
+            )
+            .unwrap(),
+            "SELECT CAST(rank() OVER (ORDER BY a DESC NULLS LAST) AS BIGINT) AS r, \
+             array_agg(b ORDER BY b DESC NULLS LAST) AS g, sum(c) OVER w AS s FROM t \
+             WINDOW w AS (PARTITION BY p ORDER BY q NULLS LAST) \
+             ORDER BY a DESC NULLS LAST, b NULLS FIRST, c ASC NULLS LAST"
+        );
+        // Nested queries too.
+        assert_eq!(
+            rewrite("SELECT * FROM (SELECT a FROM t ORDER BY a DESC LIMIT 1) s").unwrap(),
+            "SELECT * FROM (SELECT a FROM t ORDER BY a DESC NULLS LAST LIMIT 1) s"
+        );
+    }
+
+    #[test]
+    fn nested_anonymous_columns_and_values_get_col_n() {
+        assert_eq!(
+            rewrite("SELECT * FROM (SELECT 1, count(*), x AS \"Y\" FROM t) s").unwrap(),
+            "SELECT * FROM (SELECT 1 AS _col0, count(*) AS _col1, x AS \"y\" FROM t) s"
+        );
+        assert_eq!(
+            rewrite("SELECT * FROM (VALUES (1, 'a'), (2, 'b'))").unwrap(),
+            "SELECT * FROM (SELECT column1 AS _col0, column2 AS _col1 FROM (VALUES (1, 'a'), (2, 'b')) AS __glaux_values)"
+        );
+        // Column aliases on the derived table still win.
+        assert_eq!(
+            rewrite("SELECT k FROM (VALUES (1)) AS t (k)").unwrap(),
+            "SELECT k FROM (SELECT column1 AS _col0 FROM (VALUES (1)) AS __glaux_values) AS t (k)"
+        );
+    }
+
+    #[test]
+    fn null_sensitive_shims_wrap_their_calls() {
+        assert_eq!(
+            rewrite("SELECT greatest(a, b) AS g, least(a, b, c) AS l FROM t").unwrap(),
+            "SELECT CASE WHEN (a IS NULL OR b IS NULL) THEN NULL ELSE greatest(a, b) END AS g, \
+             CASE WHEN (a IS NULL OR b IS NULL OR c IS NULL) THEN NULL ELSE least(a, b, c) END AS l FROM t"
+        );
+        assert_eq!(
+            rewrite("SELECT array_sort(a) AS s, reverse(a) AS r, contains(a, 1) AS c, arrays_overlap(a, b) AS o, split(s, ',') AS p FROM t").unwrap(),
+            "SELECT array_sort(a, 'ASC', 'NULLS LAST') AS s, trino_reverse(a) AS r, trino_contains(a, 1) AS c, trino_arrays_overlap(a, b) AS o, trino_split(s, ',') AS p FROM t"
+        );
+        let err = rewrite("SELECT array_sort(a, (x, y) -> 1) FROM t").unwrap_err();
+        assert!(err.to_string().contains("lambda"), "{err}");
+    }
+
+    #[test]
+    fn non_trino_syntax_is_refused_by_name() {
+        for (sql, construct) in [
+            ("SELECT DISTINCT ON (a) a FROM t", "DISTINCT ON"),
+            (
+                "SELECT a FROM t QUALIFY row_number() OVER (ORDER BY a) = 1",
+                "QUALIFY",
+            ),
+            ("SELECT a FROM t GROUP BY ALL", "GROUP BY ALL"),
+            ("SELECT a FROM t TABLESAMPLE BERNOULLI (50)", "TABLESAMPLE"),
+            ("SELECT a FROM t FOR UPDATE", "FOR UPDATE / FOR SHARE"),
+            ("SELECT * FROM t NATURAL JOIN u", "NATURAL JOIN"),
+            (
+                "SELECT * FROM t LEFT SEMI JOIN u ON t.a = u.a",
+                "SEMI / ANTI JOIN",
+            ),
+            (
+                "SELECT * FROM t LEFT ANTI JOIN u ON t.a = u.a",
+                "SEMI / ANTI JOIN",
+            ),
+            ("SELECT [1, 2]", "[...] array literal"),
+            ("SELECT 1::INT", ":: cast"),
+            ("SELECT TOP 1 a FROM t", "TOP"),
+            (
+                "SELECT TIMESTAMP '2024-01-05 10:00:00 America/New_York'",
+                "timestamp with time zone literal",
+            ),
+            (
+                "SELECT TIMESTAMP '2024-01-05 10:00:00+02:00'",
+                "timestamp with time zone literal",
+            ),
+            (
+                "SELECT TIMESTAMP '2024-01-05T10:00:00Z'",
+                "timestamp with time zone literal",
+            ),
+            (
+                "SELECT TIMESTAMP WITH TIME ZONE '2024-01-05 10:00:00'",
+                "timestamp with time zone literal",
+            ),
+        ] {
+            let err = rewrite(sql).unwrap_err();
+            assert!(
+                matches!(&err, GlauxSqlError::Unsupported { construct: c, .. } if c == construct),
+                "{sql}: {err}"
+            );
+        }
+        // Zone-less literals are fine.
+        rewrite("SELECT TIMESTAMP '2024-01-05 10:00:00.123', DATE '2024-01-05', TIME '10:00:00'")
+            .unwrap();
+        assert!(!literal_has_zone("2024-01-05 10:00:00.123"));
+        assert!(!literal_has_zone("10:00:00"));
+        assert!(literal_has_zone("2024-01-05 10:00:00 UTC"));
+        assert!(literal_has_zone("2024-01-05 10:00:00 -05:00"));
     }
 
     #[test]

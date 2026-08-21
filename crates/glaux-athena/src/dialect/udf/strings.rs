@@ -1,10 +1,11 @@
 //! String functions whose DataFusion namesakes differ from Trino at the
-//! edges: `substr` for start ≤ 0, `split_part` past the last field, and
-//! the replacement-string syntax of `regexp_replace`.
+//! edges: `substr` for start ≤ 0, `split_part` past the last field,
+//! `split` of an empty string or by an empty delimiter, and the
+//! replacement-string syntax of `regexp_replace`.
 
 use std::sync::Arc;
 
-use arrow::array::{Array, StringBuilder};
+use arrow::array::{Array, ListBuilder, StringBuilder};
 use arrow::datatypes::DataType;
 use datafusion::common::Result;
 use datafusion::logical_expr::{
@@ -19,8 +20,76 @@ pub fn all() -> Vec<ScalarUDF> {
     vec![
         ScalarUDF::new_from_impl(TrinoSubstr::new()),
         ScalarUDF::new_from_impl(TrinoSplitPart::new()),
+        ScalarUDF::new_from_impl(TrinoSplit::new()),
         ScalarUDF::new_from_impl(TrinoRegexpReplacement::new()),
     ]
+}
+
+/// Trino's `split(string, delimiter)`: `split('', ',')` is `['']` and an
+/// empty delimiter splits into single characters (DataFusion's
+/// `string_to_array` gives `[]` and `['abc']` respectively).
+pub fn trino_split(s: &str, delimiter: &str) -> Vec<String> {
+    if delimiter.is_empty() {
+        return s.chars().map(String::from).collect();
+    }
+    s.split(delimiter).map(String::from).collect()
+}
+
+/// `trino_split(string, delimiter)`: see [`trino_split`].
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoSplit {
+    signature: Signature,
+}
+
+impl Default for TrinoSplit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoSplit {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoSplit {
+    fn name(&self) -> &str {
+        "trino_split"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+        Ok(DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Utf8,
+            true,
+        ))))
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let strings = string_array("split", &args.args[0], rows)?;
+        let delimiters = string_array("split", &args.args[1], rows)?;
+        let mut out = ListBuilder::new(StringBuilder::new());
+        for i in 0..rows {
+            if strings.is_null(i) || delimiters.is_null(i) {
+                out.append(false);
+                continue;
+            }
+            for part in trino_split(strings.value(i), delimiters.value(i)) {
+                out.values().append_value(part);
+            }
+            out.append(true);
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
 }
 
 /// Trino's `substr(string, start[, length])` on code points.
@@ -293,6 +362,15 @@ impl ScalarUDFImpl for TrinoRegexpReplacement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_keeps_empty_fields_and_splits_characters_on_empty_delimiter() {
+        assert_eq!(trino_split("", ","), vec![""]);
+        assert_eq!(trino_split("a,b,,c", ","), vec!["a", "b", "", "c"]);
+        assert_eq!(trino_split("abc", ""), vec!["a", "b", "c"]);
+        assert_eq!(trino_split("Über", ""), vec!["Ü", "b", "e", "r"]);
+        assert_eq!(trino_split("a::b", "::"), vec!["a", "b"]);
+    }
 
     #[test]
     fn substr_follows_trino_for_non_positive_starts() {

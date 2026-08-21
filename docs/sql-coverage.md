@@ -4,37 +4,40 @@
 
 glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusion. This table is generated from the shim registry that drives the translator, so it is exactly what the engine accepts: anything not listed is refused with an error naming the construct — never silently approximated.
 
-**Functions:** 133 supported (74 passthrough, 49 rewritten, 10 Rust UDFs), 28 refused by name.
+**Functions:** 133 supported (68 passthrough, 55 rewritten, 10 Rust UDFs), 28 refused by name.
 
 ## SQL constructs
 
 | Construct | Category | Status | Notes |
 |---|---|---|---|
-| SELECT / DISTINCT / WHERE | Query shape | supported | Full projection, `SELECT DISTINCT`, arbitrary predicates. Anonymous output columns are named `_col0`, `_col1`, … by position and duplicate output names are allowed, as on Athena. |
-| JOIN (INNER, LEFT, RIGHT, FULL, CROSS) | Query shape | supported | `ON` and `USING` forms. |
+| SELECT / DISTINCT / WHERE | Query shape | supported | Full projection, `SELECT DISTINCT`, arbitrary predicates. Anonymous output columns are named `_col0`, `_col1`, … by position (also inside derived tables and CTEs) and duplicate output names are allowed, as on Athena. `DISTINCT ON`, `QUALIFY`, `GROUP BY ALL`, `TOP`, `SELECT INTO`, `TABLESAMPLE`, `FOR UPDATE`, and `SELECT * EXCLUDE` are refused as non-Trino syntax. |
+| JOIN (INNER, LEFT, RIGHT, FULL, CROSS) | Query shape | supported | `ON` and `USING` forms; join keys must have comparable types (`TYPE_MISMATCH` otherwise). `NATURAL`, `SEMI` / `ANTI`, `APPLY`, and `ASOF` joins are refused as non-Trino syntax. |
 | Common table expressions (WITH) | Query shape | supported | Including multiple and chained CTEs. |
 | Subqueries (derived tables, scalar, IN, EXISTS) | Query shape | supported | Correlated `EXISTS` / `IN` are decorrelated by DataFusion. |
-| Window functions | Query shape | supported | `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` and named windows. Ranking functions return `bigint` (cast from DataFusion's unsigned result). |
+| Window functions | Query shape | supported | `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` and named windows. Ranking functions return `bigint` (cast from DataFusion's unsigned result). Window `ORDER BY` sorts NULLs last by default, as in Trino. |
 | GROUP BY / HAVING / ROLLUP / CUBE / GROUPING SETS | Query shape | supported |  |
-| ORDER BY / LIMIT / OFFSET | Query shape | supported | `NULLS FIRST/LAST` honoured. Trino's default (NULLS LAST for ASC) is applied when unspecified. |
-| UNION / UNION ALL / INTERSECT / EXCEPT | Query shape | supported |  |
-| VALUES | Query shape | supported | Inline tables, also as a `FROM` source with column aliases. |
-| CASE | Expressions | supported | Simple and searched forms. |
-| CAST | Expressions | supported | Trino type names (`VARCHAR[(n)]`, `BIGINT`, `INTEGER`, `SMALLINT`, `TINYINT`, `DOUBLE`, `REAL`, `DECIMAL(p,s)`, `BOOLEAN`, `DATE`, `TIMESTAMP`) map to Arrow types. Double/decimal → integer rounds half away from zero (`CAST(2.5 AS BIGINT)` is 3) and fails on overflow (`INVALID_CAST_ARGUMENT`; NULL under `TRY_CAST`). `CAST(... AS VARCHAR)` uses Trino's text forms (`2024-01-05 10:30:00.000`, `1.0E20`) and `VARCHAR(n)` truncates to `n` characters. `VARBINARY`, `JSON`, `ROW`, `MAP` targets are refused by name. |
+| ORDER BY / LIMIT / OFFSET | Query shape | supported | `NULLS FIRST/LAST` honoured. Trino's default — NULLs last whatever the direction, also for window `ORDER BY` and aggregate `ORDER BY` arguments — is applied when unspecified (DataFusion's own default would sort NULLs first under `DESC`). `ORDER BY ALL` is refused. |
+| UNION / UNION ALL / INTERSECT / EXCEPT | Query shape | supported | Corresponding columns must have comparable types (`SELECT 1 UNION SELECT 'a'` is a `TYPE_MISMATCH`, as on Athena). |
+| VALUES | Query shape | supported | Inline tables, also as a `FROM` source with column aliases; anonymous columns are `_col0`, `_col1`, … as on Athena. |
+| CASE | Expressions | supported | Simple and searched forms. The operand must be comparable with the `WHEN` values and all results must share a type (`TYPE_MISMATCH` otherwise, as on Athena); the same applies to `if`, `nullif`, and `coalesce`. |
+| CAST | Expressions | supported | Trino type names (`VARCHAR[(n)]`, `BIGINT`, `INTEGER`, `SMALLINT`, `TINYINT`, `DOUBLE`, `REAL`, `DECIMAL(p,s)`, `BOOLEAN`, `DATE`, `TIMESTAMP`) map to Arrow types. The `x::type` form is refused as non-Trino syntax. Double/decimal → integer rounds half away from zero (`CAST(2.5 AS BIGINT)` is 3) and fails on overflow (`INVALID_CAST_ARGUMENT`; NULL under `TRY_CAST`). `CAST(... AS VARCHAR)` uses Trino's text forms (`2024-01-05 10:30:00.000`, `1.0E20`) and `VARCHAR(n)` truncates to `n` characters. `VARBINARY`, `JSON`, `ROW`, `MAP` targets are refused by name. |
 | TRY_CAST | Expressions | supported | NULL on conversion failure. |
-| INTERVAL literals | Expressions | supported | `INTERVAL '1' DAY`, `INTERVAL '2' HOUR`, and `timestamp ± interval` arithmetic. |
+| INTERVAL literals | Expressions | supported | `INTERVAL '1' DAY`, `INTERVAL '2' HOUR`, and `timestamp ± interval` arithmetic. `date - date` and `timestamp - timestamp` (an `interval` result in Trino) are refused; use `date_diff`. |
 | String concatenation (\|\|) | Expressions | supported | NULL-propagating, like Trino. |
 | BETWEEN / IN (list) / LIKE / IS [NOT] NULL / IS DISTINCT FROM | Expressions | supported |  |
-| ARRAY[...] literals and 1-based subscripts | Expressions | supported | `arr[1]` is the first element; `arr[0]`, negative, and out-of-range subscripts are errors, as in Trino (use `element_at` for NULL instead). |
+| ARRAY[...] literals and 1-based subscripts | Expressions | supported | `arr[1]` is the first element; `arr[0]`, negative, and out-of-range subscripts are errors, as in Trino (use `element_at` for NULL instead). The bare `[1, 2]` form is refused as non-Trino syntax. |
 | EXTRACT(field FROM x) / POSITION / SUBSTRING / TRIM syntax | Expressions | supported | `EXTRACT` fields: YEAR, QUARTER, MONTH, WEEK, DAY, DAY_OF_MONTH, DAY_OF_WEEK/DOW (1 = Monday … 7 = Sunday, Trino numbering), DAY_OF_YEAR/DOY, HOUR, MINUTE, SECOND; other fields are refused by name. `SUBSTRING` follows `substr`'s rules; `POSITION` returns bigint. |
-| Identifiers | Semantics | supported | Identifiers are case-insensitive whether quoted or not, as in Trino: `"Name"` and `name` resolve to the same column. Output aliases keep the case they were written in (`AS "CustomerName"`), so an `ORDER BY` that repeats a mixed-case quoted alias must write it the same way. |
+| Identifiers | Semantics | supported | Identifiers are case-insensitive whether quoted or not, as in Trino: `"Name"` and `name` resolve to the same column. Output aliases are reported in the case they were written (`AS "Total"` is column `Total`) and resolve case-insensitively (`ORDER BY total`, `ORDER BY "TOTAL"`), also from outer queries. |
 | Numeric literals | Semantics | supported | `1.5` is `DECIMAL(2,1)` and `1e2` is `DOUBLE`, as in Trino, so `0.1 + 0.2` is exactly `0.3`. Decimal arithmetic follows DataFusion's result precision/scale rules (division and `avg` keep more fractional digits than Trino: `1.5 / 2` is `0.75000` here, `0.8` on Athena) and math functions compute decimal arguments in double precision. |
 | Integer overflow | Semantics | supported | `bigint` `+`, `-`, `*`, and `sum` fail with `NUMERIC_VALUE_OUT_OF_RANGE` on overflow, as in Trino (DataFusion alone wraps around). Division by zero is `DIVISION_BY_ZERO`. |
-| Operator type checking | Semantics | supported | Comparisons, arithmetic, `\|\|`, `IN`, and `BETWEEN` between types Trino does not combine (`varchar = integer`, `'a' \|\| 1`, `date = varchar`) are refused with `TYPE_MISMATCH` instead of being coerced. Numeric types compare with each other and `date` with `timestamp`, as in Trino. |
+| Operator type checking | Semantics | supported | Comparisons, arithmetic, `\|\|`, `IN` (lists and subqueries), `BETWEEN`, join keys, simple `CASE` operands, `CASE` / `if` / `nullif` / `coalesce` / `greatest` / `least` results, and set-operation columns between types Trino does not combine (`varchar = integer`, `'a' \|\| 1`, `date = varchar`) are refused with `TYPE_MISMATCH` instead of being coerced, and the date-part functions (`year`, `date_trunc`, `date_format`, `to_unixtime`, `EXTRACT`) refuse varchar arguments. Numeric types compare with each other and `date` with `timestamp`, as in Trino. |
 | Runtime errors | Semantics | supported | Failures caused by the query's data (an invalid cast, an unparsable date, a bad subscript) are user errors (Athena `ErrorCategory` 2) with Trino's error code; only I/O and engine failures are category 1. |
 | Read-only statements | Semantics | supported | `SELECT`, `WITH`, `VALUES`, `EXPLAIN` (DataFusion's plan text, not Trino's). |
 | lambda expression | Unsupported | refused | `x -> ...` arguments (`transform`, `filter`, `reduce`, comparator sorts) are refused by name. |
 | AT TIME ZONE | Unsupported | refused | Refused in v0.1; timestamps are handled as UTC instants. |
+| timestamp with time zone literal | Unsupported | refused | `TIMESTAMP '2024-01-05 10:00:00 America/New_York'` (and `Z` / offset suffixes) are refused rather than silently converted to a zone-less UTC instant. |
+| date subtraction | Unsupported | refused | `date - date` and `timestamp - timestamp` produce an `interval` in Trino, which glaux cannot return in v0.1; use `date_diff(unit, a, b)`. |
+| Non-Trino syntax | Unsupported | refused | Syntax DataFusion accepts but Trino does not is refused by name instead of running with DataFusion semantics: `DISTINCT ON`, `QUALIFY`, `GROUP BY ALL`, `ORDER BY ALL`, `TABLESAMPLE`, `FOR UPDATE`, `NATURAL` / `SEMI` / `ANTI` / `APPLY` / `ASOF` joins, `[1, 2]` array literals, `x::type` casts, `TOP`, `SELECT INTO`, `SELECT * EXCLUDE`, PostgreSQL operators. |
 | ROW / MAP literals and types | Unsupported | refused | `ROW(...)`, `MAP(...)`, `CAST(... AS ROW(...))` are refused. |
 | UNNEST | Unsupported | refused | `CROSS JOIN UNNEST(...)` is refused in v0.1 (Trino's `WITH ORDINALITY` and multi-array forms have no direct DataFusion mapping). |
 | Multiple statements | Unsupported | refused | One statement per query execution, like Athena. |
@@ -111,10 +114,10 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | `lpad` | `lpad(varchar, size, padstring)` | passthrough | DataFusion `lpad` |
 | `ltrim` | `ltrim(varchar)` | passthrough | DataFusion `ltrim` |
 | `replace` | `replace(varchar, search[, replacement])` | rewrite | DataFusion `replace`; the 2-argument (delete) form becomes `replace(x, search, '')` |
-| `reverse` | `reverse(varchar)` | passthrough | DataFusion `reverse` |
+| `reverse` | `reverse(varchar) → varchar, reverse(array) → array` | rewrite | Rust UDF `trino_reverse`: reverses a string's code points or an array's elements (DataFusion's `reverse` is string-only and would stringify an array) |
 | `rpad` | `rpad(varchar, size, padstring)` | passthrough | DataFusion `rpad` |
 | `rtrim` | `rtrim(varchar)` | passthrough | DataFusion `rtrim` |
-| `split` | `split(varchar, delimiter) → array(varchar)` | rewrite | `string_to_array(x, delimiter)`. The 3-argument `split(x, delimiter, limit)` form is refused. |
+| `split` | `split(varchar, delimiter) → array(varchar)` | rewrite | Rust UDF `trino_split`: `split('', ',')` is `['']` and an empty delimiter splits into characters, as in Trino. The 3-argument `split(x, delimiter, limit)` form is refused. |
 | `split_part` | `split_part(varchar, delimiter, index) → varchar` | rewrite | Rust UDF `trino_split_part`: 1-based; NULL past the last field (DataFusion returns `''`); `index < 1` is an error; an empty delimiter splits into characters. |
 | `starts_with` | `starts_with(varchar, prefix) → boolean` | passthrough | DataFusion `starts_with` |
 | `strpos` | `strpos(varchar, substring) → bigint` | passthrough | `CAST(strpos(x, sub) AS BIGINT)` (1-based, 0 when absent). The 3-argument `strpos(x, sub, instance)` form is refused. |
@@ -147,7 +150,7 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | `date_diff` | `date_diff(unit, timestamp1, timestamp2) → bigint` | udf | Rust UDF: `timestamp2 - timestamp1` in whole units, truncated toward zero; calendar months for month/quarter/year. |
 | `date_format` | `date_format(timestamp, format) → varchar` | rewrite | `to_char(x, <strftime>)` with the MySQL-style format translated specifier by specifier; the format must be a literal and unknown specifiers are refused. |
 | `date_parse` | `date_parse(varchar, format) → timestamp` | rewrite | `to_timestamp(x, <strftime>)` with the MySQL-style format translated; the format must be a literal. `%f` accepts 1-9 fractional digits when parsing, like Trino, but only directly after a `.`. |
-| `date_trunc` | `date_trunc(unit, timestamp) → timestamp` | passthrough | DataFusion `date_trunc` (same argument order and unit names) |
+| `date_trunc` | `date_trunc(unit, x) → same as x` | rewrite | Rust UDF `trino_date_trunc`: a `date` input stays a `date` (DataFusion's `date_trunc` returns a timestamp), sub-day units on a `date` are refused, and varchar input is refused (`TYPE_MISMATCH`, as in Trino). Weeks start on Monday. |
 | `day` | `day(x) → bigint` | rewrite | `CAST(date_part('day', x) AS BIGINT)` |
 | `day_of_month` | `day_of_month(x) → bigint` | rewrite | `CAST(date_part('day', x) AS BIGINT)` |
 | `day_of_week` | `day_of_week(x) → bigint (1 = Monday … 7 = Sunday)` | rewrite | `date_part('dow', x)` remapped from DataFusion's 0 = Sunday to Trino's ISO numbering |
@@ -157,7 +160,7 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | `format_datetime` | `format_datetime(timestamp, pattern) → varchar` | rewrite | `to_char(x, <strftime>)` with the Joda pattern translated; the pattern must be a literal and unknown pattern letters are refused. `Z` / `ZZ` / `ZZZ` print `+0000` / `+00:00` / `UTC` (timestamps are UTC instants). |
 | `from_iso8601_date` | `from_iso8601_date(varchar) → date` | udf | Rust UDF: strict ISO-8601 calendar date (`YYYY-MM-DD`, also `YYYY-MM` / `YYYY`); anything else (`2024-1-1`, ordinal or week dates) is an error. |
 | `from_iso8601_timestamp` | `from_iso8601_timestamp(varchar) → timestamp with time zone` | udf | Rust UDF: strict ISO-8601 (`YYYY-MM-DD[THH[:mm[:ss[.fff]]]][Z\|±HH:mm]`); a space separator or single-digit fields are errors, as in Trino. The instant is returned as a UTC `timestamp(3)` (the input's offset is applied, not preserved). |
-| `from_unixtime` | `from_unixtime(double) → timestamp` | rewrite | `arrow_cast(CAST(x * 1000 AS BIGINT), 'Timestamp(Millisecond, None)')` (millisecond precision, like Athena). The zone-argument forms are refused. |
+| `from_unixtime` | `from_unixtime(double) → timestamp` | rewrite | `arrow_cast(CAST(round(x * 1000) AS BIGINT), 'Timestamp(Millisecond, None)')` (rounded to the millisecond, like Athena: `from_unixtime(1.9999)` is `…:02.000`). The zone-argument forms are refused. |
 | `hour` | `hour(x) → bigint` | rewrite | `CAST(date_part('hour', x) AS BIGINT)` |
 | `last_day_of_month` | `last_day_of_month(x) → date` | unsupported | Refused: no DataFusion equivalent. Use `date_add('day', -1, date_add('month', 1, date_trunc('month', x)))`. |
 | `localtimestamp` | `localtimestamp → timestamp` | rewrite | `now()` (UTC) |
@@ -168,7 +171,7 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | `quarter` | `quarter(x) → bigint` | rewrite | `CAST(date_part('quarter', x) AS BIGINT)` |
 | `second` | `second(x) → bigint` | rewrite | `CAST(date_part('second', x) AS BIGINT)` |
 | `to_iso8601` | `to_iso8601(x) → varchar` | unsupported | Refused: the output depends on the argument type. Use `format_datetime(x, 'yyyy-MM-dd''T''HH:mm:ss.SSS')` or `CAST(x AS VARCHAR)`. |
-| `to_unixtime` | `to_unixtime(timestamp) → double` | rewrite | `CAST(arrow_cast(arrow_cast(x, 'Timestamp(Microsecond, None)'), 'Int64') AS DOUBLE) / 1000000` (keeps fractional seconds) |
+| `to_unixtime` | `to_unixtime(timestamp) → double` | rewrite | Rust UDF `trino_to_unixtime` (microsecond resolution). Varchar input is refused (`TYPE_MISMATCH`, as in Trino). |
 | `week` | `week(x) → bigint` | rewrite | `CAST(date_part('week', x) AS BIGINT)` (ISO week) |
 | `week_of_year` | `week_of_year(x) → bigint` | rewrite | Alias of `week` |
 | `with_timezone` | `with_timezone(timestamp, zone)` | unsupported | Refused in v0.1 along with `AT TIME ZONE`. |
@@ -184,8 +187,8 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | `ceiling` | `ceiling(x)` | rewrite | `ceil(x)` |
 | `exp` | `exp(x) → double` | passthrough | DataFusion `exp` |
 | `floor` | `floor(x)` | passthrough | DataFusion `floor` (on DECIMAL inputs the result keeps the input's scale — `-2.0` where Trino gives `-2`) |
-| `greatest` | `greatest(a, b, ...)` | passthrough | DataFusion `greatest` |
-| `least` | `least(a, b, ...)` | passthrough | DataFusion `least` |
+| `greatest` | `greatest(a, b, ...)` | rewrite | `CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE greatest(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type. |
+| `least` | `least(a, b, ...)` | rewrite | `CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE least(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type. |
 | `ln` | `ln(x) → double` | passthrough | DataFusion `ln` |
 | `log` | `log(base, x) → double` | passthrough | DataFusion `log(base, x)` (same argument order) |
 | `log10` | `log10(x) → double` | passthrough | DataFusion `log10` |
@@ -213,11 +216,11 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | `array_min` | `array_min(array)` | passthrough | DataFusion `array_min` |
 | `array_position` | `array_position(array, element) → bigint` | rewrite | `CASE WHEN array IS NULL THEN NULL ELSE coalesce(CAST(array_position(array, element) AS BIGINT), 0) END` — Trino returns 0 for a missing element where DataFusion returns NULL. |
 | `array_remove` | `array_remove(array, element) → array` | rewrite | `array_remove_all(array, element)` — Trino removes every occurrence, DataFusion's `array_remove` only the first. |
-| `array_sort` | `array_sort(array) → array` | passthrough | DataFusion `array_sort` (ascending). The comparator-lambda form is refused. |
+| `array_sort` | `array_sort(array) → array` | rewrite | `array_sort(x, 'ASC', 'NULLS LAST')`: ascending with NULL elements last, as in Trino (DataFusion's default puts them first). The comparator-lambda form is refused. |
 | `array_union` | `array_union(a, b) → array` | passthrough | DataFusion `array_union` |
-| `arrays_overlap` | `arrays_overlap(a, b) → boolean` | passthrough | DataFusion `arrays_overlap` |
+| `arrays_overlap` | `arrays_overlap(a, b) → boolean` | rewrite | Rust UDF `trino_arrays_overlap`: NULL (not false) when no element matches but either array has a NULL element, as in Trino. Element types must be comparable. |
 | `cardinality` | `cardinality(array) → bigint` | rewrite | `CAST(cardinality(array) AS BIGINT)` (DataFusion returns an unsigned integer) |
-| `contains` | `contains(array, element) → boolean` | rewrite | `array_has(array, element)` |
+| `contains` | `contains(array, element) → boolean` | rewrite | Rust UDF `trino_contains`: NULL (not false) when the element is not found but the array has a NULL element, or when the element is NULL, as in Trino. The element type must be comparable with the array's. |
 | `element_at` | `element_at(array, index)` | rewrite | Rust UDF `trino_element_at`: 1-based, negative indexes count from the end, NULL past either end, `index = 0` is an error (`SQL array indices start at 1`). `element_at` on maps is refused. |
 | `filter` | `filter(array, lambda)` | unsupported | Refused: lambda expressions are not translated. |
 | `flatten` | `flatten(array(array)) → array` | passthrough | DataFusion `flatten` |

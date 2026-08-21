@@ -13,8 +13,13 @@
 //!   including DataFusion-only names, are refused with
 //!   [`GlauxSqlError::UnknownFunction`].
 //! - Constructs with no faithful translation (lambda expressions,
-//!   `AT TIME ZONE`, ROW/MAP values, multi-statement batches) are refused
-//!   with [`GlauxSqlError::Unsupported`] naming the construct.
+//!   `AT TIME ZONE`, zoned timestamp literals, ROW/MAP values, `date -
+//!   date`, multi-statement batches) and syntax Trino does not have
+//!   (`DISTINCT ON`, `QUALIFY`, `[1, 2]`, `::`, ...) are refused with
+//!   [`GlauxSqlError::Unsupported`] naming the construct.
+//! - Trino's operand-type rules are enforced on the planned query
+//!   ([`strict`]), so queries Athena rejects with `TYPE_MISMATCH` are not
+//!   quietly coerced.
 //! - Format strings are translated specifier by specifier and unknown
 //!   specifiers are errors, never dropped.
 //! - `docs/sql-coverage.md` is rendered from the same registry, so the docs
@@ -132,8 +137,10 @@ pub fn translate_full(sql: &str) -> Result<Translation, GlauxSqlError> {
         }
     }
     let mut statement = statements.remove(0);
-    rewrite::rewrite_statement(&mut statement)?;
+    // Naming runs first so it sees aliases as written (case preserved) and
+    // can map the folded names back; the rewriter then folds everything.
     let renames = naming::name_outputs(&mut statement);
+    rewrite::rewrite_statement(&mut statement)?;
     Ok(Translation { statement, renames })
 }
 
