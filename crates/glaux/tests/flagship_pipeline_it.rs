@@ -464,6 +464,27 @@ fn events_published_to_eventbridge_come_back_from_athena_as_parquet_rows() {
         published.len(),
         "the rule must not route OrderCancelled"
     );
+    // Keep draining for a short window: the queue must now be empty. Any
+    // further message means the rule routed something it must not (the
+    // OrderCancelled event) and the pipeline would be forwarding wrong data.
+    let quiet_until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < quiet_until {
+        let received = aws.json_ok(
+            fc,
+            "AmazonSQS.ReceiveMessage",
+            json!({ "QueueUrl": queue_url, "MaxNumberOfMessages": 10, "WaitTimeSeconds": 1 }),
+        );
+        if let Some(messages) = received["Messages"].as_array().filter(|m| !m.is_empty()) {
+            let bodies: Vec<&str> = messages
+                .iter()
+                .map(|m| m["Body"].as_str().unwrap_or(""))
+                .collect();
+            panic!(
+                "rule routed {} unexpected event(s) to the queue after all OrderPlaced events were consumed: {bodies:?}",
+                messages.len()
+            );
+        }
+    }
 
     // 5. Parquet objects under the prefix; nothing under the error prefix.
     let deadline = Instant::now() + Duration::from_secs(30);
