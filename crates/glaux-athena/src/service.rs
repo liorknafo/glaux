@@ -10,11 +10,21 @@
 //!
 //! `StartQueryExecution` records the query as `QUEUED` and spawns a tokio
 //! task that moves it to `RUNNING`, drives the [`QueryEngine`], encodes the
-//! results, writes the CSV to the `OutputLocation`, and lands on
-//! `SUCCEEDED` or `FAILED`. `StopQueryExecution` aborts that task (which
-//! drops the DataFusion stream mid-flight) and marks the query `CANCELLED`.
-//! Terminal states are sticky: a task that completes concurrently with a
-//! cancellation does not resurrect the query.
+//! results, writes `<id>.csv` and `<id>.csv.metadata` to the
+//! `OutputLocation`, and lands on `SUCCEEDED` or `FAILED`.
+//! `StopQueryExecution` aborts that task (which drops the DataFusion stream
+//! mid-flight) and marks the query `CANCELLED`. Terminal states are sticky:
+//! a task that completes concurrently with a cancellation does not
+//! resurrect the query.
+//!
+//! # Result objects
+//!
+//! A query that does not reach `SUCCEEDED` leaves no result objects behind:
+//! the two writes run under a guard that deletes whatever was written if
+//! either write fails or the task is aborted between them. Like real Athena,
+//! `QueryExecution.ResultConfiguration.OutputLocation` reports the full
+//! path of the CSV (`s3://bucket/prefix/<id>.csv`), not the location the
+//! client asked for.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -28,6 +38,7 @@ use tokio::task::AbortHandle;
 
 use crate::engine::{EngineError, QueryEngine, QueryRequest};
 use crate::error::AthenaError;
+use crate::metadata::encode_metadata;
 use crate::model::*;
 use crate::results::{EncodedResultSet, ResultError, encode_result_set};
 
@@ -370,7 +381,7 @@ impl AthenaService {
         let id = uuid::Uuid::new_v4().to_string();
         let context = input.query_execution_context.unwrap_or_default();
         let (statement_type, substatement) = classify(&sql);
-        let execution = QueryExecution {
+        let mut execution = QueryExecution {
             query_execution_id: id.clone(),
             query: sql.clone(),
             statement_type: statement_type.to_string(),
@@ -399,9 +410,10 @@ impl AthenaService {
         };
         let service = Arc::clone(self);
         let task_id = id.clone();
-        let key = format!("{prefix}{id}.csv");
+        let csv_key = format!("{prefix}{id}.csv");
+        execution.result_configuration.output_location = Some(format!("s3://{bucket}/{csv_key}"));
         let handle = tokio::spawn(async move {
-            service.run_query(task_id, request, bucket, key).await;
+            service.run_query(task_id, request, bucket, csv_key).await;
         });
 
         state.queries.insert(
@@ -425,12 +437,14 @@ impl AthenaService {
     }
 
     /// The background task body: `QUEUED → RUNNING → SUCCEEDED | FAILED`.
+    /// `csv_key` is the result CSV's key in `bucket`; the metadata file
+    /// sits next to it as `<csv_key>.metadata`.
     async fn run_query(
         self: Arc<Self>,
         id: String,
         request: QueryRequest,
         bucket: String,
-        key: String,
+        csv_key: String,
     ) {
         if !self.mark_running(&id) {
             return;
@@ -443,17 +457,13 @@ impl AthenaService {
                     (output.engine_time_millis, output.data_scanned_bytes);
                 match encode_result_set(&output.schema, &output.batches) {
                     Ok(encoded) => {
-                        let csv = Bytes::from(encoded.to_csv());
-                        match self.storage.put_object(&bucket, &key, csv).await {
-                            Ok(()) => Ok(Completed {
+                        self.write_results(&bucket, &csv_key, &encoded)
+                            .await
+                            .map(|()| Completed {
                                 results: Arc::new(encoded),
                                 engine_millis,
                                 scanned_bytes,
-                            }),
-                            Err(e) => Err(Failure::ResultWrite(format!(
-                                "failed to write query results to s3://{bucket}/{key}: {e}"
-                            ))),
-                        }
+                            })
                     }
                     Err(e) => Err(Failure::Encode(e)),
                 }
@@ -461,6 +471,44 @@ impl AthenaService {
             Err(e) => Err(Failure::Engine(e)),
         };
         self.finish(&id, outcome, processing_started.elapsed());
+    }
+
+    /// Write `<id>.csv.metadata` then `<id>.csv`. Metadata goes first so a
+    /// reader that sees the CSV can rely on its companion existing. Both
+    /// objects are removed again if either write fails or this future is
+    /// dropped (cancellation) part-way through.
+    async fn write_results(
+        &self,
+        bucket: &str,
+        csv_key: &str,
+        encoded: &EncodedResultSet,
+    ) -> Result<(), Failure> {
+        let metadata_key = format!("{csv_key}.metadata");
+        let mut cleanup = ResultCleanup {
+            storage: Arc::clone(&self.storage),
+            bucket: bucket.to_string(),
+            keys: vec![metadata_key.clone(), csv_key.to_string()],
+            armed: true,
+        };
+        let write_error = |key: &str, e: glaux_catalog::CatalogError| {
+            Failure::ResultWrite(format!(
+                "failed to write query results to s3://{bucket}/{key}: {e}"
+            ))
+        };
+        self.storage
+            .put_object(
+                bucket,
+                &metadata_key,
+                Bytes::from(encode_metadata(&encoded.columns)),
+            )
+            .await
+            .map_err(|e| write_error(&metadata_key, e))?;
+        self.storage
+            .put_object(bucket, csv_key, Bytes::from(encoded.to_csv()))
+            .await
+            .map_err(|e| write_error(csv_key, e))?;
+        cleanup.armed = false;
+        Ok(())
     }
 
     /// Move `id` to `RUNNING`; `false` if it was cancelled while queued.
@@ -806,6 +854,40 @@ impl AthenaService {
             .queries
             .get(id)
             .and_then(|r| r.client_request_token.clone())
+    }
+}
+
+/// Deletes the result objects of a query that did not complete its writes.
+/// Dropped armed on the error path and when the writing task is aborted;
+/// disarmed once both objects are in place.
+struct ResultCleanup {
+    storage: Arc<dyn StorageBackend>,
+    bucket: String,
+    keys: Vec<String>,
+    armed: bool,
+}
+
+impl Drop for ResultCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // `Drop` cannot await; hand the deletes to the runtime. If the
+        // runtime is already gone (process shutdown) there is nothing to
+        // clean up against either.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let storage = Arc::clone(&self.storage);
+        let bucket = std::mem::take(&mut self.bucket);
+        let keys = std::mem::take(&mut self.keys);
+        handle.spawn(async move {
+            for key in keys {
+                if let Err(e) = storage.delete_object(&bucket, &key).await {
+                    tracing::warn!(bucket, key, error = %e, "failed to remove partial result object");
+                }
+            }
+        });
     }
 }
 
