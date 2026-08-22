@@ -1012,6 +1012,11 @@ impl FirehoseService {
     /// this, streams refuse new records. Returns one entry per stream whose
     /// flush failed (its records stay in memory; nothing is dropped
     /// silently).
+    ///
+    /// Every stream is closed first and the flushes then run concurrently:
+    /// serialising them would make shutdown cost one sink round-trip per
+    /// stream, and `max_streams` allows 5000 of them, so a shutdown grace
+    /// period could expire before the last buffer was written.
     pub async fn shutdown(&self) -> Vec<(String, SinkError)> {
         let buffers: Vec<Arc<StreamBuffer>> = self
             .streams
@@ -1020,13 +1025,35 @@ impl FirehoseService {
             .values()
             .map(|e| Arc::clone(&e.buffer))
             .collect();
-        let mut failures = Vec::new();
+        // Close every timer up front so no buffer keeps scheduling work
+        // while the others are still flushing.
+        for buffer in &buffers {
+            buffer.close();
+        }
+        let mut tasks = tokio::task::JoinSet::new();
         for buffer in buffers {
-            if let Err(err) = buffer.close_and_flush(FlushReason::Shutdown).await {
+            tasks.spawn(async move {
+                let result = buffer.close_and_flush(FlushReason::Shutdown).await;
+                (buffer, result)
+            });
+        }
+        let mut failures = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            let (buffer, result) = match joined {
+                Ok(joined) => joined,
+                Err(join) => {
+                    // A flush task can only end abnormally if the runtime
+                    // itself is going away; nothing is silently dropped.
+                    tracing::error!(error = %join, "shutdown flush task ended abnormally");
+                    continue;
+                }
+            };
+            if let Err(err) = result {
                 tracing::error!(stream = buffer.stream_name(), error = %err, "shutdown flush failed");
                 failures.push((buffer.stream_name().to_string(), err));
             }
         }
+        failures.sort_by(|a, b| a.0.cmp(&b.0));
         failures
     }
 }
@@ -1291,6 +1318,37 @@ mod tests {
         let err = create(&service, body).await.unwrap_err();
         assert_eq!(err.code(), "InvalidArgumentException");
         assert!(err.message().contains("S3BackupConfiguration"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_every_stream() {
+        let (service, sink) = service();
+        let data = base64::engine::general_purpose::STANDARD.encode(b"payload");
+        for i in 0..8 {
+            let name = format!("s{i}");
+            create(&service, plain(&name)).await.unwrap();
+            service
+                .handle(
+                    "PutRecord",
+                    json!({"DeliveryStreamName": name, "Record": {"Data": data}})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(service.shutdown().await.is_empty());
+        let mut flushed: Vec<String> = sink
+            .batches()
+            .iter()
+            .map(|b| b.stream_name.clone())
+            .collect();
+        flushed.sort();
+        assert_eq!(
+            flushed,
+            (0..8).map(|i| format!("s{i}")).collect::<Vec<_>>(),
+            "every stream must be flushed exactly once"
+        );
     }
 
     #[tokio::test]
