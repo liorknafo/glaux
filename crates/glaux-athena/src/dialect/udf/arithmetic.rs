@@ -428,11 +428,14 @@ struct CheckedSum {
 
 impl CheckedSum {
     fn add(&mut self, value: i64) -> Result<()> {
+        // Trino's `LongSumAggregation` adds through `BigintOperators.add`,
+        // so an overflowing sum carries that operator's diagnostic — the
+        // running total and the value that broke it — not a `sum`-specific
+        // one.
+        let sum = self.sum.unwrap_or(0);
         self.sum = Some(
-            self.sum
-                .unwrap_or(0)
-                .checked_add(value)
-                .ok_or_else(|| overflow("bigint", "sum"))?,
+            sum.checked_add(value)
+                .ok_or_else(|| overflow_at("bigint", "addition", sum, "+", value))?,
         );
         Ok(())
     }
@@ -463,12 +466,14 @@ impl Accumulator for CheckedSum {
     }
 
     fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        // The mirror image, through `BigintOperators.subtract` — what
+        // Trino's `@RemoveInputFunction` for `sum(bigint)` goes through as
+        // a window frame slides.
         for v in int64_values(&values[0])?.iter().flatten() {
+            let sum = self.sum.unwrap_or(0);
             self.sum = Some(
-                self.sum
-                    .unwrap_or(0)
-                    .checked_sub(v)
-                    .ok_or_else(|| overflow("bigint", "sum"))?,
+                sum.checked_sub(v)
+                    .ok_or_else(|| overflow_at("bigint", "subtraction", sum, "-", v))?,
             );
         }
         Ok(())
@@ -500,7 +505,7 @@ impl Accumulator for DistinctCheckedSum {
         for v in &self.values {
             sum = sum
                 .checked_add(*v)
-                .ok_or_else(|| overflow("bigint", "sum"))?;
+                .ok_or_else(|| overflow_at("bigint", "addition", sum, "+", *v))?;
         }
         Ok(ScalarValue::Int64(Some(sum)))
     }
