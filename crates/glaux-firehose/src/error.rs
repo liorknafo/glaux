@@ -153,8 +153,10 @@ impl FirehoseError {
             | Self::ConcurrentModification { .. }
             | Self::UnknownOperation { .. }
             | Self::Serialization { .. } => 400,
-            Self::ServiceUnavailable { .. } => 503,
-            Self::InternalServer { .. } => 500,
+            // Firehose models `ServiceUnavailableException` with HTTP 500,
+            // not 503 (see the Errors section of PutRecord in the Firehose
+            // API reference); SDK retry policies key off the status.
+            Self::ServiceUnavailable { .. } | Self::InternalServer { .. } => 500,
         }
     }
 
@@ -205,7 +207,7 @@ mod tests {
         let err = FirehoseError::ServiceUnavailable {
             message: "sink down".into(),
         };
-        assert_eq!(err.http_status(), 503);
+        assert_eq!(err.http_status(), 500);
         assert_eq!(err.code(), "ServiceUnavailableException");
     }
 }
