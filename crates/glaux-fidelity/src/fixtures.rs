@@ -10,6 +10,7 @@
 //! | `customers` | Parquet | `ParquetHiveSerDe` |
 //! | `orders` | NDJSON | OpenX `JsonSerDe` |
 //! | `countries` | delimited text (`,`) | `LazySimpleSerDe` |
+//! | `events` | Parquet | `ParquetHiveSerDe` |
 //!
 //! [`FixtureTable::glue_table`] yields the Glue definition used offline;
 //! the record path builds the identical `TableInput` for real Glue from
@@ -34,7 +35,7 @@ use serde_json::{Map, Value};
 
 use crate::{HarnessError, Result};
 
-pub use data::{countries, customers, orders};
+pub use data::{countries, customers, events, orders};
 
 /// Hive SerDe class for Parquet.
 pub const PARQUET_SERDE: &str = "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe";
@@ -201,6 +202,7 @@ pub fn tables() -> Result<Vec<FixtureTable>> {
     let (customers_schema, customers_batch) = customers();
     let (orders_schema, orders_batch) = orders();
     let (countries_schema, countries_batch) = countries();
+    let (events_schema, events_batch) = events();
     Ok(vec![
         build(
             "customers",
@@ -244,6 +246,13 @@ pub fn tables() -> Result<Vec<FixtureTable>> {
             &countries_schema,
             countries_batch,
         )?,
+        build(
+            "events",
+            Format::Parquet,
+            vec![("id", "bigint"), ("at", "timestamp")],
+            &events_schema,
+            events_batch,
+        )?,
     ])
 }
 
@@ -256,7 +265,7 @@ pub fn table(name: &str) -> Result<FixtureTable> {
 }
 
 /// Table names in the order [`tables`] returns them.
-pub const TABLE_NAMES: &[&str] = &["customers", "orders", "countries"];
+pub const TABLE_NAMES: &[&str] = &["customers", "orders", "countries", "events"];
 
 fn build(
     name: &'static str,

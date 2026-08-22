@@ -286,131 +286,403 @@ Functions not in this table are refused with `FUNCTION_NOT_FOUND`, even when Dat
 
 Every corpus query runs against glaux's Athena service over the fixture tables stored as Parquet (`customers`), NDJSON (`orders`) and delimited text (`countries`), and is diffed against a recorded snapshot (`crates/glaux-fidelity/tests/snapshots/`). Rows are compared positionally under a top-level `ORDER BY` and as a multiset otherwise; floating-point columns within a relative 1e-9; timestamps as instants. Negative cases must fail naming the construct the corpus expects.
 
-**119 cases** (37 queries, 82 error cases): 119 match their snapshot. Snapshot provenance: **0 verified against real Athena**, 119 UNVERIFIED (self-recorded from glaux; re-record with `cargo run -p glaux-fidelity -- record`).
+**391 cases** (124 queries, 267 error cases): 391 match their snapshot. Snapshot provenance: **0 verified against real Athena**, 391 UNVERIFIED (self-recorded from glaux; re-record with `cargo run -p glaux-fidelity -- record`).
 
 > **UNVERIFIED** snapshots pin glaux's current behaviour so regressions are caught, but they do not yet prove agreement with AWS Athena. Treat the `match` column for those rows as "stable", not "verified".
 
 | Case | Kind | Tables (format) | Result | Snapshot |
 |---|---|---|---|---|
-| agg_approx_and_stats | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| agg_array_agg_ordered | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| array_functions | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| array_subscripts | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| dt_extract_and_iso | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| dt_formats_and_epochs | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| dt_interval_and_parts | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| expr_case_cast_predicates | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| expr_cast_semantics | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| fmt_csv_countries_anti_join | query, ordered | customers (Parquet), countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| fmt_csv_countries_join | query, ordered | customers (Parquet), countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| fmt_json_orders_types | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| fmt_parquet_customers_types | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| fmt_three_way_join | query, ordered | customers (Parquet), orders (JSON), countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| json_functions | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| math_functions | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_approx_percentile_array | error case (`approx_percentile`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_at_time_zone | error case (`AT TIME ZONE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_bigint_overflow_add | error case (`NUMERIC_VALUE_OUT_OF_RANGE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_bigint_overflow_mul | error case (`NUMERIC_VALUE_OUT_OF_RANGE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_bigint_overflow_sum | error case (`NUMERIC_VALUE_OUT_OF_RANGE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_bracket_array_literal | error case (`[...] array literal`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_cast_invalid_integer | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_cast_overflow | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_cast_varbinary | error case (`CAST(... AS VARBINARY)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_csv_unknown_column | error case (`capital`) | countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_ctas | error case (`not supported`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_datafusion_only_name | error case (`array_element`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_add_fractional | error case (`value must be an integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_add_subday_on_date | error case (`cannot be added to a DATE`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_add_unknown_unit | error case (`fortnight`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_minus_date | error case (`date subtraction`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_parse_bad_input | error case (`garbage`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_parse_non_literal_format | error case (`string literal`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_parse_unknown_specifier | error case (`%Q`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_trunc_hour_on_date | error case (`not a valid DATE field`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_distinct_on | error case (`DISTINCT ON`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_division_by_zero | error case (`DIVISION_BY_ZERO`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_double_colon_cast | error case (`:: cast`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_element_at_zero | error case (`SQL array indices start at 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_extract_epoch | error case (`EXTRACT(EPOCH)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_for_update | error case (`FOR UPDATE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_format_datetime_unknown_letter | error case (`'z'`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_from_unixtime_zone | error case (`time-zone`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_group_by_all | error case (`GROUP BY ALL`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_insert | error case (`not supported`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_invalid_date_literal | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_iso8601_date_single_digit | error case (`not an ISO-8601 value`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_iso8601_garbage | error case (`from_iso8601_timestamp`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_iso8601_timestamp_space | error case (`not an ISO-8601 value`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_json_invalid_input | error case (`invalid JSON`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_json_path_wildcard | error case (`wildcard`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_lambda_array_sort | error case (`lambda`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_lambda_transform | error case (`lambda expression`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_map_function | error case (`function map`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_max_by | error case (`function max_by`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_multiple_statements | error case (`Multiple statements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_natural_join | error case (`NATURAL JOIN`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_qualify | error case (`QUALIFY`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_regexp_replace_illegal_group | error case (`illegal group reference`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_repeat_is_a_trap | error case (`function repeat`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_row_type | error case (`ROW / MAP`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_semi_join | error case (`SEMI / ANTI JOIN`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_split_part_zero | error case (`greater than zero`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_split_three_args | error case (`3-argument`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_strpos_three_args | error case (`3-argument`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_subscript_out_of_range | error case (`array subscript must be less than or equal to array length`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_substr_fractional_start | error case (`start must be an integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_syntax_error | error case (`SYNTAX_ERROR`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_tablesample | error case (`TABLESAMPLE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_timestamp_minus_timestamp | error case (`date subtraction`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_try | error case (`function try`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_case_operand | error case (`Cannot apply operator: bigint = varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_case_results | error case (`All CASE results must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_coalesce | error case (`All COALESCE operands must be the same type`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_concat | error case (`Cannot apply operator: varchar || bigint`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_contains | error case (`cannot compare varchar with bigint`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_date_format_varchar | error case (`Unexpected parameters (varchar) for date/time function`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_date_trunc_varchar | error case (`Unexpected parameters (varchar, varchar) for function date_trunc`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_date_union | error case (`column 1 in UNION query has incompatible types: date, varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_date_varchar | error case (`Cannot apply operator: date = varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_extract_varchar | error case (`Unexpected parameters (varchar) for date/time function`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_greatest | error case (`All GREATEST operands must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_if | error case (`All CASE results must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_in_list | error case (`Cannot apply operator: bigint = varchar`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_in_subquery | error case (`value and result of subquery must be of the same type`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_join_on | error case (`Cannot apply operator: bigint = varchar`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_join_using | error case (`Cannot apply operator: bigint = varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_literal_compare | error case (`TYPE_MISMATCH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_nullif | error case (`All NULLIF operands must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_to_unixtime_varchar | error case (`Unexpected parameters (varchar) for function to_unixtime`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_union | error case (`column 1 in UNION query has incompatible types: bigint, varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_varchar_int | error case (`Cannot apply operator: varchar = bigint`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_year_varchar | error case (`Unexpected parameters (varchar) for date/time function`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_tz_literal | error case (`timestamp with time zone literal`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_unknown_column | error case (`nope`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_unknown_function | error case (`frobnicate`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_unnest | error case (`UNNEST`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| regex_functions | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| sem_alias_case | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| sem_identifiers | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| sem_nested_output_names | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| sem_null_ordering | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| sem_numeric_literals | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| sem_output_names | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_cte_chain | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_group_by_having | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_group_by_rollup | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_join_full_outer | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_join_inner_cross | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_join_left_using | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_order_limit_offset | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_set_operations | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_subqueries | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_values_anonymous | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_values_distinct | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_window_functions | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| str_functions | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| str_substr_split_part | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
+| agg_approx_and_stats | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_approx_percentile_grouped | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_approx_percentile_overloads | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_array_agg_ordered | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_decimal_sum_avg | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_decimal_window | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_group_by_empty | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_real_sum_avg | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_real_window | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_comparison | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_concat_null | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ctor_numeric_unification | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ctor_type_mismatch | error case (`All ARRAY elements must be the same type or coercible to a common type`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ctor_type_mismatch_cast | error case (`Cannot find common type between integer and varchar(1)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ctor_type_mismatch_join | error case (`All ARRAY elements must be the same type or coercible to a common type`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ctor_type_mismatch_subscript | error case (`All ARRAY elements must be the same type or coercible to a common type`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_empty_literal_unification | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_functions | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_elements | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_agg_order_by | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_array_max | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_array_min | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_array_sort | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_between | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_greatest | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_least | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_max | error case (`ARRAY comparison not supported for arrays with null elements`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_min | error case (`ARRAY comparison not supported for arrays with null elements`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_window | error case (`ARRAY comparison not supported for arrays with null elements`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_order_by | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_overlap_empty_arrays | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_overlap_empty_column | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ranking_aggregates | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ranking_without_nulls | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_subscripts | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| cast_varchar_text_grammars | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_nan_comparisons | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_nan_constructors | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_nan_extremes | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_nan_join | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_nan_membership | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_nan_window_max | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_negative_zero | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_special_array_eq | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_date_diff_joda | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_date_interval_days | query, unordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_extract_and_iso | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_far_dates | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_format_datetime_joda_digits | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_format_weekyear | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_formats_and_epochs | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_from_unixtime_rounding | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_from_unixtime_zone | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_interval_and_parts | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_parse_far_dates | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_parse_partial_fields | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_timestamp_literals | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_timestamp_precision | query, ordered | events (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_zoned_values | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| exists_double_correlated | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_case_cast_predicates | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_cast_boolean | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_cast_decimal | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_cast_double_text | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_cast_semantics | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_cast_temporal | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_integer_division | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_negation_overflow_types | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_nullif_first_arg_type | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| fetch_first_rows | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| fmt_csv_countries_anti_join | query, ordered | customers (Parquet), countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| fmt_csv_countries_join | query, ordered | customers (Parquet), countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| fmt_json_orders_types | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| fmt_parquet_customers_types | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| fmt_three_way_join | query, ordered | customers (Parquet), orders (JSON), countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| json_functions | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| json_malformed_input | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| json_numeric_text | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_abs_types | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_functions | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_log2_java_formula | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_power_ieee | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_random_bounded | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_round_double_edges | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_sqrt_nan | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_trino_types | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_truncate_decimal_precision | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_abs_overflow | error case (`NUMERIC_VALUE_OUT_OF_RANGE: Value -9223372036854775808 is out of range for abs(bigint)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_abs_overflow_integer | error case (`NUMERIC_VALUE_OUT_OF_RANGE: Value -2147483648 is out of range for abs(integer)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_abs_overflow_smallint | error case (`NUMERIC_VALUE_OUT_OF_RANGE: Value -32768 is out of range for abs(smallint)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_abs_overflow_tinyint_column | error case (`NUMERIC_VALUE_OUT_OF_RANGE: Value -128 is out of range for abs(tinyint)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_agg_argument_type | error case (`Unexpected parameters (varchar) for function sum`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_agg_argument_type_avg | error case (`Unexpected parameters (varchar) for function avg`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_aggregate_in_where | error case (`EXPRESSION_NOT_SCALAR: WHERE clause cannot contain aggregations, window functions or grouping operations`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_ambiguous_order_by | error case (`Column 'x' is ambiguous`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_ambiguous_order_by_column_alias | error case (`Column 'status' is ambiguous`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_approx_percentile_array | error case (`approx_percentile`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_approx_percentile_decimal | error case (`approx_percentile`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_approx_percentile_out_of_range | error case (`Percentile must be between 0 and 1`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_array_angle_bracket_type | error case (`ARRAY<...> type syntax`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_array_lt_null_elements | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_array_order_by_null_elements | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_array_order_nan_elements | error case (`ARRAY comparison not supported for arrays with NaN elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_at_time_zone | error case (`AT TIME ZONE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_division_overflow | error case (`NUMERIC_VALUE_OUT_OF_RANGE: bigint division overflow: -9223372036854775808 / -1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_division_overflow_column | error case (`NUMERIC_VALUE_OUT_OF_RANGE: bigint division overflow: -9223372036854775808 / -1`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_min_minus_one | error case (`NUMERIC_VALUE_OUT_OF_RANGE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_overflow_add | error case (`NUMERIC_VALUE_OUT_OF_RANGE: bigint addition overflow: 9223372036854775807 + 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_overflow_mul | error case (`NUMERIC_VALUE_OUT_OF_RANGE: bigint multiplication overflow: 10000000000 * 10000000000`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_overflow_sum | error case (`NUMERIC_VALUE_OUT_OF_RANGE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bitwise_and_operator | error case (`operator &`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bitwise_or_operator | error case (`operator |`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bitwise_xor_operator | error case (`operator ^`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_boolean_context_and | error case (`Logical expression term must evaluate to a boolean (actual: bigint)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_boolean_context_not | error case (`Value of logical NOT expression must evaluate to a boolean (actual: bigint)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_boolean_context_where | error case (`WHERE clause must evaluate to a boolean: actual type bigint`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_boolean_eq_integer | error case (`TYPE_MISMATCH: Cannot apply operator: boolean`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bracket_array_literal | error case (`[...] array literal`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_bigint_to_date | error case (`Cannot cast bigint to date`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_bigint_whitespace | error case (`Cannot cast '  12  ' to bigint`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_char | error case (`CAST(... AS CHAR(n))`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_date_to_bigint | error case (`Cannot cast date to bigint`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_date_with_time | error case (`Value cannot be cast to date`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_double_decimal_overflow | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_float_type | error case (`CAST(... AS FLOAT)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_inf_text | error case (`Cannot cast 'inf' to double`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_infinity_nbsp | error case (`Cannot cast 'Infinity`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_int_to_timestamp | error case (`to timestamp`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_int_varchar_n | error case (`cannot be represented as varchar(2)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_integer_out_of_range | error case (`Out of range for integer: 2147483648`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_integer_trailing_newline | error case (`to integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_invalid_integer | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_json | error case (`CAST(... AS JSON)`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_nan_lowercase | error case (`Cannot cast 'nan' to double`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_overflow | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_timestamp_region | error case (`Value cannot be cast to timestamp`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_timestamp_to_double | error case (`Cannot cast timestamp to double`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_timestamp_zone | error case (`Value cannot be cast to timestamp`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_tinyint_out_of_range | error case (`Out of range for tinyint: 200`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_varbinary | error case (`CAST(... AS VARBINARY)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_varchar_to_integer | error case (`Cannot cast '1.5' to integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_yes_boolean | error case (`Cannot cast 'yes' to BOOLEAN`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_chr_out_of_range | error case (`INVALID_FUNCTION_ARGUMENT: chr: Not a valid Unicode code point`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_codepoint_two_chars | error case (`codepoint(varchar(1))`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_column_alias_count | error case (`Column alias list has 1 entries but relation has 2 columns`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_count_distinct_multiple_arguments | error case (`for function count`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_csv_unknown_column | error case (`capital`) | countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_ctas | error case (`not supported`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_current_time | error case (`function current_time`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_datafusion_only_name | error case (`array_element`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_add_fractional | error case (`value must be an integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_add_subday_on_date | error case (`cannot be added to a DATE`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_add_unknown_unit | error case (`fortnight`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_minus_date | error case (`date subtraction`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_minus_second | error case (`Cannot add hour, minutes or seconds to a date`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_bad_input | error case (`garbage`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_bigint | error case (`TYPE_MISMATCH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_non_literal_format | error case (`string literal`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_out_of_range | error case (`INVALID_FUNCTION_ARGUMENT: date_parse`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_second_60 | error case (`Value 60 for secondOfMinute must be in the range [0,59]`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_unknown_specifier | error case (`%Q`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_weekday_only | error case (`INVALID_FUNCTION_ARGUMENT: date_parse`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_plus_25_hours | error case (`Cannot add hour, minutes or seconds to a date`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_plus_hour | error case (`Cannot add hour, minutes or seconds to a date`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_trunc_hour_on_date | error case (`not a valid DATE field`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_decimal_cast_whitespace | error case (`Cannot cast VARCHAR ' 1.5 ' to DECIMAL(2, 1)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_decimal_division_by_zero | error case (`DIVISION_BY_ZERO`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_decimal_literal_precision | error case (`has 39 digits; Trino decimals hold at most 38`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_decimal_overflow_add | error case (`Decimal overflow`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_decimal_overflow_cast_add | error case (`Decimal overflow`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_decimal_precision_39 | error case (`more digits than a Trino decimal holds`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_digit_identifier | error case (`must not start with a digit`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_distinct_on | error case (`DISTINCT ON`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_distinct_order_by_not_selected | error case (`For SELECT DISTINCT, ORDER BY expressions must appear in select list`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_divide_by_zero_integer | error case (`DIVISION_BY_ZERO: Division by zero`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_division_by_zero | error case (`DIVISION_BY_ZERO`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_double_colon_cast | error case (`:: cast`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_double_equals | error case (`mismatched input '=='`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_element_at_zero | error case (`SQL array indices start at 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_except_all | error case (`EXCEPT ALL`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_extract_epoch | error case (`EXTRACT(EPOCH)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_for_update | error case (`FOR UPDATE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_format_datetime_dd_doy | error case (`'D' (x2)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_format_datetime_unknown_letter | error case (`'z'`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_format_datetime_yyyyy | error case (`'y' (x5)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_from_unixtime_overflow | error case (`Millis overflow`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_from_unixtime_varchar | error case (`Unexpected parameters (varchar) for function from_unixtime`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_from_unixtime_zone | error case (`time-zone`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_group_by_all | error case (`GROUP BY ALL`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_group_by_empty_needs_aggregate | error case (`must be an aggregate expression or appear in GROUP BY clause`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_group_by_missing_column | error case (`'orders.id' must be an aggregate expression or appear in GROUP BY clause`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_group_by_output_alias | error case (`Column 's' cannot be resolved`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_having_output_alias | error case (`Column 'c' cannot be resolved`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_hex_literal | error case (`binary literal`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_ilike | error case (`ILIKE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_in_subquery_double | error case (`IN (subquery) over DOUBLE / REAL`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_in_subquery_projection | error case (`IN (subquery) as a value`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_insert | error case (`not supported`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_division_overflow | error case (`NUMERIC_VALUE_OUT_OF_RANGE: integer division overflow: -2147483648 / -1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_like_varchar | error case (`TYPE_MISMATCH: Left side of LIKE expression must evaluate to a varchar`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_literal_beyond_bigint | error case (`Invalid numeric literal: 12345678901234567890`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_literal_beyond_bigint_arithmetic | error case (`Invalid numeric literal: 9223372036854775808`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_overflow_add | error case (`integer addition overflow: 2147483647 + 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_overflow_cast | error case (`integer addition overflow`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_overflow_mul | error case (`integer multiplication overflow: 65536 * 65536`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_plus_varchar | error case (`TYPE_MISMATCH: Cannot apply operator: bigint + varchar`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_comparison | error case (`interval comparison`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_comparison_mixed | error case (`interval comparison`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_day_to_second | error case (`INTERVAL ... DAY TO SECOND`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_fractional_day | error case (`Invalid INTERVAL DAY value`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_result | error case (`interval result`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_times_number | error case (`interval * n`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_year_to_month | error case (`INTERVAL ... YEAR TO MONTH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_invalid_date_literal | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_is_true | error case (`IS NOT TRUE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_is_unknown | error case (`IS UNKNOWN`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_iso8601_date_single_digit | error case (`not an ISO-8601 value`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_iso8601_garbage | error case (`from_iso8601_timestamp`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_iso8601_offset | error case (`timestamp with time zone`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_iso8601_timestamp_space | error case (`not an ISO-8601 value`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_join_using_column_missing | error case (`Column 'status' cannot be resolved`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_join_using_qualified | error case (`Column 'a.k' cannot be resolved`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_join_without_condition | error case (`JOIN without ON or USING`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_json_invalid_input | error case (`Cannot convert '{not json' to JSON`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_json_path_wildcard | error case (`wildcard`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lag_negative_offset | error case (`Offset must be at least 0`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lambda_array_sort | error case (`lambda`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lambda_transform | error case (`lambda expression`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lead_negative_offset | error case (`Offset must be at least 0`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lead_null_offset | error case (`Offset must not be null`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_length_bigint | error case (`TYPE_MISMATCH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_length_date | error case (`TYPE_MISMATCH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_like_bad_escape | error case (`Escape character must be followed by`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_like_pattern_integer | error case (`TYPE_MISMATCH: Pattern for LIKE expression must evaluate to a varchar`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_limit_negative | error case (`LIMIT takes a non-negative row count`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_log_one_argument | error case (`log(base, x)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lower_bigint | error case (`TYPE_MISMATCH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lpad_empty_pad | error case (`Padding string must not be empty`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_ltrim_two_args | error case (`ltrim takes one argument`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_map_function | error case (`function map`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_max_by | error case (`function max_by`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_modulo_by_zero | error case (`DIVISION_BY_ZERO: Division by zero`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_multiple_statements | error case (`Multiple statements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_natural_join | error case (`NATURAL JOIN`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_negate_tinyint_overflow | error case (`tinyint negation overflow: -128`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_nth_value_zero_offset | error case (`Offset must be at least 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_ntile_zero_buckets | error case (`Buckets must be at least 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_offset_negative | error case (`OFFSET takes a non-negative row count`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_parse_datetime_second_60 | error case (`Value 60 for secondOfMinute must be in the range [0,59]`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_parse_datetime_zone | error case (`timestamp with time zone`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_pg_regex_operator | error case (`operator ~`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_postgres_interval_day | error case (`PostgreSQL interval string`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_postgres_interval_hour | error case (`PostgreSQL interval string`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_qualify | error case (`QUALIFY`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_quantified_comparison_all | error case (`quantified comparison (ALL)`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_quantified_comparison_any | error case (`quantified comparison (ANY)`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_quantified_comparison_some | error case (`quantified comparison (SOME)`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_quantified_comparison_values | error case (`quantified comparison (ALL)`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_random_bound_not_positive | error case (`bound must be positive`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_dollar_ambiguous | error case (`$` against text ending in a newline`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_dollar_followed | error case (`is followed by a part of the pattern that can match text`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_extract_group_out_of_range | error case (`Pattern has 1 groups. Cannot access group 2`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_horizontal_space | error case (`\h is read differently`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_invalid_pattern | error case (`invalid regular expression`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_lookaround | error case (`invalid regular expression`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_possessive | error case (`possessive quantifier`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_possessive_brace | error case (`possessive quantifier`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_replace_illegal_group | error case (`Illegal group reference`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_replace_missing_group | error case (`No group 2`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_replace_missing_named_group | error case (`No group with name {y}`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_replace_no_groups | error case (`No group 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_repeat_is_a_trap | error case (`function repeat`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_row_type | error case (`ROW / MAP`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_rpad_empty_pad | error case (`Padding string must not be empty`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_rtrim_two_args | error case (`rtrim takes one argument`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_scalar_argument_type_abs | error case (`Unexpected parameters (varchar) for function abs`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_scalar_argument_type_cardinality | error case (`Unexpected parameters (varchar) for function cardinality`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_scalar_subquery_multiple_rows | error case (`SUBQUERY_MULTIPLE_ROWS: Scalar sub-query has returned multiple rows`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_select_list_alias_reference | error case (`Column 'x' cannot be resolved`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_semi_join | error case (`SEMI / ANTI JOIN`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_smallint_overflow_sub | error case (`NUMERIC_VALUE_OUT_OF_RANGE: smallint subtraction overflow: -32768 - 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_spaceship_operator | error case (`operator <=>`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_split_empty_delimiter | error case (`The delimiter may not be the empty string`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_split_part_zero | error case (`greater than zero`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_split_three_args | error case (`3-argument`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_string_literal_alias | error case (`a string literal cannot be used as an alias`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_strpos_three_args | error case (`3-argument`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_subquery_correlated_limit | error case (`correlated scalar subquery is not supported`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_subquery_correlated_multiple_rows | error case (`SUBQUERY_MULTIPLE_ROWS: Scalar sub-query has returned multiple rows`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_subquery_correlated_order_by | error case (`correlated scalar subquery in this clause`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_subquery_correlated_same_column_name | error case (`correlated subquery over two `id` columns`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_subscript_out_of_range | error case (`array subscript must be less than or equal to array length`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_substr_fractional_start | error case (`start must be an integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_syntax_error | error case (`SYNTAX_ERROR`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_tablesample | error case (`TABLESAMPLE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_timestamp_literal_precision | error case (`timestamp literal`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_timestamp_minus_timestamp | error case (`date subtraction`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_tinyint_division_overflow | error case (`NUMERIC_VALUE_OUT_OF_RANGE: tinyint division overflow: -128 / -1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_tinyint_overflow_mul | error case (`NUMERIC_VALUE_OUT_OF_RANGE: tinyint multiplication overflow: 127 * 2`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_trim_two_args | error case (`Expected: )`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_truncate_double_two_args | error case (`truncate(double, n)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_try | error case (`function try`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_case_operand | error case (`Cannot apply operator: bigint = varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_case_results | error case (`All CASE results must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_coalesce | error case (`All COALESCE operands must be the same type`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_concat | error case (`Cannot apply operator: varchar(1) || integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_contains | error case (`cannot compare varchar with bigint`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_date_format_varchar | error case (`Unexpected parameters (varchar) for date/time function`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_date_trunc_varchar | error case (`Unexpected parameters (varchar, varchar) for function date_trunc`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_date_union | error case (`column 1 in UNION query has incompatible types: date, varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_date_varchar | error case (`Cannot apply operator: date = varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_extract_varchar | error case (`Unexpected parameters (varchar) for date/time function`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_greatest | error case (`All GREATEST operands must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_if | error case (`All CASE results must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_in_list | error case (`Cannot apply operator: bigint = varchar`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_in_subquery | error case (`value and result of subquery must be of the same type`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_join_on | error case (`Cannot apply operator: bigint = varchar`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_join_using | error case (`Cannot apply operator: bigint = varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_literal_compare | error case (`TYPE_MISMATCH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_literal_type_names | error case (`Cannot apply operator: integer = varchar(1)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_nullif | error case (`All NULLIF operands must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_to_unixtime_varchar | error case (`Unexpected parameters (varchar) for function to_unixtime`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_union | error case (`column 1 in UNION query has incompatible types: bigint, varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_varchar_int | error case (`Cannot apply operator: varchar = integer`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_year_varchar | error case (`Unexpected parameters (varchar) for date/time function`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_tz_literal | error case (`timestamp with time zone literal`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_unary_minus_varchar | error case (`Cannot negate the operand of unary '-'`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_union_literal_type_names | error case (`column 1 in UNION query has incompatible types: varchar(1), integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_unknown_column | error case (`nope`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_unknown_function | error case (`frobnicate`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_unnest | error case (`UNNEST`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_using_double_keys | error case (`JOIN ... USING on DOUBLE / REAL keys`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_window_aggregate_order_by | error case (`aggregate ORDER BY inside a window function`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_window_function_in_having | error case (`EXPRESSION_NOT_SCALAR: HAVING clause cannot contain window functions or grouping operations`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_window_function_in_where | error case (`EXPRESSION_NOT_SCALAR: WHERE clause cannot contain aggregations, window functions or grouping operations`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_window_without_over | error case (`rank is a window function and requires an OVER clause`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_with_recursive | error case (`WITH RECURSIVE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| regex_dollar_final_newline | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| regex_functions | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| regex_java_classes | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| regex_replace_empty_matches | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| regex_replace_empty_matches_column | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| result_metadata_json_type | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| result_metadata_unknown_type | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| result_metadata_unknown_union | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_alias_case | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_bigint_min_literal | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_decimal_arithmetic | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_identifiers | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_integer_literals | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_like_computed_pattern | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_like_no_escape | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_nested_output_names | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_null_ordering | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_numeric_literals | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_output_names | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_set_operation_integer | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_set_operation_types | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_values_types | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_cte_chain | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_group_by_having | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_group_by_rollup | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_group_by_source_column_alias | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_intersect_all | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_join_full_outer | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_join_inner_cross | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_join_left_using | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_join_using_columns | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_join_using_star_order | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_join_using_unqualified | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_order_limit_offset | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_scalar_subquery_empty | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_set_operations | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_subqueries | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_values_anonymous | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_values_distinct | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_window_functions | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| str_case_and_padding | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| str_functions | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| str_substr_split_part | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| str_trim_bare_specification | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| str_trim_whitespace | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| string_replace_empty_search | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| subquery_correlated_scalar | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| subquery_correlated_scalar_where | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| values_bare_rows | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| values_bare_toplevel | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| values_numeric_unification | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| values_row_type_mismatch | error case (`Values rows have mismatched types: row(integer) vs row(varchar(1))`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| values_row_type_mismatch_boolean | error case (`Values rows have mismatched types: row(boolean) vs row(bigint)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| values_row_type_mismatch_date | error case (`Values rows have mismatched types: row(date) vs row(varchar)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 
 ### Firehose delivery artifacts
 
@@ -418,6 +690,6 @@ Object keys are checked against Firehose's naming contract (prefix resolved at t
 
 | Scenario | Objects | Result | Snapshot |
 |---|---|---|---|
-| firehose_raw_default_prefix | `!{timestamp:yyyy/MM/dd/HH}/clicks-raw-1-<timestamp>-<uuid>` | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| firehose_custom_prefix_gzip | `events/!{timestamp:yyyy/MM/dd}/hour=!{timestamp:HH}/clicks-gz-1-<timestamp>-<uuid>.gz` | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| firehose_parquet_conversion | `errors/format-conversion-failed/!{timestamp:yyyy-MM-dd}/orders-parquet-1-<timestamp>-<uuid>`<br>`tables/orders/!{timestamp:yyyy/MM/dd}/orders-parquet-1-<timestamp>-<uuid>.parquet` | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
+| firehose_raw_default_prefix | `!{timestamp:yyyy/MM/dd/HH}/clicks-raw-1-<timestamp>-<uuid>` | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| firehose_custom_prefix_gzip | `events/!{timestamp:yyyy/MM/dd}/hour=!{timestamp:HH}/clicks-gz-1-<timestamp>-<uuid>.gz` | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| firehose_parquet_conversion | `errors/format-conversion-failed/!{timestamp:yyyy-MM-dd}/orders-parquet-1-<timestamp>-<uuid>`<br>`tables/orders/!{timestamp:yyyy/MM/dd}/orders-parquet-1-<timestamp>-<uuid>.parquet` | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
