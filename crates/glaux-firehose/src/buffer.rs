@@ -691,6 +691,8 @@ mod tests {
                 .interval_in_seconds,
             Some(30)
         );
+        // The new version reaches the sink: S3 object names embed it.
+        assert_eq!(sink.batches()[0].stream_version, "2");
     }
 
     #[tokio::test(start_paused = true)]
