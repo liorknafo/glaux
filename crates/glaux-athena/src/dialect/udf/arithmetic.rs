@@ -6,9 +6,10 @@
 //! - integer literals that fit in 32 bits to `integer` (DataFusion types
 //!   `1` as `bigint`; Trino and Athena report `integer`, and
 //!   `2147483647 + 1` overflows);
-//! - integer `+ - *` and `sum` to overflow-checked UDFs (DataFusion wraps
-//!   around; Trino raises `NUMERIC_VALUE_OUT_OF_RANGE`), widening mixed
-//!   widths to the wider type;
+//! - integer `+ - * /` and `sum` to overflow-checked UDFs (DataFusion wraps
+//!   around, and Arrow's diagnostic names neither the SQL type nor the
+//!   operands; Trino raises `NUMERIC_VALUE_OUT_OF_RANGE` naming both),
+//!   widening mixed widths to the wider type;
 //! - decimal `+ - * /`, `sum`, and `avg` to UDFs with Trino's result types
 //!   and HALF_UP rounding (see [`super::decimal`]);
 //! - `date ± interval` to a UDF that refuses sub-day intervals;
@@ -62,14 +63,19 @@ use super::floats::{TrinoFloatGreatest, TrinoFloatMax, TrinoIeeeCmp};
 use super::timestamps::{TrinoDateInterval, TrinoTimestampMillis};
 use super::{data_error, is_integer, type_mismatch, unsupported_error};
 
-/// The checked scalar UDFs (`trino_checked_add` / `_sub` / `_mul` /
-/// `_neg`).
+/// The checked scalar UDFs (`trino_checked_add` / `_sub` / `_mul` / `_div`
+/// / `_neg`).
 pub fn scalar_udfs() -> Vec<ScalarUDF> {
-    [Operator::Plus, Operator::Minus, Operator::Multiply]
-        .into_iter()
-        .map(|op| ScalarUDF::new_from_impl(CheckedArithmetic::new(op)))
-        .chain([ScalarUDF::new_from_impl(CheckedNegate::new())])
-        .collect()
+    [
+        Operator::Plus,
+        Operator::Minus,
+        Operator::Multiply,
+        Operator::Divide,
+    ]
+    .into_iter()
+    .map(|op| ScalarUDF::new_from_impl(CheckedArithmetic::new(op)))
+    .chain([ScalarUDF::new_from_impl(CheckedNegate::new())])
+    .collect()
 }
 
 /// The checked aggregate UDFs (`trino_checked_sum`) and the `real`
@@ -87,6 +93,63 @@ fn overflow(type_name: &str, op: &str) -> DataFusionError {
         "NUMERIC_VALUE_OUT_OF_RANGE",
         format!("{type_name} {op} overflow"),
     )
+}
+
+/// The same diagnostic with the operands Trino always names
+/// (`BigintOperators.add`: `bigint addition overflow: 9223372036854775807 +
+/// 1`), as the negation path does.
+fn overflow_at(type_name: &str, op: &str, left: i64, symbol: &str, right: i64) -> DataFusionError {
+    data_error(
+        "NUMERIC_VALUE_OUT_OF_RANGE",
+        format!("{type_name} {op} overflow: {left} {symbol} {right}"),
+    )
+}
+
+/// The inclusive range of a signed integer type, as `i64`.
+fn integer_range(t: &DataType) -> (i64, i64) {
+    match t {
+        DataType::Int8 => (i64::from(i8::MIN), i64::from(i8::MAX)),
+        DataType::Int16 => (i64::from(i16::MIN), i64::from(i16::MAX)),
+        DataType::Int32 => (i64::from(i32::MIN), i64::from(i32::MAX)),
+        _ => (i64::MIN, i64::MAX),
+    }
+}
+
+/// The first row whose `op` overflows `target`. Arrow's kernel reports that
+/// *a* row overflowed without saying which, so the operation is replayed in
+/// 64-bit arithmetic — every glaux integer type widens into `i64` losslessly
+/// — to recover the operands Trino names.
+fn first_overflowing_row(
+    op: Operator,
+    target: &DataType,
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+) -> Option<(i64, i64)> {
+    let lhs = cast(lhs, &DataType::Int64).ok()?;
+    let rhs = cast(rhs, &DataType::Int64).ok()?;
+    let lhs = lhs.as_primitive::<Int64Type>();
+    let rhs = rhs.as_primitive::<Int64Type>();
+    let (low, high) = integer_range(target);
+    (0..lhs.len().min(rhs.len())).find_map(|i| {
+        if lhs.is_null(i) || rhs.is_null(i) {
+            return None;
+        }
+        let (left, right) = (lhs.value(i), rhs.value(i));
+        // A zero divisor is a division-by-zero error, not an overflow.
+        if op == Operator::Divide && right == 0 {
+            return None;
+        }
+        let value = match op {
+            Operator::Plus => left.checked_add(right),
+            Operator::Minus => left.checked_sub(right),
+            Operator::Multiply => left.checked_mul(right),
+            _ => left.checked_div(right),
+        };
+        match value {
+            Some(v) if (low..=high).contains(&v) => None,
+            _ => Some((left, right)),
+        }
+    })
 }
 
 /// The wider of two signed integer types.
@@ -107,8 +170,10 @@ fn wider_integer(a: &DataType, b: &DataType) -> DataType {
 }
 
 /// `trino_checked_add(a, b)` etc.: overflow-checked integer arithmetic
-/// (Arrow's checked kernels on the wider operand type) and Trino's decimal
-/// arithmetic for decimal operands.
+/// (Arrow's checked kernels on the wider operand type, with Trino's
+/// diagnostic naming the type and the operands) and Trino's decimal
+/// arithmetic for decimal operands. `trino_checked_div` covers integer
+/// division only; decimal division is [`TrinoDecimalDiv`], which rounds.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct CheckedArithmetic {
     signature: Signature,
@@ -128,7 +193,17 @@ impl CheckedArithmetic {
         match self.op {
             Operator::Plus => "addition",
             Operator::Minus => "subtraction",
+            Operator::Divide => "division",
             _ => "multiplication",
+        }
+    }
+
+    fn symbol(&self) -> &'static str {
+        match self.op {
+            Operator::Plus => "+",
+            Operator::Minus => "-",
+            Operator::Divide => "/",
+            _ => "*",
         }
     }
 }
@@ -138,6 +213,7 @@ impl ScalarUDFImpl for CheckedArithmetic {
         match self.op {
             Operator::Plus => "trino_checked_add",
             Operator::Minus => "trino_checked_sub",
+            Operator::Divide => "trino_checked_div",
             _ => "trino_checked_mul",
         }
     }
@@ -178,12 +254,19 @@ impl ScalarUDFImpl for CheckedArithmetic {
         let kernel = match self.op {
             Operator::Plus => numeric::add,
             Operator::Minus => numeric::sub,
+            Operator::Divide => numeric::div,
             _ => numeric::mul,
         };
         match kernel(&lhs, &rhs) {
             Ok(array) => Ok(ColumnarValue::Array(array)),
             Err(ArrowError::ArithmeticOverflow(_)) => {
-                Err(overflow(&trino_type_name(&target), self.verb()))
+                let name = trino_type_name(&target);
+                Err(match first_overflowing_row(self.op, &target, &lhs, &rhs) {
+                    Some((left, right)) => {
+                        overflow_at(&name, self.verb(), left, self.symbol(), right)
+                    }
+                    None => overflow(&name, self.verb()),
+                })
             }
             Err(e) => Err(e.into()),
         }
@@ -802,6 +885,13 @@ fn rewrite_binary(left: &Expr, op: Operator, right: &Expr, schema: &DFSchema) ->
                     || matches!(r, DataType::Decimal128(..))) =>
         {
             Some(udf_call(TrinoDecimalDiv::new(), args))
+        }
+        // Integer division overflows for exactly one pair per type (the
+        // type's minimum over -1); the UDF names the type and the operands
+        // as Trino's `BigintOperators.divide` does, where Arrow's kernel
+        // says only `Overflow happened on: ...`.
+        Operator::Divide if is_integer(&l) && is_integer(&r) => {
+            Some(udf_call(CheckedArithmetic::new(op), args))
         }
         _ => None,
     }
