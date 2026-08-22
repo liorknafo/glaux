@@ -17,7 +17,13 @@
 //! execution. Nested select lists get the `_colN` treatment from
 //! [`name_nested_select`], called by the rewriter for every query level.
 
-use sqlparser::ast::{Expr, Ident, Query, Select, SelectItem, SetExpr, Statement};
+use std::ops::ControlFlow;
+
+use sqlparser::ast::{
+    Expr, Ident, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Visit, Visitor,
+};
+
+use super::error::GlauxSqlError;
 
 /// Placeholder prefix for duplicate output names; never a plausible user
 /// alias.
@@ -164,6 +170,43 @@ pub fn name_outputs(statement: &mut Statement) -> OutputRenames {
     OutputRenames(renames)
 }
 
+/// Refuse an `ORDER BY` identifier that names more than one output column
+/// (`SELECT id x, amount x ... ORDER BY x`): Trino reports `Column 'x' is
+/// ambiguous`, DataFusion would silently sort by the first. Checked at
+/// every query level, before duplicates are renamed.
+pub fn check_order_by_ambiguity(statement: &Statement) -> Result<(), GlauxSqlError> {
+    struct Checker;
+    impl Visitor for Checker {
+        type Break = GlauxSqlError;
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+            let (Some(order_by), SetExpr::Select(select)) = (&query.order_by, query.body.as_ref())
+            else {
+                return ControlFlow::Continue(());
+            };
+            let OrderByKind::Expressions(items) = &order_by.kind else {
+                return ControlFlow::Continue(());
+            };
+            let names: Vec<String> = select.projection.iter().filter_map(item_name).collect();
+            for item in items {
+                let Expr::Identifier(id) = &item.expr else {
+                    continue;
+                };
+                let wanted = id.value.to_lowercase();
+                if names.iter().filter(|n| **n == wanted).count() > 1 {
+                    return ControlFlow::Break(GlauxSqlError::Parse {
+                        message: format!("Column '{}' is ambiguous", id.value),
+                    });
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    match statement.visit(&mut Checker) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(err) => Err(err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sqlparser::dialect::GenericDialect;
@@ -211,6 +254,28 @@ mod tests {
         );
         assert_eq!(renames.original("total"), Some("Total"));
         assert_eq!(renames.original("count"), None);
+    }
+
+    #[test]
+    fn ambiguous_order_by_aliases_are_refused() {
+        for sql in [
+            "SELECT id x, amount x FROM t ORDER BY x",
+            "SELECT 1 AS a, 2 AS a FROM t ORDER BY A",
+            "SELECT amount AS status, status FROM t ORDER BY status",
+            "SELECT * FROM (SELECT a AS k, b AS k FROM t ORDER BY k) s",
+        ] {
+            let stmt = Parser::parse_sql(&GenericDialect, sql).unwrap().remove(0);
+            let err = check_order_by_ambiguity(&stmt).unwrap_err();
+            assert!(err.to_string().contains("is ambiguous"), "{sql}: {err}");
+        }
+        for sql in [
+            "SELECT id x, amount y FROM t ORDER BY x",
+            "SELECT id x, amount x FROM t ORDER BY amount",
+            "SELECT id, id FROM t ORDER BY 1",
+        ] {
+            let stmt = Parser::parse_sql(&GenericDialect, sql).unwrap().remove(0);
+            check_order_by_ambiguity(&stmt).unwrap();
+        }
     }
 
     #[test]

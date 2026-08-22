@@ -1,0 +1,2 @@
+-- error: Value cannot be cast to date
+SELECT CAST('2024-01-05 10:00:00' AS DATE)

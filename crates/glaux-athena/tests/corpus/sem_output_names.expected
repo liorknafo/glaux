@@ -1,4 +1,4 @@
-types: bigint, bigint, bigint, bigint, bigint, varchar, bigint
+types: bigint, bigint, integer, integer, bigint, varchar, bigint
 +-------+----+---+---+----+-------+-------+
 | _col0 | id | a | a | id | Name  | _col6 |
 +-------+----+---+---+----+-------+-------+

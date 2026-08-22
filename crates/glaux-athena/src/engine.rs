@@ -256,20 +256,260 @@ fn classify(err: DataFusionError) -> EngineError {
     if let Some(user) = glaux_error(&err) {
         return user;
     }
+    // The root cause without the optimizer's context wrappers ("Optimizer
+    // rule 'simplify_expressions' failed, caused by ..."), which would leak
+    // engine internals into user-facing messages.
+    let root_message = err.find_root().to_string();
     let data = |code: &str| EngineError::Data {
         code: code.to_string(),
-        message: err.to_string(),
+        message: runtime_message(&root_message),
     };
     match err.find_root() {
         DataFusionError::SQL(..)
         | DataFusionError::Plan(..)
         | DataFusionError::SchemaError(..)
-        | DataFusionError::NotImplemented(..) => EngineError::Plan(err.to_string()),
+        | DataFusionError::NotImplemented(..) => {
+            // DataFusion's coercion failure for operand types it does not
+            // combine is Trino's TYPE_MISMATCH ("Cannot apply operator:
+            // boolean = integer"), not a syntax error.
+            if let Some(rest) = root_message.strip_prefix(
+                "Error during planning: Cannot infer common argument \
+                     type for comparison operation ",
+            ) {
+                return EngineError::TypeMismatch(format!(
+                    "Cannot apply operator: {}",
+                    trino_type_tokens(rest)
+                ));
+            }
+            // Same for its arithmetic coercion failure ("Cannot coerce
+            // arithmetic expression Int64 + Utf8 to valid types"), which
+            // DataFusion raises while typing the projection — before the
+            // strict operand checker ever sees the plan.
+            if let Some(rest) = root_message
+                .strip_prefix("Error during planning: Cannot coerce arithmetic expression ")
+                .and_then(|text| text.strip_suffix(" to valid types"))
+            {
+                return EngineError::TypeMismatch(format!(
+                    "Cannot apply operator: {}",
+                    trino_type_tokens(rest)
+                ));
+            }
+            // And for a `VALUES` row list whose columns it will not unify
+            // ("Inconsistent data type across values list at row 1 column
+            // 0. Was Date32 but found Utf8"), which is Trino's `Values rows
+            // have mismatched types`. The pairs DataFusion *does* unify are
+            // caught by the strict checker instead.
+            if let Some(rest) = root_message.strip_prefix(
+                "Error during planning: Inconsistent data type across \
+                     values list at row ",
+            ) && let Some((_, types)) = rest.split_once(". Was ")
+                && let Some((was, found)) = types.split_once(" but found ")
+            {
+                return EngineError::TypeMismatch(format!(
+                    "Values rows have mismatched types: row({}) vs row({})",
+                    trino_type_tokens(was),
+                    trino_type_tokens(found.trim_end_matches('.'))
+                ));
+            }
+            // Trino types the operands of `AND` / `OR`, `NOT`, and a
+            // `WHERE` / `HAVING` predicate as boolean and reports
+            // TYPE_MISMATCH with the sentences below; DataFusion phrases the
+            // same refusals in its own words and Arrow type names.
+            if let Some(rest) = root_message.strip_prefix(
+                "Error during planning: Cannot infer common argument type \
+                     for logical boolean operation ",
+            ) {
+                let actual = rest
+                    .split(' ')
+                    .find(|token| *token != "Boolean" && !matches!(*token, "AND" | "OR"))
+                    .unwrap_or(rest);
+                return EngineError::TypeMismatch(format!(
+                    "Logical expression term must evaluate to a boolean (actual: {})",
+                    trino_type_tokens(actual)
+                ));
+            }
+            if let Some(rest) = root_message.strip_prefix(
+                "Error during planning: Unary operator 'NOT' requires a \
+                     boolean expression, got ",
+            ) {
+                return EngineError::TypeMismatch(format!(
+                    "Value of logical NOT expression must evaluate to a boolean (actual: {})",
+                    trino_type_tokens(rest)
+                ));
+            }
+            if root_message.starts_with(
+                "Error during planning: Cannot create filter with non-boolean predicate",
+            ) && let Some((_, actual)) = root_message.rsplit_once(" returning ")
+            {
+                return EngineError::TypeMismatch(format!(
+                    "WHERE clause must evaluate to a boolean: actual type {}",
+                    trino_type_tokens(actual)
+                ));
+            }
+            // DataFusion does not name the operand type of a unary minus it
+            // refuses, so neither can the message.
+            if root_message.starts_with(
+                "Error during planning: Unary operator '-' only supports signed numeric",
+            ) {
+                return EngineError::TypeMismatch(
+                    "Cannot negate the operand of unary '-': Trino has a negation \
+                     operator only for numeric and interval types"
+                        .to_string(),
+                );
+            }
+            // Function resolution: DataFusion appends "No function matches
+            // the given name and argument types 'abs(Utf8)'" (plus an
+            // invitation to file a DataFusion bug report, for aggregates).
+            // Every name that gets this far is in glaux's coverage table, so
+            // the failure is always the argument types or the arity —
+            // Trino's `Unexpected parameters (...) for function ...`.
+            if let Some(call) = root_message
+                .split("No function matches the given name and argument types '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                && let Some((name, args)) = call.strip_suffix(')').and_then(|c| c.split_once('('))
+            {
+                return EngineError::TypeMismatch(format!(
+                    "Unexpected parameters ({}) for function {name}",
+                    trino_type_list(args)
+                ));
+            }
+            // An aggregate in `WHERE`: Trino's analyzer refuses it with the
+            // same sentence it uses for a window function there.
+            if root_message.contains("Aggregate functions are not allowed in the WHERE clause") {
+                return EngineError::Data {
+                    code: "EXPRESSION_NOT_SCALAR".to_string(),
+                    message: "WHERE clause cannot contain aggregations, window functions or \
+                              grouping operations"
+                        .to_string(),
+                };
+            }
+            // A column alias list that does not match the relation's width:
+            // DataFusion counts "Source table contains 2 columns but only 1
+            // names given as column alias"; Trino names both counts the
+            // other way round.
+            if let Some(rest) =
+                root_message.strip_prefix("Error during planning: Source table contains ")
+                && let Some((columns, rest)) = rest.split_once(" columns but only ")
+                && let Some((aliases, _)) = rest.split_once(" names given as column alias")
+            {
+                return EngineError::Plan(format!(
+                    "Column alias list has {aliases} entries but relation has {columns} columns"
+                ));
+            }
+            // A select item that is neither grouped nor aggregated.
+            // DataFusion's diagnostic talks about "expanding wildcard" even
+            // when the query has none, and names the GROUP BY column
+            // instead of the offending one.
+            if let Some(rest) = root_message
+                .split("column \"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                && root_message
+                    .contains("Column in SELECT must be in GROUP BY or an aggregate function")
+            {
+                return EngineError::Plan(format!(
+                    "'{rest}' must be an aggregate expression or appear in GROUP BY clause"
+                ));
+            }
+            // A correlated subquery DataFusion's decorrelation could not
+            // turn into a join (an `ORDER BY` or `LIMIT` inside it, or a
+            // correlation equality glaux routed through its IEEE double
+            // comparison). The expression survives into physical planning,
+            // where DataFusion dumps the `Debug` of the logical expression.
+            if root_message.contains("Physical plan does not support logical expression")
+                && root_message.contains("ScalarSubquery")
+            {
+                return EngineError::Unsupported {
+                    construct: "correlated scalar subquery".to_string(),
+                    message: "DataFusion could not rewrite this one into a join: an ORDER BY or \
+                              LIMIT inside a correlated subquery, or a correlation condition over \
+                              DOUBLE / REAL (which Trino compares with IEEE equality), stops it. \
+                              Rewrite the subquery as a JOIN"
+                        .to_string(),
+                };
+            }
+            if root_message.contains(
+                "Correlated scalar subquery can only be used in Projection, Filter, Aggregate",
+            ) {
+                return EngineError::Unsupported {
+                    construct: "correlated scalar subquery in this clause".to_string(),
+                    message: "DataFusion decorrelates a scalar subquery only in the SELECT list, \
+                              a WHERE / HAVING predicate, or a GROUP BY; Trino also allows it in \
+                              ORDER BY and a JOIN condition. Compute it in a derived table (or \
+                              select it and sort by the output column) instead"
+                        .to_string(),
+                };
+            }
+            // A column name that resolves nowhere. DataFusion lists the
+            // schema ("No field named x. Valid fields are orders.id, ...")
+            // and sometimes guesses ("Did you mean 'c.tags'?"); Trino names
+            // the column and stops there.
+            if let Some(rest) = root_message.split("No field named ").nth(1) {
+                // The name ends at the first `.` that closes the sentence;
+                // a qualified `c.nope` keeps its own dot, which is followed
+                // by a letter rather than whitespace or the end of the text.
+                let end = rest
+                    .char_indices()
+                    .find(|(i, c)| {
+                        *c == '.' && rest[i + 1..].chars().next().is_none_or(char::is_whitespace)
+                    })
+                    .map_or(rest.len(), |(i, _)| i);
+                let name = rest[..end].replace('"', "");
+                return EngineError::Plan(format!("Column '{name}' cannot be resolved"));
+            }
+            // `SELECT DISTINCT ... ORDER BY x` where `x` is not selected.
+            // DataFusion names the column in its own qualified form and
+            // leaks the "Error during planning:" prefix.
+            if root_message.contains("For SELECT DISTINCT, ORDER BY expressions") {
+                return EngineError::Plan(
+                    "For SELECT DISTINCT, ORDER BY expressions must appear in select list"
+                        .to_string(),
+                );
+            }
+            // A window function written without `OVER`: DataFusion cannot
+            // resolve it as a scalar or aggregate and says `Invalid
+            // function 'rank'.`. Every name that reaches the planner is in
+            // glaux's coverage table, so the missing `OVER` is the cause.
+            if let Some(name) = root_message
+                .strip_prefix("Error during planning: Invalid function '")
+                .and_then(|rest| rest.split('\'').next())
+            {
+                return EngineError::InvalidArgument {
+                    function: name.to_string(),
+                    message: format!(
+                        "{name} is a window function and requires an OVER clause, as in Trino"
+                    ),
+                };
+            }
+            if let Some(name) = root_message
+                .split("Function '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                && root_message.contains("failed to match any signature")
+            {
+                return EngineError::TypeMismatch(format!(
+                    "Unexpected parameters for function {name}: no signature accepts these                      argument types"
+                ));
+            }
+            EngineError::Plan(err.to_string())
+        }
         DataFusionError::ArrowError(arrow, _) => match arrow.as_ref() {
             ArrowError::CastError(_) => data("INVALID_CAST_ARGUMENT"),
             ArrowError::ParseError(_) => data("INVALID_FUNCTION_ARGUMENT"),
-            ArrowError::DivideByZero => data("DIVISION_BY_ZERO"),
+            // Arrow's own wording is "Divide by zero error"; Trino's is the
+            // sentence glaux's decimal path already uses.
+            ArrowError::DivideByZero => EngineError::Data {
+                code: "DIVISION_BY_ZERO".to_string(),
+                message: "Division by zero".to_string(),
+            },
             ArrowError::ArithmeticOverflow(_) => data("NUMERIC_VALUE_OUT_OF_RANGE"),
+            // Arrow reports an integer kernel's overflow as a compute error
+            // ("Int64Array overflow on abs(-9223372036854775808)"); Trino
+            // reports NUMERIC_VALUE_OUT_OF_RANGE for all of them.
+            ArrowError::ComputeError(message) if message.contains("overflow") => {
+                data("NUMERIC_VALUE_OUT_OF_RANGE")
+            }
             ArrowError::ComputeError(_)
             | ArrowError::InvalidArgumentError(_)
             | ArrowError::NotYetImplemented(_)
@@ -279,9 +519,118 @@ fn classify(err: DataFusionError) -> EngineError {
         // DataFusion raises `Execution` for data problems its kernels
         // detect themselves (format-string parse failures, bad function
         // arguments at runtime). Engine-internal failures use `Internal`.
-        DataFusionError::Execution(_) => data("GENERIC_USER_ERROR"),
+        DataFusionError::Execution(message) => runtime_execution_error(message, data),
         _ => EngineError::Execution(err.to_string()),
     }
+}
+
+/// Trino's code and wording for the runtime failures DataFusion reports as
+/// plain `Execution` errors, which would otherwise all be
+/// `GENERIC_USER_ERROR` with the kernel's own text.
+fn runtime_execution_error(message: &str, data: impl Fn(&str) -> EngineError) -> EngineError {
+    // `chr(1114112)`: Trino's `chr` refuses anything outside the Unicode
+    // range with INVALID_FUNCTION_ARGUMENT.
+    if message.contains("invalid Unicode scalar value") {
+        return EngineError::InvalidArgument {
+            function: "chr".to_string(),
+            message: "Not a valid Unicode code point".to_string(),
+        };
+    }
+    // `date_parse('2024-13-05', '%Y-%m-%d')`: an unparsable input is
+    // INVALID_FUNCTION_ARGUMENT on Trino, not a generic user error.
+    if let Some(rest) = message.strip_prefix("Error parsing timestamp from ") {
+        return EngineError::InvalidArgument {
+            function: "date_parse".to_string(),
+            message: format!("cannot parse timestamp from {rest}"),
+        };
+    }
+    if message.contains("Scalar subquery returned more than one row") {
+        return EngineError::Data {
+            code: "SUBQUERY_MULTIPLE_ROWS".to_string(),
+            message: "Scalar sub-query has returned multiple rows".to_string(),
+        };
+    }
+    data("GENERIC_USER_ERROR")
+}
+
+/// Arrow and DataFusion name the layer that raised a runtime diagnostic
+/// ("Arrow error: Compute error: ..."); Trino's messages carry the reason
+/// alone, so the wrappers are peeled off before the client sees them.
+fn runtime_message(message: &str) -> String {
+    let mut text = message;
+    for prefix in [
+        "Arrow error: ",
+        "Compute error: ",
+        "Cast error: ",
+        "Invalid argument error: ",
+        "Arithmetic overflow: ",
+        "Parser error: ",
+        "Execution error: ",
+    ] {
+        text = text.strip_prefix(prefix).unwrap_or(text);
+    }
+    // Arrow's cast diagnostics name Arrow types and its own kernels
+    // ("Cannot cast string '1.5' to value of Int32 type", "Can't cast value
+    // 2147483648 to type Int32"); Trino names the SQL type and separates
+    // an unparsable text from an out-of-range value. (The `CAST(... AS
+    // DOUBLE / REAL / DECIMAL / DATE / TIMESTAMP / BOOLEAN)` paths are Rust
+    // UDFs that already word their own failures like Trino.)
+    if let Some(rest) = text.strip_prefix("Cannot cast string '")
+        && let Some((value, arrow_type)) = rest.rsplit_once("' to value of ")
+        && let Some(arrow_type) = arrow_type.strip_suffix(" type")
+    {
+        return format!("Cannot cast '{value}' to {}", trino_type_tokens(arrow_type));
+    }
+    if let Some(rest) = text.strip_prefix("Can't cast value ")
+        && let Some((value, arrow_type)) = rest.rsplit_once(" to type ")
+    {
+        return format!(
+            "Out of range for {}: {value}",
+            trino_type_tokens(arrow_type)
+        );
+    }
+    // DataFusion's checked `abs` names the Arrow array type it overflowed
+    // ("Int64Array overflow on abs(-9223372036854775808)"); Trino 411's
+    // MathFunctions.abs names the value and the SQL type instead
+    // ("Value -9223372036854775808 is out of range for abs(bigint)").
+    if let Some((array_type, rest)) = text.split_once("Array overflow on abs(")
+        && let Some(value) = rest.strip_suffix(')')
+    {
+        let name = trino_type_tokens(array_type);
+        if name != array_type {
+            return format!("Value {value} is out of range for abs({name})");
+        }
+    }
+    text.to_string()
+}
+
+/// Best-effort mapping of the Arrow type names in a coercion diagnostic
+/// ("Boolean = Int64") onto Trino's ("boolean = bigint"). Unknown tokens
+/// pass through unchanged.
+fn trino_type_tokens(text: &str) -> String {
+    text.split(' ')
+        .map(|token| match token {
+            "Boolean" => "boolean",
+            "Int8" => "tinyint",
+            "Int16" => "smallint",
+            "Int32" => "integer",
+            "Int64" => "bigint",
+            "Float32" => "real",
+            "Float64" => "double",
+            "Utf8" | "LargeUtf8" | "Utf8View" => "varchar",
+            "Date32" | "Date64" => "date",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The Trino names of a comma-separated Arrow type list ("Utf8, Int64").
+fn trino_type_list(text: &str) -> String {
+    text.split(", ")
+        .map(trino_type_tokens)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 pub(crate) fn execution_error(err: DataFusionError) -> EngineError {
@@ -299,7 +648,6 @@ pub(crate) fn plan_error(err: DataFusionError) -> EngineError {
 #[derive(Default)]
 struct ScanAccountant {
     bytes: u64,
-    saw_file_scan: bool,
 }
 
 impl ExecutionPlanVisitor for ScanAccountant {
@@ -309,7 +657,6 @@ impl ExecutionPlanVisitor for ScanAccountant {
         if let Some(exec) = (plan as &dyn Any).downcast_ref::<DataSourceExec>() {
             let source: &dyn Any = exec.data_source().as_ref();
             if let Some(config) = source.downcast_ref::<FileScanConfig>() {
-                self.saw_file_scan = true;
                 let metered = plan
                     .metrics()
                     .and_then(|m| m.sum_by_name("bytes_scanned"))
@@ -463,6 +810,44 @@ mod tests {
         assert!(
             matches!(&err, EngineError::Plan(m) if m.contains("nope")),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn coercion_failures_map_to_type_mismatch_with_trino_type_names() {
+        let err = classify(DataFusionError::Plan(
+            "Cannot infer common argument type for comparison operation Boolean = Int64"
+                .to_string(),
+        ));
+        assert_eq!(
+            err.to_string(),
+            "TYPE_MISMATCH: Cannot apply operator: boolean = bigint"
+        );
+        // Data errors report the root cause, not the optimizer context that
+        // wrapped it.
+        let err = classify(DataFusionError::Context(
+            "Optimizer rule 'simplify_expressions' failed".to_string(),
+            Box::new(DataFusionError::ArrowError(
+                Box::new(ArrowError::CastError(
+                    "Cannot cast string '9999999999' to value of Int32 type".to_string(),
+                )),
+                None,
+            )),
+        ));
+        // ...and Arrow's cast wording is replaced with Trino's.
+        assert_eq!(
+            err.to_string(),
+            "INVALID_CAST_ARGUMENT: Cannot cast '9999999999' to integer"
+        );
+        let err = classify(DataFusionError::ArrowError(
+            Box::new(ArrowError::CastError(
+                "Can't cast value 2147483648 to type Int32".to_string(),
+            )),
+            None,
+        ));
+        assert_eq!(
+            err.to_string(),
+            "INVALID_CAST_ARGUMENT: Out of range for integer: 2147483648"
         );
     }
 
