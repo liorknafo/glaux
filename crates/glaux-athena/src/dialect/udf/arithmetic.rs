@@ -62,11 +62,13 @@ use super::floats::{TrinoFloatGreatest, TrinoFloatMax, TrinoIeeeCmp};
 use super::timestamps::{TrinoDateInterval, TrinoTimestampMillis};
 use super::{data_error, is_integer, type_mismatch, unsupported_error};
 
-/// The checked scalar UDFs (`trino_checked_add` / `_sub` / `_mul`).
+/// The checked scalar UDFs (`trino_checked_add` / `_sub` / `_mul` /
+/// `_neg`).
 pub fn scalar_udfs() -> Vec<ScalarUDF> {
     [Operator::Plus, Operator::Minus, Operator::Multiply]
         .into_iter()
         .map(|op| ScalarUDF::new_from_impl(CheckedArithmetic::new(op)))
+        .chain([ScalarUDF::new_from_impl(CheckedNegate::new())])
         .collect()
 }
 
@@ -182,6 +184,75 @@ impl ScalarUDFImpl for CheckedArithmetic {
             Ok(array) => Ok(ColumnarValue::Array(array)),
             Err(ArrowError::ArithmeticOverflow(_)) => {
                 Err(overflow(&trino_type_name(&target), self.verb()))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+/// `trino_checked_neg(x)`: unary minus over an integer, which overflows for
+/// exactly one value per type — the type's minimum, whose positive is one
+/// past the maximum. Trino names the type and the value (`tinyint negation
+/// overflow: -128`); Arrow's kernel says `Overflow happened on: - -128`,
+/// naming neither.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct CheckedNegate {
+    signature: Signature,
+}
+
+impl Default for CheckedNegate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CheckedNegate {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for CheckedNegate {
+    fn name(&self) -> &str {
+        "trino_checked_neg"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        if is_integer(&arg_types[0]) {
+            Ok(arg_types[0].clone())
+        } else {
+            Err(type_mismatch(format!(
+                "Cannot negate {}",
+                trino_type_name(&arg_types[0])
+            )))
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let input = args.args[0].to_array(args.number_rows)?;
+        match numeric::neg(&input) {
+            Ok(array) => Ok(ColumnarValue::Array(array)),
+            Err(ArrowError::ArithmeticOverflow(_)) => {
+                let minimum = match input.data_type() {
+                    DataType::Int8 => i64::from(i8::MIN),
+                    DataType::Int16 => i64::from(i16::MIN),
+                    DataType::Int32 => i64::from(i32::MIN),
+                    _ => i64::MIN,
+                };
+                Err(data_error(
+                    "NUMERIC_VALUE_OUT_OF_RANGE",
+                    format!(
+                        "{} negation overflow: {minimum}",
+                        trino_type_name(input.data_type())
+                    ),
+                ))
             }
             Err(e) => Err(e.into()),
         }
@@ -828,6 +899,19 @@ fn rewrite_expr(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     rewrite_binary(&binary.left, binary.op, &binary.right, schema)
                 {
                     return Ok(Transformed::yes(replacement));
+                }
+            }
+            // Unary minus over an integer: Trino checks the overflow at the
+            // type's minimum and names the type in the diagnostic, where
+            // DataFusion's negation leaks Arrow's wording. (A negated
+            // literal is folded into the literal itself during the AST
+            // rewrite, so this only sees computed operands.)
+            Expr::Negative(inner) => {
+                if inner.get_type(schema).is_ok_and(|t| is_integer(&t)) {
+                    return Ok(Transformed::yes(udf_call(
+                        CheckedNegate::new(),
+                        vec![inner.as_ref().clone()],
+                    )));
                 }
             }
             // A correlated scalar subquery Trino runs but DataFusion's
