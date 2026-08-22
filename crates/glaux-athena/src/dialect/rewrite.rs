@@ -2296,27 +2296,15 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
                 ));
             }
             arity(name, &args, &[1])?;
-            // Trino rounds to the millisecond (`from_unixtime(1.9999)` is
-            // `...:02.000`); a plain cast would truncate. The argument is a
-            // double in Trino, so an integer argument is widened first
-            // (integer arithmetic would be overflow-checked).
-            let millis = cast_to(
-                func(
-                    "round",
-                    vec![binary(
-                        func("trino_double", vec![args.into_iter().next().unwrap()]),
-                        BinaryOperator::Multiply,
-                        num_lit(1000),
-                    )],
-                ),
-                bigint(),
-            );
-            // Trino's result is a `timestamp(3) with time zone`, UTC on
-            // Athena (printed `... UTC`), like `parse_datetime` and `now()`.
-            func(
-                "arrow_cast",
-                vec![millis, str_lit("Timestamp(Millisecond, Some(\"UTC\"))")],
-            )
+            // Trino rounds to the millisecond with Java's `Math.round`
+            // (`from_unixtime(1.9999)` is `...:02.000`, and the tie goes
+            // towards positive infinity: `from_unixtime(-0.0005)` is the
+            // epoch, not a millisecond before it), and returns a
+            // `timestamp(3) with time zone` at UTC — printed `... UTC` on
+            // Athena, like `parse_datetime` and `now()`. DataFusion's
+            // `round` rounds half away from zero, so the UDF does the
+            // rounding itself.
+            func("trino_from_unixtime", args)
         }
         "to_unixtime" => return simple_rename("trino_to_unixtime", &[1]),
         "year" | "month" | "day" | "day_of_month" | "hour" | "minute" | "second" | "quarter"
@@ -2544,7 +2532,7 @@ mod tests {
         );
         assert_eq!(
             rewrite("SELECT from_unixtime(t) AS a, to_unixtime(ts) AS b, date_trunc('day', ts) AS c FROM t").unwrap(),
-            "SELECT arrow_cast(CAST(round(trino_double(t) * 1000) AS BIGINT), 'Timestamp(Millisecond, Some(\"UTC\"))') AS a, trino_to_unixtime(ts) AS b, trino_date_trunc('day', ts) AS c FROM t"
+            "SELECT trino_from_unixtime(t) AS a, trino_to_unixtime(ts) AS b, trino_date_trunc('day', ts) AS c FROM t"
         );
     }
 

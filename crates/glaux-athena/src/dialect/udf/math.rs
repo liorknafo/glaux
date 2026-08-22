@@ -354,8 +354,9 @@ fn pow10_f64(n: i64) -> f64 {
 
 /// Java's `Math.round(double)`: `floor(a + ½)` on the exact real value,
 /// with ties rounding toward positive infinity, saturating at the `long`
-/// range and returning 0 for NaN.
-fn java_math_round(a: f64) -> i64 {
+/// range and returning 0 for NaN. (Shared with `from_unixtime`, which
+/// rounds its epoch to milliseconds the same way.)
+pub(crate) fn java_math_round(a: f64) -> i64 {
     if a.is_nan() {
         return 0;
     }
@@ -710,6 +711,16 @@ mod tests {
         assert_eq!(round(0.125, 2), 0.13);
         // Math.round's tie test is exact, not `floor(x + 0.5)` in doubles.
         assert_eq!(round(0.49999999999999994, 0), 0.0);
+        // Ties go towards positive infinity, not away from zero — the rule
+        // `from_unixtime` needs for negative epochs.
+        assert_eq!(java_math_round(0.5), 1);
+        assert_eq!(java_math_round(-0.5), 0);
+        assert_eq!(java_math_round(-1.5), -1);
+        assert_eq!(java_math_round(-1.6), -2);
+        assert_eq!(java_math_round(0.49999999999999994), 0);
+        assert_eq!(java_math_round(f64::NAN), 0);
+        assert_eq!(java_math_round(f64::INFINITY), i64::MAX);
+        assert_eq!(java_math_round(f64::NEG_INFINITY), i64::MIN);
         assert_eq!(round(1234.5, -2), 1200.0);
         assert_eq!(round(1250.0, -2), 1300.0);
         // Math.round saturates at 2^63; the BigInteger fallback divides.

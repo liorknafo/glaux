@@ -5,6 +5,11 @@
 //!   (DataFusion widens it to a timestamp), sub-day units on a `DATE` are
 //!   errors, and varchar input is refused (DataFusion would parse it).
 //! - `to_unixtime(timestamp)` refuses varchar input for the same reason.
+//! - `from_unixtime(double)` rounds with Java's `Math.round` (half towards
+//!   positive infinity, `Math.round(-0.5)` is `0`), which DataFusion's
+//!   `round` (half away from zero) gets wrong for every negative
+//!   half-millisecond epoch, and refuses the non-numeric arguments Trino
+//!   has no overload for.
 //! - `trino_date_parse(text, chrono_format, function, trino_format)` is
 //!   `date_parse` / `parse_datetime`. It replaces DataFusion's
 //!   `to_timestamp`, which resolves the parsed fields with chrono's
@@ -24,7 +29,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, AsArray, Float64Array, TimestampMillisecondBuilder};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, TimeUnit, TimestampMicrosecondType};
+use arrow::datatypes::{DataType, Float64Type, TimeUnit, TimestampMicrosecondType};
 use chrono::format::{Parsed, StrftimeItems};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta};
 use datafusion::common::Result;
@@ -33,6 +38,7 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
+use super::math::java_math_round;
 use super::{
     Unit, data_error, from_naive, string_array, to_naive, type_mismatch, unit_arg, user_err,
 };
@@ -44,7 +50,99 @@ pub fn all() -> Vec<ScalarUDF> {
         ScalarUDF::new_from_impl(TrinoDateTrunc::new()),
         ScalarUDF::new_from_impl(TrinoToUnixtime::new()),
         ScalarUDF::new_from_impl(TrinoDateParse::new()),
+        ScalarUDF::new_from_impl(TrinoFromUnixtime::new()),
     ]
+}
+
+/// Trino packs a `timestamp with time zone` as milliseconds shifted left by
+/// the 12-bit zone key, so a value outside the remaining 52 signed bits is
+/// `Millis overflow` (the diagnostic Athena engine v3 raises too).
+const MAX_PACKED_MILLIS: i64 = (1 << 51) - 1;
+
+/// `trino_from_unixtime(x)`: Trino's `from_unixtime(double)` —
+/// `packDateTimeWithZone(Math.round(unixTime * 1000), UTC)`, a
+/// `timestamp(3) with time zone` at UTC.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoFromUnixtime {
+    signature: Signature,
+}
+
+impl Default for TrinoFromUnixtime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoFromUnixtime {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoFromUnixtime {
+    fn name(&self) -> &str {
+        "trino_from_unixtime"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        // Trino declares `from_unixtime(double)` only; an exact numeric
+        // argument is coerced, a varchar or boolean one is not.
+        if matches!(
+            arg_types[0],
+            DataType::Null
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Decimal128(..)
+                | DataType::Decimal256(..)
+        ) {
+            Ok(DataType::Timestamp(
+                TimeUnit::Millisecond,
+                Some("UTC".into()),
+            ))
+        } else {
+            Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function from_unixtime. Expected: \
+                 from_unixtime(double)",
+                trino_type_name(&arg_types[0])
+            )))
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let input = args.args[0].to_array(rows)?;
+        let seconds = cast(&input, &DataType::Float64)?;
+        let seconds = seconds.as_primitive::<Float64Type>();
+        let mut out = TimestampMillisecondBuilder::with_capacity(rows);
+        for i in 0..rows {
+            if seconds.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            let millis = java_math_round(seconds.value(i) * 1000.0);
+            if millis.abs() > MAX_PACKED_MILLIS {
+                return Err(data_error(
+                    "INVALID_FUNCTION_ARGUMENT",
+                    format!("Millis overflow: {millis}"),
+                ));
+            }
+            out.append_value(millis);
+        }
+        Ok(ColumnarValue::Array(Arc::new(
+            out.finish().with_timezone("UTC"),
+        )))
+    }
 }
 
 /// Joda's parse bucket starts at the epoch, so a field the pattern does
