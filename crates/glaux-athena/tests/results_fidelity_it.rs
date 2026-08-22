@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::MemoryStorage;
-use common::fixtures::{customers, orders};
+use common::fixtures::{customers, events, orders};
 use datafusion::catalog::MemTable;
 use datafusion::prelude::SessionContext;
 use glaux_athena::model::ColumnInfo;
@@ -32,7 +32,11 @@ struct Harness {
 
 fn harness() -> Harness {
     let ctx = SessionContext::new();
-    for (name, (schema, batch)) in [("customers", customers()), ("orders", orders())] {
+    for (name, (schema, batch)) in [
+        ("customers", customers()),
+        ("orders", orders()),
+        ("events", events()),
+    ] {
         ctx.register_table(
             name,
             Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
@@ -283,10 +287,15 @@ async fn check_fidelity(h: &Harness, qe: &Value) -> Result<(), String> {
         }
     }
     // The csv crate must see the same text (modulo the NULL distinction).
+    // Athena writes NULL as an empty unquoted field, so a row whose every
+    // column is NULL is a blank line — which RFC-4180 parsers skip. glaux
+    // reproduces that quirk rather than deviating, so such rows are dropped
+    // from the comparison instead of being written differently.
     let generic = parse_with_csv_crate(&csv_bytes);
     let flattened: Vec<Vec<String>> = api_rows
         .iter()
-        .map(|r| r.iter().map(|d| d.clone().unwrap_or_default()).collect())
+        .map(|r| -> Vec<String> { r.iter().map(|d| d.clone().unwrap_or_default()).collect() })
+        .filter(|row: &Vec<String>| !row.iter().all(String::is_empty))
         .collect();
     if generic != flattened {
         return Err("csv crate parse disagrees with GetQueryResults".to_string());

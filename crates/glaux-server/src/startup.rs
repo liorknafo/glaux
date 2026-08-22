@@ -69,7 +69,14 @@ fn parse_s3_uri(uri: &str) -> Option<(&str, &str)> {
 /// Probe Glue with `GetDatabases`.
 pub async fn probe_glue(config: &GlauxConfig) -> Result<usize, StartupError> {
     let label = glue_endpoint_label(config);
-    let glue = NetworkGlueApi::new(config);
+    let glue = NetworkGlueApi::new(config).map_err(|e| StartupError {
+        endpoint: "glue",
+        message: format!(
+            "cannot build a Glue client for endpoint {label}: {e}. Check --glue-endpoint / \
+             GLAUX_GLUE_ENDPOINT, the region (--region, currently {:?}), and the credentials",
+            config.region
+        ),
+    })?;
     let result = tokio::time::timeout(PROBE_TIMEOUT, glue.get_databases()).await;
     match result {
         Ok(Ok(databases)) => Ok(databases.len()),

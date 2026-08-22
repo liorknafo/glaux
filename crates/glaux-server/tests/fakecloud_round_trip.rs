@@ -175,7 +175,7 @@ async fn provision_fixtures(endpoint: &str) {
         .expect("create bucket");
     assert!(created.status().is_success(), "CreateBucket: {created:?}");
 
-    let glue = NetworkGlueApi::new(&glaux_config(endpoint));
+    let glue = NetworkGlueApi::new(&glaux_config(endpoint)).expect("glue client");
     glue.invoke(
         "CreateDatabase",
         json!({ "DatabaseInput": { "Name": "analytics" } }),

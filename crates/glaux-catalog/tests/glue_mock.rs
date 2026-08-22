@@ -62,7 +62,10 @@ async fn handle(
                 StatusCode::OK,
                 json!({ "DatabaseList": [{ "Name": "db_page_two" }] }).to_string(),
             ),
-            Some(other) => panic!("mock got unexpected NextToken {other:?}"),
+            Some(other) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("mock got unexpected NextToken {other:?}"),
+            ),
         },
         "AWSGlue.GetTable" => {
             let name = body.get("Name").and_then(Value::as_str).unwrap_or_default();
@@ -113,15 +116,37 @@ async fn handle(
             })
             .to_string(),
         ),
-        "AWSGlue.GetTables" => (
-            StatusCode::BAD_REQUEST,
-            json!({
-                "__type": "InvalidInputException",
-                "message": "DatabaseName must not be empty",
-            })
-            .to_string(),
+        "AWSGlue.GetTables" => {
+            let database = body
+                .get("DatabaseName")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match database {
+                // Echoes the same NextToken forever: pagination never advances.
+                "looping" => (
+                    StatusCode::OK,
+                    json!({
+                        "TableList": [{ "Name": "t" }],
+                        "NextToken": "same-token",
+                    })
+                    .to_string(),
+                ),
+                // Malformed: no TableList at all.
+                "malformed" => (StatusCode::OK, json!({}).to_string()),
+                _ => (
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "__type": "InvalidInputException",
+                        "message": "DatabaseName must not be empty",
+                    })
+                    .to_string(),
+                ),
+            }
+        }
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("mock got unexpected target {other:?}"),
         ),
-        other => panic!("mock got unexpected target {other:?}"),
     }
 }
 
@@ -156,7 +181,7 @@ fn client_for(addr: SocketAddr) -> NetworkGlueApi {
         ..Default::default()
     };
     let config = GlauxConfig::load(None, &overrides).expect("test config");
-    NetworkGlueApi::new(&config)
+    NetworkGlueApi::new(&config).expect("glue client")
 }
 
 #[tokio::test]
@@ -303,5 +328,43 @@ async fn modeled_glue_errors_surface_code_and_message() {
             assert!(message.contains("DatabaseName"), "got: {message}");
         }
         other => panic!("expected GlueApi, got: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn repeated_next_token_is_an_error_not_an_infinite_loop() {
+    let (addr, requests) = start_mock().await;
+    let glue = client_for(addr);
+
+    let err = glue
+        .get_tables("looping")
+        .await
+        .expect_err("a NextToken that never advances must fail");
+    match err {
+        CatalogError::GlueResponseParse { action, message } => {
+            assert_eq!(action, "GetTables");
+            assert!(message.contains("same-token"), "got: {message}");
+        }
+        other => panic!("expected GlueResponseParse, got: {other}"),
+    }
+    // First page (no token) plus one page with the echoed token, then stop.
+    assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn missing_list_field_is_an_error_not_an_empty_listing() {
+    let (addr, _requests) = start_mock().await;
+    let glue = client_for(addr);
+
+    let err = glue
+        .get_tables("malformed")
+        .await
+        .expect_err("a response without TableList must fail");
+    match err {
+        CatalogError::GlueResponseParse { action, message } => {
+            assert_eq!(action, "GetTables");
+            assert!(message.contains("TableList"), "got: {message}");
+        }
+        other => panic!("expected GlueResponseParse, got: {other}"),
     }
 }

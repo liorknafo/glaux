@@ -265,7 +265,19 @@ impl GlauxConfig {
                     session_token: env("GLAUX_SESSION_TOKEN"),
                 });
             }
-            (None, None) => {}
+            (None, None) => {
+                // A session token is only meaningful together with a key
+                // pair; dropping it silently would run under a different
+                // identity than the user configured.
+                if env("GLAUX_SESSION_TOKEN").is_some() {
+                    return Err(CatalogError::ConfigInvalid(
+                        "GLAUX_SESSION_TOKEN is set but GLAUX_ACCESS_KEY_ID and \
+                         GLAUX_SECRET_ACCESS_KEY are not; a session token requires \
+                         the full credential pair"
+                            .to_string(),
+                    ));
+                }
+            }
             (Some(_), None) => {
                 return Err(CatalogError::ConfigInvalid(
                     "GLAUX_ACCESS_KEY_ID is set but GLAUX_SECRET_ACCESS_KEY is not; \
@@ -538,6 +550,16 @@ mod tests {
             .expect_err("partial credentials must fail");
         let msg = err.to_string();
         assert!(msg.contains("GLAUX_SECRET_ACCESS_KEY"), "got: {msg}");
+    }
+
+    #[test]
+    fn lone_session_token_errors_explicitly() {
+        let env = env_map(&[("GLAUX_SESSION_TOKEN", "tok")]);
+        let err = GlauxConfig::resolve(None, &env, &ConfigOverrides::default())
+            .expect_err("a session token without a key pair must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("GLAUX_SESSION_TOKEN"), "got: {msg}");
+        assert!(msg.contains("GLAUX_ACCESS_KEY_ID"), "got: {msg}");
     }
 
     #[test]
