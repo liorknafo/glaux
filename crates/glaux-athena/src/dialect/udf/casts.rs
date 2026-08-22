@@ -133,8 +133,11 @@ impl TrinoFloat {
         }
     }
 
+    /// Trino's `VarcharOperators.castToDouble` names the target with the
+    /// lower-case SQL type name (`Cannot cast 'inf' to double`), as the
+    /// integral casts glaux already matches do.
     fn type_name(&self) -> &'static str {
-        if self.real { "REAL" } else { "DOUBLE" }
+        if self.real { "real" } else { "double" }
     }
 }
 
@@ -169,7 +172,7 @@ impl ScalarUDFImpl for TrinoFloat {
             other => Err(type_mismatch(format!(
                 "Cannot cast {} to {}",
                 trino_type_name(other),
-                self.type_name().to_lowercase()
+                self.type_name()
             ))),
         }
     }
