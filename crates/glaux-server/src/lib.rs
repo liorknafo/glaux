@@ -108,9 +108,16 @@ pub struct Services {
 }
 
 /// Build both services over network S3/Glue clients for `config`.
-pub fn build_services(config: &GlauxConfig) -> Services {
+///
+/// Fails if the Glue client cannot be built from `config` (a bad endpoint
+/// or credentials): better to say so here than to start and fail on the
+/// first query.
+pub fn build_services(config: &GlauxConfig) -> Result<Services, ServerError> {
     let storage: Arc<dyn StorageBackend> = Arc::new(NetworkStorageBackend::new(config));
-    let glue: Arc<dyn GlueApi> = Arc::new(NetworkGlueApi::new(config));
+    let glue: Arc<dyn GlueApi> = Arc::new(
+        NetworkGlueApi::new(config)
+            .map_err(|e| ServerError::Config(format!("cannot build the Glue client: {e}")))?,
+    );
 
     let engine = GlueBackedEngine::new(
         TrinoEngine::new(SessionContext::new(), CATALOG_NAME),
@@ -130,7 +137,7 @@ pub fn build_services(config: &GlauxConfig) -> Services {
         sink,
     ));
 
-    Services { athena, firehose }
+    Ok(Services { athena, firehose })
 }
 
 /// Resolve a shutdown future: `SIGINT` (Ctrl-C) or, on Unix, `SIGTERM`.
@@ -183,7 +190,7 @@ pub async fn run(cli: Cli) -> Result<(), ServerError> {
         "startup validation passed"
     );
 
-    let services = build_services(&config);
+    let services = build_services(&config)?;
     let state = app::AppState::new(
         Arc::clone(&services.athena),
         Arc::clone(&services.firehose),

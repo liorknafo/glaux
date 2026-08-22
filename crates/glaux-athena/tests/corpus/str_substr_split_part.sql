@@ -5,4 +5,4 @@ SELECT substr('hello', -3) AS neg_start, substr('hello', 0, 3) AS zero_start, su
        split_part('abc', ',', 2) IS NULL AS missing_is_null, split_part('a,b,,c', ',', 3) = '' AS empty_field,
        split_part('abc', '', 2) AS by_char, split_part('a.b.c', '.', 3) AS last_field,
        regexp_replace('ab', '(a)', '$1x') AS group_then_text, regexp_replace('a.b', '\.', '\$') AS literal_dollar,
-       regexp_replace('k=v', '(\w)=(\w)', '${2}=${1}') AS braced_groups
+       regexp_replace('k=v', '(?<k>\w)=(?<v>\w)', '${v}=${k}') AS named_groups

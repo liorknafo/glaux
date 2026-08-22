@@ -1,4 +1,4 @@
-types: varchar, bigint
+types: varchar, integer
 +---+---------+
 | k | doubled |
 +---+---------+
