@@ -1,0 +1,13 @@
+types: varchar, integer, varchar, varchar
++-------+---+----+----+
+| kind  | k | lv | rv |
++-------+---+----+----+
+| full  | 1 | a  |    |
+| full  | 2 | b  | x  |
+| full  | 3 |    | y  |
+| inner | 2 | b  | x  |
+| left  | 1 | a  |    |
+| left  | 2 | b  | x  |
+| right | 2 | b  | x  |
+| right | 3 |    | y  |
++-------+---+----+----+

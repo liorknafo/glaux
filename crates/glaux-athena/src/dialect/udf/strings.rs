@@ -1,11 +1,19 @@
 //! String functions whose DataFusion namesakes differ from Trino at the
 //! edges: `substr` for start ≤ 0, `split_part` past the last field,
-//! `split` of an empty string or by an empty delimiter, and the
-//! replacement-string syntax of `regexp_replace`.
+//! `split` of an empty string or by an empty delimiter, `lpad` / `rpad`
+//! with an empty pad string (an error in Trino) or a size below the length
+//! (truncation), `codepoint` of more than one character (a type error in
+//! Trino), `upper` / `lower`, which Trino maps per code point (`ß` stays
+//! `ß`) where Rust applies the full Unicode mapping, and `trim` / `ltrim` /
+//! `rtrim`, which strip every Java whitespace code point (tab, newline,
+//! `U+2028`, ...) where DataFusion strips only the ASCII space, and
+//! `replace` with an empty `search`, which Trino answers by inserting the
+//! replacement around every code point where DataFusion returns the input
+//! unchanged.
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ListBuilder, StringBuilder};
+use arrow::array::{Array, Int32Builder, ListBuilder, StringBuilder};
 use arrow::datatypes::DataType;
 use datafusion::common::Result;
 use datafusion::logical_expr::{
@@ -13,7 +21,8 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
-use super::{data_error, int64_array, string_array};
+use super::casts::trino_type_name;
+use super::{data_error, int64_array, string_array, type_mismatch};
 
 /// The string UDFs.
 pub fn all() -> Vec<ScalarUDF> {
@@ -21,18 +30,30 @@ pub fn all() -> Vec<ScalarUDF> {
         ScalarUDF::new_from_impl(TrinoSubstr::new()),
         ScalarUDF::new_from_impl(TrinoSplitPart::new()),
         ScalarUDF::new_from_impl(TrinoSplit::new()),
-        ScalarUDF::new_from_impl(TrinoRegexpReplacement::new()),
+        ScalarUDF::new_from_impl(TrinoReplace::new()),
+        ScalarUDF::new_from_impl(TrinoStringOp::new(StringOp::Lpad)),
+        ScalarUDF::new_from_impl(TrinoStringOp::new(StringOp::Rpad)),
+        ScalarUDF::new_from_impl(TrinoStringOp::new(StringOp::Codepoint)),
+        ScalarUDF::new_from_impl(TrinoStringOp::new(StringOp::Upper)),
+        ScalarUDF::new_from_impl(TrinoStringOp::new(StringOp::Lower)),
+        ScalarUDF::new_from_impl(TrinoTrim::new(TrimSide::Both)),
+        ScalarUDF::new_from_impl(TrinoTrim::new(TrimSide::Leading)),
+        ScalarUDF::new_from_impl(TrinoTrim::new(TrimSide::Trailing)),
     ]
 }
 
-/// Trino's `split(string, delimiter)`: `split('', ',')` is `['']` and an
-/// empty delimiter splits into single characters (DataFusion's
-/// `string_to_array` gives `[]` and `['abc']` respectively).
-pub fn trino_split(s: &str, delimiter: &str) -> Vec<String> {
+/// Trino's `split(string, delimiter)`: `split('', ',')` is `['']`
+/// (DataFusion's `string_to_array` gives `[]`) and an empty delimiter is
+/// an `INVALID_FUNCTION_ARGUMENT` error (`The delimiter may not be the
+/// empty string`; only `split_part` splits into characters on it).
+pub fn trino_split(s: &str, delimiter: &str) -> Result<Vec<String>> {
     if delimiter.is_empty() {
-        return s.chars().map(String::from).collect();
+        return Err(data_error(
+            "INVALID_FUNCTION_ARGUMENT",
+            "split: The delimiter may not be the empty string",
+        ));
     }
-    s.split(delimiter).map(String::from).collect()
+    Ok(s.split(delimiter).map(String::from).collect())
 }
 
 /// `trino_split(string, delimiter)`: see [`trino_split`].
@@ -83,10 +104,88 @@ impl ScalarUDFImpl for TrinoSplit {
                 out.append(false);
                 continue;
             }
-            for part in trino_split(strings.value(i), delimiters.value(i)) {
+            for part in trino_split(strings.value(i), delimiters.value(i))? {
                 out.values().append_value(part);
             }
             out.append(true);
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+/// Trino's `replace(string, search, replace)`.
+///
+/// With a non-empty `search` this is the usual left-to-right replacement of
+/// every non-overlapping occurrence. With an **empty** `search` Trino's
+/// `StringFunctions.replace` takes a separate branch that "insert[s]
+/// `replace` in front of every character and at the end", so
+/// `replace('abc', '', 'X')` is `'XaXbXcX'` and `replace('', '', 'X')` is
+/// `'X'` — DataFusion's `replace` returns the input untouched instead.
+/// "Character" is a code point there (the Java loop advances by
+/// `lengthOfCodePointSafe`), so `replace('a👍', '', '-')` is `'-a-👍-'`.
+pub fn trino_replace(s: &str, search: &str, replacement: &str) -> String {
+    if !search.is_empty() {
+        return s.replace(search, replacement);
+    }
+    let mut out = String::with_capacity(s.len() + replacement.len() * (s.chars().count() + 1));
+    out.push_str(replacement);
+    for c in s.chars() {
+        out.push(c);
+        out.push_str(replacement);
+    }
+    out
+}
+
+/// `trino_replace(string, search, replacement)`: see [`trino_replace`].
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoReplace {
+    signature: Signature,
+}
+
+impl Default for TrinoReplace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrinoReplace {
+    /// New instance.
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::new(TypeSignature::Any(3), Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoReplace {
+    fn name(&self) -> &str {
+        "trino_replace"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let rows = args.number_rows;
+        let strings = string_array("replace", &args.args[0], rows)?;
+        let searches = string_array("replace", &args.args[1], rows)?;
+        let replacements = string_array("replace", &args.args[2], rows)?;
+        let mut out = StringBuilder::new();
+        for i in 0..rows {
+            if strings.is_null(i) || searches.is_null(i) || replacements.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            out.append_value(trino_replace(
+                strings.value(i),
+                searches.value(i),
+                replacements.value(i),
+            ));
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
@@ -248,114 +347,229 @@ impl ScalarUDFImpl for TrinoSplitPart {
     }
 }
 
-/// Translate a Java/Trino `regexp_replace` replacement string to the Rust
-/// `regex` crate's syntax.
-///
-/// Java: `$1` / `$12` is a numbered group, `${name}` a named group, `\x` a
-/// literal `x`. Rust: `$1x` would be the group *named* `1x`, and a literal
-/// `$` is `$$`. So numbered references become `${n}`, backslash escapes
-/// become literals, and a `$` that is not a group reference (which Java
-/// rejects with "Illegal group reference") is an error.
-pub fn java_replacement_to_rust(replacement: &str) -> Result<String> {
-    let mut out = String::with_capacity(replacement.len() + 4);
-    let mut chars = replacement.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => match chars.next() {
-                Some('$') => out.push_str("$$"),
-                Some(escaped) => out.push(escaped),
-                None => {
-                    return Err(data_error(
-                        "INVALID_FUNCTION_ARGUMENT",
-                        format!(
-                            "regexp_replace: replacement {replacement:?} ends with a dangling \
-                             backslash"
-                        ),
-                    ));
-                }
-            },
-            '$' => match chars.peek() {
-                Some(d) if d.is_ascii_digit() => {
-                    out.push_str("${");
-                    while let Some(d) = chars.peek().filter(|d| d.is_ascii_digit()) {
-                        out.push(*d);
-                        chars.next();
-                    }
-                    out.push('}');
-                }
-                Some('{') => {
-                    out.push('$');
-                    for inner in chars.by_ref() {
-                        out.push(inner);
-                        if inner == '}' {
-                            break;
-                        }
-                    }
-                }
-                _ => {
-                    return Err(data_error(
-                        "INVALID_FUNCTION_ARGUMENT",
-                        format!(
-                            "regexp_replace: illegal group reference in replacement \
-                             {replacement:?} (write \\$ for a literal dollar sign)"
-                        ),
-                    ));
-                }
-            },
-            other => out.push(other),
-        }
+// ---------------------------------------------------------------------------
+// lpad / rpad / codepoint / upper / lower
+// ---------------------------------------------------------------------------
+
+/// Trino's `lpad` / `rpad`: `size` is a code-point count, a longer input is
+/// truncated to `size`, an empty pad string is an error, and so is a
+/// negative size.
+pub fn trino_pad(function: &str, s: &str, size: i64, pad: &str, left: bool) -> Result<String> {
+    if size < 0 || size > i64::from(i32::MAX) {
+        return Err(data_error(
+            "INVALID_FUNCTION_ARGUMENT",
+            format!("{function}: Target length must be in the range [0..2147483647], got {size}"),
+        ));
     }
-    Ok(out)
+    let size = size as usize;
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= size {
+        return Ok(chars[..size].iter().collect());
+    }
+    if pad.is_empty() {
+        return Err(data_error(
+            "INVALID_FUNCTION_ARGUMENT",
+            format!("{function}: Padding string must not be empty"),
+        ));
+    }
+    let padding: String = pad.chars().cycle().take(size - chars.len()).collect();
+    Ok(if left {
+        format!("{padding}{s}")
+    } else {
+        format!("{s}{padding}")
+    })
 }
 
-/// `trino_regexp_replacement(replacement)`: see [`java_replacement_to_rust`].
-/// The rewriter wraps the replacement argument of every `regexp_replace`
-/// call in it; for literal replacements DataFusion folds it at plan time.
+/// Unicode simple (1:1) case mapping per code point, as Java's
+/// `Character.toUpperCase(int)` / `toLowerCase(int)` which Trino applies:
+/// `ß` stays `ß`, `ﬁ` stays `ﬁ`, `İ` lowers to a plain `i`, a final sigma
+/// is not special-cased. Rust's `char::to_uppercase` gives the *full*
+/// mapping (`ß` → `SS`); where the two differ the simple mapping is looked
+/// up here (SpecialCasing.txt's unconditional entries).
+pub fn simple_upper(c: char) -> char {
+    let mut full = c.to_uppercase();
+    match (full.next(), full.next()) {
+        (Some(single), None) => single,
+        _ => match c as u32 {
+            // Greek letters with ypogegrammeni: the simple uppercase is the
+            // titlecase form with prosgegrammeni.
+            0x1F80..=0x1F87 | 0x1F90..=0x1F97 | 0x1FA0..=0x1FA7 => {
+                char::from_u32(c as u32 + 8).unwrap_or(c)
+            }
+            0x1FB3 => '\u{1FBC}',
+            0x1FC3 => '\u{1FCC}',
+            0x1FF3 => '\u{1FFC}',
+            _ => c,
+        },
+    }
+}
+
+/// See [`simple_upper`].
+pub fn simple_lower(c: char) -> char {
+    let mut full = c.to_lowercase();
+    match (full.next(), full.next()) {
+        (Some(single), None) => single,
+        // LATIN CAPITAL LETTER I WITH DOT ABOVE: full mapping is `i̇`, simple
+        // mapping is `i`.
+        _ if c == '\u{0130}' => 'i',
+        _ => c,
+    }
+}
+
+/// Which string function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StringOp {
+    Lpad,
+    Rpad,
+    Codepoint,
+    Upper,
+    Lower,
+}
+
+impl StringOp {
+    fn trino_name(self) -> &'static str {
+        match self {
+            Self::Lpad => "lpad",
+            Self::Rpad => "rpad",
+            Self::Codepoint => "codepoint",
+            Self::Upper => "upper",
+            Self::Lower => "lower",
+        }
+    }
+}
+
+/// `trino_lpad` / `trino_rpad` / `trino_codepoint` / `trino_upper` /
+/// `trino_lower`: see the module docs.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct TrinoRegexpReplacement {
+pub struct TrinoStringOp {
     signature: Signature,
+    op: StringOp,
 }
 
-impl Default for TrinoRegexpReplacement {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TrinoRegexpReplacement {
+impl TrinoStringOp {
     /// New instance.
-    pub fn new() -> Self {
+    pub fn new(op: StringOp) -> Self {
+        let arity = match op {
+            StringOp::Lpad | StringOp::Rpad => 3,
+            _ => 1,
+        };
         Self {
-            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+            signature: Signature::new(TypeSignature::Any(arity), Volatility::Immutable),
+            op,
         }
     }
 }
 
-impl ScalarUDFImpl for TrinoRegexpReplacement {
+fn is_string_or_null(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Null
+    )
+}
+
+impl ScalarUDFImpl for TrinoStringOp {
     fn name(&self) -> &str {
-        "trino_regexp_replacement"
+        match self.op {
+            StringOp::Lpad => "trino_lpad",
+            StringOp::Rpad => "trino_rpad",
+            StringOp::Codepoint => "trino_codepoint",
+            StringOp::Upper => "trino_upper",
+            StringOp::Lower => "trino_lower",
+        }
     }
 
     fn signature(&self) -> &Signature {
         &self.signature
     }
 
-    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Utf8)
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        let string_ok = match self.op {
+            StringOp::Lpad | StringOp::Rpad => {
+                is_string_or_null(&arg_types[0])
+                    && is_string_or_null(&arg_types[2])
+                    && (super::is_integer(&arg_types[1]) || arg_types[1] == DataType::Null)
+            }
+            _ => is_string_or_null(&arg_types[0]),
+        };
+        if !string_ok {
+            return Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function {}. Expected varchar arguments",
+                arg_types
+                    .iter()
+                    .map(trino_type_name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.op.trino_name()
+            )));
+        }
+        Ok(match self.op {
+            StringOp::Codepoint => DataType::Int32,
+            _ => DataType::Utf8,
+        })
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let function = self.op.trino_name();
         let rows = args.number_rows;
-        let replacements = string_array("regexp_replace", &args.args[0], rows)?;
-        let mut out = StringBuilder::new();
-        for i in 0..rows {
-            if replacements.is_null(i) {
-                out.append_null();
-            } else {
-                out.append_value(java_replacement_to_rust(replacements.value(i))?);
+        let strings = string_array(function, &args.args[0], rows)?;
+        match self.op {
+            StringOp::Lpad | StringOp::Rpad => {
+                let sizes = int64_array(function, "size", &args.args[1], rows)?;
+                let pads = string_array(function, &args.args[2], rows)?;
+                let mut out = StringBuilder::new();
+                for i in 0..rows {
+                    if strings.is_null(i) || sizes.is_null(i) || pads.is_null(i) {
+                        out.append_null();
+                        continue;
+                    }
+                    out.append_value(trino_pad(
+                        function,
+                        strings.value(i),
+                        sizes.value(i),
+                        pads.value(i),
+                        self.op == StringOp::Lpad,
+                    )?);
+                }
+                Ok(ColumnarValue::Array(Arc::new(out.finish())))
+            }
+            StringOp::Codepoint => {
+                let mut out = Int32Builder::with_capacity(rows);
+                for i in 0..rows {
+                    if strings.is_null(i) {
+                        out.append_null();
+                        continue;
+                    }
+                    let mut chars = strings.value(i).chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) => out.append_value(c as i32),
+                        _ => {
+                            return Err(type_mismatch(format!(
+                                "Unexpected parameters (varchar({})) for function codepoint. \
+                                 Expected: codepoint(varchar(1))",
+                                strings.value(i).chars().count()
+                            )));
+                        }
+                    }
+                }
+                Ok(ColumnarValue::Array(Arc::new(out.finish())))
+            }
+            StringOp::Upper | StringOp::Lower => {
+                let map = if self.op == StringOp::Upper {
+                    simple_upper
+                } else {
+                    simple_lower
+                };
+                let mut out = StringBuilder::new();
+                for i in 0..rows {
+                    if strings.is_null(i) {
+                        out.append_null();
+                    } else {
+                        out.append_value(strings.value(i).chars().map(map).collect::<String>());
+                    }
+                }
+                Ok(ColumnarValue::Array(Arc::new(out.finish())))
             }
         }
-        Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
 }
 
@@ -365,11 +579,15 @@ mod tests {
 
     #[test]
     fn split_keeps_empty_fields_and_splits_characters_on_empty_delimiter() {
-        assert_eq!(trino_split("", ","), vec![""]);
-        assert_eq!(trino_split("a,b,,c", ","), vec!["a", "b", "", "c"]);
-        assert_eq!(trino_split("abc", ""), vec!["a", "b", "c"]);
-        assert_eq!(trino_split("Über", ""), vec!["Ü", "b", "e", "r"]);
-        assert_eq!(trino_split("a::b", "::"), vec!["a", "b"]);
+        assert_eq!(trino_split("", ",").unwrap(), vec![""]);
+        assert_eq!(trino_split("a,b,,c", ",").unwrap(), vec!["a", "b", "", "c"]);
+        assert_eq!(trino_split("a::b", "::").unwrap(), vec!["a", "b"]);
+        let err = trino_split("abc", "").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("The delimiter may not be the empty string"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -403,18 +621,202 @@ mod tests {
     }
 
     #[test]
-    fn java_replacement_syntax_translates_to_rust() {
-        assert_eq!(java_replacement_to_rust("$1x").unwrap(), "${1}x");
-        assert_eq!(java_replacement_to_rust("$2=$1").unwrap(), "${2}=${1}");
-        assert_eq!(java_replacement_to_rust("$12-$0").unwrap(), "${12}-${0}");
-        assert_eq!(java_replacement_to_rust("${name}!").unwrap(), "${name}!");
-        assert_eq!(java_replacement_to_rust("\\$5").unwrap(), "$$5");
-        assert_eq!(java_replacement_to_rust("a\\\\b").unwrap(), "a\\b");
-        assert_eq!(java_replacement_to_rust("plain").unwrap(), "plain");
-        assert_eq!(java_replacement_to_rust("").unwrap(), "");
-        let err = java_replacement_to_rust("cost: $").unwrap_err().to_string();
-        assert!(err.contains("illegal group reference"), "{err}");
-        let err = java_replacement_to_rust("$x").unwrap_err().to_string();
-        assert!(err.contains("illegal group reference"), "{err}");
+    fn padding_truncates_and_refuses_empty_pads() {
+        assert_eq!(trino_pad("lpad", "abc", 5, "xy", true).unwrap(), "xyabc");
+        assert_eq!(trino_pad("rpad", "abc", 6, "xy", false).unwrap(), "abcxyx");
+        assert_eq!(trino_pad("lpad", "abcdef", 3, "x", true).unwrap(), "abc");
+        assert_eq!(trino_pad("lpad", "Über", 5, "é", true).unwrap(), "éÜber");
+        assert_eq!(trino_pad("lpad", "abc", 3, "", true).unwrap(), "abc");
+        let err = trino_pad("lpad", "abc", 5, "", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Padding string must not be empty"), "{err}");
+        let err = trino_pad("lpad", "abc", -1, "x", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Target length"), "{err}");
+    }
+
+    #[test]
+    fn case_mapping_is_per_code_point() {
+        let upper = |s: &str| s.chars().map(simple_upper).collect::<String>();
+        let lower = |s: &str| s.chars().map(simple_lower).collect::<String>();
+        assert_eq!(upper("straße"), "STRAßE");
+        assert_eq!(upper("ﬁ"), "ﬁ");
+        assert_eq!(upper("ᾀ"), "ᾈ");
+        assert_eq!(upper("hello wörld"), "HELLO WÖRLD");
+        assert_eq!(lower("İstanbul"), "istanbul");
+        assert_eq!(lower("ΟΔΥΣΣΕΥΣ"), "οδυσσευσ");
+        assert_eq!(lower("ÀB"), "àb");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// trim / ltrim / rtrim
+// ---------------------------------------------------------------------------
+
+/// Java's `Character.isWhitespace`, which Trino's `trim` family strips:
+/// the Unicode space separators except the non-breaking ones (`U+00A0`,
+/// `U+2007`, `U+202F`), the line and paragraph separators, `U+0009`–`U+000D`,
+/// and `U+001C`–`U+001F`. DataFusion's `trim` strips only `U+0020`.
+pub fn is_java_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0009}'..='\u{000D}'
+            | '\u{001C}'..='\u{001F}'
+            | ' '
+            | '\u{1680}'
+            | '\u{2000}'..='\u{2006}'
+            | '\u{2008}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{205F}'
+            | '\u{3000}'
+    )
+}
+
+/// Which side `trim` strips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrimSide {
+    Both,
+    Leading,
+    Trailing,
+}
+
+impl TrimSide {
+    fn trino_name(self) -> &'static str {
+        match self {
+            Self::Both => "trim",
+            Self::Leading => "ltrim",
+            Self::Trailing => "rtrim",
+        }
+    }
+}
+
+/// Trino's `trim` / `ltrim` / `rtrim`: strips Java whitespace, or any code
+/// point of `chars` when given (`TRIM(LEADING 'xy' FROM s)`).
+pub fn trino_trim(s: &str, side: TrimSide, chars: Option<&str>) -> String {
+    let strip = |c: char| match chars {
+        Some(set) => set.contains(c),
+        None => is_java_whitespace(c),
+    };
+    match side {
+        TrimSide::Both => s.trim_matches(strip),
+        TrimSide::Leading => s.trim_start_matches(strip),
+        TrimSide::Trailing => s.trim_end_matches(strip),
+    }
+    .to_string()
+}
+
+/// `trino_trim(s[, chars])` / `trino_ltrim` / `trino_rtrim`: see
+/// [`trino_trim`].
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct TrinoTrim {
+    signature: Signature,
+    side: TrimSide,
+}
+
+impl TrinoTrim {
+    /// New instance.
+    pub fn new(side: TrimSide) -> Self {
+        Self {
+            signature: Signature::one_of(
+                vec![TypeSignature::Any(1), TypeSignature::Any(2)],
+                Volatility::Immutable,
+            ),
+            side,
+        }
+    }
+}
+
+impl ScalarUDFImpl for TrinoTrim {
+    fn name(&self) -> &str {
+        match self.side {
+            TrimSide::Both => "trino_trim",
+            TrimSide::Leading => "trino_ltrim",
+            TrimSide::Trailing => "trino_rtrim",
+        }
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        if !arg_types.iter().all(is_string_or_null) {
+            return Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function {}. Expected varchar arguments",
+                arg_types
+                    .iter()
+                    .map(trino_type_name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.side.trino_name()
+            )));
+        }
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let function = self.side.trino_name();
+        let rows = args.number_rows;
+        let strings = string_array(function, &args.args[0], rows)?;
+        let chars = match args.args.get(1) {
+            Some(c) => Some(string_array(function, c, rows)?),
+            None => None,
+        };
+        let mut out = StringBuilder::new();
+        for i in 0..rows {
+            let chars_null = chars.as_ref().is_some_and(|c| c.is_null(i));
+            if strings.is_null(i) || chars_null {
+                out.append_null();
+                continue;
+            }
+            let set = chars.as_ref().map(|c| c.value(i));
+            out.append_value(trino_trim(strings.value(i), self.side, set));
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+#[cfg(test)]
+mod trim_tests {
+    use super::*;
+
+    #[test]
+    fn trim_strips_java_whitespace_only() {
+        assert_eq!(trino_trim("\t a \n", TrimSide::Both, None), "a");
+        assert_eq!(trino_trim("\ta", TrimSide::Leading, None), "a");
+        assert_eq!(trino_trim("a\r", TrimSide::Trailing, None), "a");
+        assert_eq!(trino_trim("\u{2028}a\u{3000}", TrimSide::Both, None), "a");
+        assert_eq!(trino_trim("\u{001C}a\u{001F}", TrimSide::Both, None), "a");
+        // Non-breaking spaces are not whitespace to Java.
+        assert_eq!(
+            trino_trim("\u{00A0}a\u{202F}", TrimSide::Both, None),
+            "\u{00A0}a\u{202F}"
+        );
+        assert_eq!(trino_trim("\u{2007}a", TrimSide::Both, None), "\u{2007}a");
+        assert_eq!(trino_trim("xyaxy", TrimSide::Both, Some("yx")), "a");
+        assert_eq!(trino_trim("xax", TrimSide::Leading, Some("x")), "ax");
+        assert_eq!(trino_trim("xax", TrimSide::Trailing, Some("x")), "xa");
+        assert_eq!(trino_trim(" a ", TrimSide::Both, Some("x")), " a ");
+    }
+}
+
+#[cfg(test)]
+mod replace_tests {
+    use super::*;
+
+    #[test]
+    fn empty_search_wraps_every_code_point() {
+        assert_eq!(trino_replace("abc", "", "X"), "XaXbXcX");
+        assert_eq!(trino_replace("", "", "X"), "X");
+        assert_eq!(trino_replace("a\u{1F44D}", "", "-"), "-a-\u{1F44D}-");
+        assert_eq!(trino_replace("abc", "", "XY").chars().count(), 11);
+        assert_eq!(trino_replace("abc", "", ""), "abc");
+        // Non-empty searches are the ordinary left-to-right replacement.
+        assert_eq!(trino_replace("a,b,,c", ",", ";"), "a;b;;c");
+        assert_eq!(trino_replace("aaa", "aa", "b"), "ba");
+        assert_eq!(trino_replace("abc", "b", ""), "ac");
     }
 }

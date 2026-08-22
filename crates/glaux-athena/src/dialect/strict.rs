@@ -6,7 +6,8 @@
 //! query that works on glaux but fails on Athena (or, worse, matches
 //! different rows) would be silently wrong. [`check`] walks the logical
 //! plan DataFusion produced *before* its type-coercion pass and rejects
-//! comparisons, arithmetic, concatenation, `IN` lists and subqueries,
+//! comparisons, arithmetic, concatenation, `LIKE` over non-varchar
+//! operands, `IN` lists and subqueries,
 //! `BETWEEN`, join conditions (`ON` and `USING`), simple `CASE` operands
 //! and `CASE` / `if` results, `nullif` / `coalesce` / `greatest` / `least`
 //! arguments, set-operation columns, and varchar arguments to the
@@ -21,14 +22,17 @@
 //! `date - date` and `timestamp - timestamp` are refused too, for a
 //! different reason: Trino returns an `interval`, which glaux cannot carry
 //! in v0.1 (DataFusion would return a bigint day count or a duration).
+//! Comparisons between intervals are refused as well: Trino compares the
+//! normalised value (`INTERVAL '1' DAY = INTERVAL '24' HOUR` is true),
+//! DataFusion the month/day/nanosecond triple.
 
 use arrow::datatypes::DataType;
-use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, Operator};
 
 use super::error::GlauxSqlError;
-use super::udf::arithmetic::input_schema;
+use super::udf::arithmetic::{input_schema, values_row_expr};
 use super::udf::casts::trino_type_name;
 
 /// Coarse type classes; Trino only mixes classes in the cases listed in
@@ -137,6 +141,32 @@ pub(crate) fn comparable(left: &DataType, right: &DataType) -> bool {
     compatible(class(left), class(right), Operator::Eq)
 }
 
+/// The Trino name of a DataFusion function the rewriter emitted.
+fn trino_function_name(name: &str) -> &str {
+    match name {
+        "character_length" => "length",
+        "trino_replace" => "replace",
+        "trino_power" => "power",
+        "levenshtein" => "levenshtein_distance",
+        "trino_date_parse" => "date_parse",
+        other => other,
+    }
+}
+
+fn is_comparison(op: Operator) -> bool {
+    matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+            | Operator::IsDistinctFrom
+            | Operator::IsNotDistinctFrom
+    )
+}
+
 fn operator_text(op: Operator) -> String {
     match op {
         Operator::IsDistinctFrom => "IS DISTINCT FROM".to_string(),
@@ -156,7 +186,22 @@ fn check_operands(
     let (Ok(left_type), Ok(right_type)) = (left.get_type(schema), right.get_type(schema)) else {
         return Ok(());
     };
-    check_types(&left_type, op, &right_type)
+    check_types(&left_type, op, &right_type).map_err(|err| match &err {
+        // Re-render the operand types from the expressions, so a literal
+        // reports the type Trino gives it (`1 = '1'` is `integer =
+        // varchar(1)`, not `bigint = varchar`).
+        GlauxSqlError::TypeMismatch { message }
+            if message.starts_with("Cannot apply operator: ") =>
+        {
+            GlauxSqlError::type_mismatch(format!(
+                "Cannot apply operator: {} {} {}",
+                trino_expr_type_name(left, &left_type),
+                operator_text(op),
+                trino_expr_type_name(right, &right_type)
+            ))
+        }
+        _ => err,
+    })
 }
 
 fn check_types(left: &DataType, op: Operator, right: &DataType) -> Result<(), GlauxSqlError> {
@@ -175,6 +220,26 @@ fn check_types(left: &DataType, op: Operator, right: &DataType) -> Result<(), Gl
             ),
         ));
     }
+    if is_comparison(op) && (l == Class::Interval || r == Class::Interval) {
+        // Trino compares a day-to-second interval by its total milliseconds
+        // and a year-to-month one by its total months (`INTERVAL '1' DAY =
+        // INTERVAL '24' HOUR` is true) and refuses to mix the two kinds;
+        // DataFusion compares its month/day/nanosecond triple structurally,
+        // so the same query would be false. Comparison operators on
+        // intervals are refused rather than answered differently.
+        return Err(GlauxSqlError::unsupported(
+            "interval comparison",
+            format!(
+                "`{} {} {}`: Trino compares intervals by their normalised value (day-to-second \
+                 in milliseconds, year-to-month in months), which DataFusion's structural \
+                 interval comparison does not reproduce; compare the dates or timestamps the \
+                 intervals are applied to, or use date_diff",
+                trino_type_name(left),
+                operator_text(op),
+                trino_type_name(right)
+            ),
+        ));
+    }
     if compatible(l, r, op) {
         return Ok(());
     }
@@ -186,26 +251,45 @@ fn check_types(left: &DataType, op: Operator, right: &DataType) -> Result<(), Gl
     )))
 }
 
+/// Trino's name for an expression's type, narrowing the two places where
+/// the literal is typed more precisely than the plan says at this point:
+/// DataFusion plans every integer literal as `bigint` (glaux's analyzer
+/// narrows it to `integer` later, and Trino types it `integer` from the
+/// start), and a string literal is `varchar(n)` for its code-point length,
+/// not an unbounded `varchar`.
+pub(crate) fn trino_expr_type_name(expr: &Expr, data_type: &DataType) -> String {
+    match expr {
+        Expr::Literal(ScalarValue::Int64(Some(v)), _) if i32::try_from(*v).is_ok() => {
+            "integer".to_string()
+        }
+        Expr::Literal(ScalarValue::Utf8(Some(text)) | ScalarValue::LargeUtf8(Some(text)), _) => {
+            format!("varchar({})", text.chars().count())
+        }
+        Expr::Alias(alias) => trino_expr_type_name(&alias.expr, data_type),
+        _ => trino_type_name(data_type),
+    }
+}
+
 /// Trino requires the results of `CASE` / `if` / `coalesce` / `nullif` /
 /// `greatest` / `least` to share a type; `what` names the construct in the
 /// diagnostic.
 fn check_common_type(what: &str, exprs: &[&Expr], schema: &DFSchema) -> Result<(), GlauxSqlError> {
-    let mut types: Vec<DataType> = Vec::new();
+    let mut typed: Vec<(&Expr, DataType)> = Vec::new();
     for e in exprs {
         if let Ok(t) = e.get_type(schema) {
-            types.push(t);
+            typed.push((e, t));
         }
     }
-    let Some(first) = types.iter().find(|t| class(t) != Class::Null) else {
+    let Some((first_expr, first)) = typed.iter().find(|(_, t)| class(t) != Class::Null) else {
         return Ok(());
     };
-    for t in &types {
+    for (expr, t) in &typed {
         if !comparable(first, t) {
             return Err(GlauxSqlError::type_mismatch(format!(
                 "All {what} must be the same type or coercible to a common type. Cannot find \
                  common type between {} and {}",
-                trino_type_name(first),
-                trino_type_name(t)
+                trino_expr_type_name(first_expr, first),
+                trino_expr_type_name(expr, t)
             )));
         }
     }
@@ -223,9 +307,161 @@ fn date_argument(name: &str) -> Option<usize> {
     }
 }
 
+/// DataFusion string functions the registry passes through, with the
+/// argument positions Trino types as `varchar`. DataFusion would stringify
+/// a number or a date there (`length(123)` is 3); Trino has no such
+/// signature.
+fn string_arguments(name: &str) -> &'static [usize] {
+    match name {
+        "character_length" => &[0],
+        "starts_with" | "strpos" | "levenshtein" | "regexp_match" => &[0, 1],
+        "trino_replace" | "translate" => &[0, 1, 2],
+        // `date_parse(x, fmt)`: the parsed text must be a varchar.
+        "trino_date_parse" => &[0],
+        _ => &[],
+    }
+}
+
+/// Argument positions typed `numeric` by Trino, for the DataFusion
+/// functions the registry passes through: DataFusion would parse a varchar
+/// there, or fail with its own planner text (`Function 'abs' expects
+/// Numeric but received String`), where Athena reports `TYPE_MISMATCH`.
+fn numeric_arguments(name: &str) -> &'static [usize] {
+    match name {
+        "abs" | "cbrt" | "ceil" | "chr" | "degrees" | "exp" | "factorial" | "floor" | "ln"
+        | "log10" | "log2" | "radians" | "signum" | "sqrt" | "acos" | "asin" | "atan" | "cos"
+        | "cosh" | "sin" | "sinh" | "tan" | "tanh" | "trunc" | "width_bucket" => &[0],
+        "atan2" | "log" | "trino_power" | "nanvl" => &[0, 1],
+        _ => &[],
+    }
+}
+
+/// Argument positions typed `array` by Trino, same idea.
+fn array_arguments(name: &str) -> &'static [usize] {
+    match name {
+        // (`reverse` is not here: Trino has both `reverse(varchar)` and
+        // `reverse(array)`.)
+        "cardinality" | "array_distinct" | "flatten" | "array_sort" => &[0],
+        "array_union"
+        | "array_intersect"
+        | "array_except"
+        | "trino_arrays_overlap"
+        | "trino_array_concat" => &[0, 1],
+        _ => &[],
+    }
+}
+
+/// Aggregates Trino declares only over numeric or only over boolean
+/// arguments; DataFusion refuses the mismatch with an `Internal error:
+/// Function 'sum' failed to match any signature ...` that ends in an
+/// invitation to file a DataFusion bug report.
+fn aggregate_argument_class(name: &str) -> Option<(Class, &'static str)> {
+    match name {
+        "sum" | "avg" | "stddev" | "stddev_pop" | "stddev_samp" | "var_pop" | "var_samp"
+        | "variance" | "corr" | "covar_pop" | "covar_samp" | "regr_slope" | "regr_intercept"
+        | "checked_int_sum" | "trino_decimal_sum" | "trino_decimal_avg" | "trino_real_sum"
+        | "trino_real_avg" => Some((Class::Number, "a numeric argument")),
+        "bool_and" | "bool_or" => Some((Class::Boolean, "a boolean argument")),
+        _ => None,
+    }
+}
+
+/// `TYPE_MISMATCH: Unexpected parameters (varchar) for function abs:
+/// expected a numeric argument`, Trino's shape for a signature that has no
+/// overload for the argument type.
+fn unexpected_parameters(name: &str, actual: &str, expected: &str) -> GlauxSqlError {
+    GlauxSqlError::type_mismatch(format!(
+        "Unexpected parameters ({actual}) for function {}: expected {expected}",
+        trino_function_name(name)
+    ))
+}
+
+/// Refuse a function call whose argument at `index` is not of `class`.
+fn check_argument_class(
+    name: &str,
+    args: &[Expr],
+    index: usize,
+    class_wanted: Class,
+    expected: &str,
+    schema: &DFSchema,
+) -> Result<(), GlauxSqlError> {
+    let Some(arg) = args.get(index) else {
+        return Ok(());
+    };
+    let Ok(t) = arg.get_type(schema) else {
+        return Ok(());
+    };
+    if class(&t) == class_wanted || class(&t) == Class::Null || class(&t) == Class::Other {
+        return Ok(());
+    }
+    Err(unexpected_parameters(
+        name,
+        &trino_expr_type_name(arg, &t),
+        expected,
+    ))
+}
+
+/// Whether Trino has a cast between these type classes (varchar sources are
+/// validated at run time; the pairs here are the ones Trino refuses at
+/// planning, such as `CAST(DATE ... AS BIGINT)` or `CAST(12 AS DATE)`).
+fn castable(source: Class, target: Class) -> bool {
+    use Class::*;
+    matches!(
+        (source, target),
+        (Null | Other, _)
+            | (_, Other)
+            | (String, _)
+            | (Number, Number | String | Boolean)
+            | (Boolean, Boolean | Number | String)
+            | (Date, Date | Timestamp | String)
+            | (Timestamp, Timestamp | Date | Time | String)
+            | (Time, Time | String)
+            | (Interval, Interval | String)
+            | (Array, Array)
+            | (Binary, Binary)
+    )
+}
+
+fn check_cast(source: &Expr, target: &DataType, schema: &DFSchema) -> Result<(), GlauxSqlError> {
+    let Ok(source_type) = source.get_type(schema) else {
+        return Ok(());
+    };
+    if castable(class(&source_type), class(target)) {
+        return Ok(());
+    }
+    Err(GlauxSqlError::type_mismatch(format!(
+        "Cannot cast {} to {}",
+        trino_type_name(&source_type),
+        trino_type_name(target)
+    )))
+}
+
 fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
     match expr {
         Expr::BinaryExpr(binary) => check_operands(&binary.left, binary.op, &binary.right, schema),
+        // Trino types both sides of `LIKE` as varchar; DataFusion's
+        // type-coercion pass would fail later with its own planner text
+        // ("There isn't a common type to coerce Int32 and Utf8 in LIKE
+        // expression"), so refuse here with Trino's diagnostic.
+        Expr::Like(like) | Expr::SimilarTo(like) => {
+            if let Ok(t) = like.expr.get_type(schema)
+                && !matches!(class(&t), Class::String | Class::Null)
+            {
+                return Err(GlauxSqlError::type_mismatch(format!(
+                    "Left side of LIKE expression must evaluate to a varchar (actual: {})",
+                    trino_type_name(&t)
+                )));
+            }
+            if let Ok(t) = like.pattern.get_type(schema)
+                && !matches!(class(&t), Class::String | Class::Null)
+            {
+                return Err(GlauxSqlError::type_mismatch(format!(
+                    "Pattern for LIKE expression must evaluate to a varchar (actual: {})",
+                    trino_type_name(&t)
+                )));
+            }
+            Ok(())
+        }
         Expr::InList(in_list) => {
             for item in &in_list.list {
                 check_operands(&in_list.expr, Operator::Eq, item, schema)?;
@@ -233,6 +469,7 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
             Ok(())
         }
         Expr::InSubquery(in_subquery) => {
+            check_correlation_names(&in_subquery.subquery.subquery)?;
             let Ok(left) = in_subquery.expr.get_type(schema) else {
                 return Ok(());
             };
@@ -246,7 +483,27 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
                     trino_type_name(&left),
                     trino_type_name(field.data_type())
                 ))
-            })
+            })?;
+            // Trino evaluates `IN (subquery)` with the EQUAL operator (NaN
+            // matches nothing); DataFusion decorrelates it into a hash
+            // semi-join whose key equality is Arrow's (NaN matches NaN),
+            // and the join is built after this check runs, so a float
+            // operand is refused rather than risked.
+            if matches!(
+                left,
+                DataType::Float16 | DataType::Float32 | DataType::Float64
+            ) || matches!(
+                field.data_type(),
+                DataType::Float16 | DataType::Float32 | DataType::Float64
+            ) {
+                return Err(GlauxSqlError::unsupported(
+                    "IN (subquery) over DOUBLE / REAL",
+                    "Trino compares double values with IEEE equality (NaN never matches), which \
+                     DataFusion's semi-join does not reproduce; use a JOIN with an explicit ON \
+                     equality instead",
+                ));
+            }
+            Ok(())
         }
         Expr::Between(between) => {
             check_operands(&between.expr, Operator::GtEq, &between.low, schema)?;
@@ -268,12 +525,49 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
             }
             check_common_type("CASE results", &results, schema)
         }
+        Expr::ScalarSubquery(subquery) => check_correlation_names(&subquery.subquery),
+        Expr::Exists(exists) => check_correlation_names(&exists.subquery.subquery),
+        Expr::Cast(cast) => check_cast(&cast.expr, cast.field.data_type(), schema),
+        Expr::TryCast(cast) => check_cast(&cast.expr, cast.field.data_type(), schema),
+        // `sum(varchar)` / `bool_and(bigint)`: Trino has no such overload
+        // and reports `TYPE_MISMATCH`, where DataFusion's signature
+        // matcher raises an `Internal error` that asks the user to file a
+        // DataFusion bug report.
+        Expr::AggregateFunction(agg) => {
+            let name = agg.func.name();
+            let Some((wanted, expected)) = aggregate_argument_class(name) else {
+                return Ok(());
+            };
+            for index in 0..agg.params.args.len() {
+                check_argument_class(name, &agg.params.args, index, wanted, expected, schema)?;
+            }
+            Ok(())
+        }
+        Expr::WindowFunction(window) => {
+            let name = window.fun.name().to_string();
+            let Some((wanted, expected)) = aggregate_argument_class(&name) else {
+                return Ok(());
+            };
+            for index in 0..window.params.args.len() {
+                check_argument_class(&name, &window.params.args, index, wanted, expected, schema)?;
+            }
+            Ok(())
+        }
         Expr::ScalarFunction(call) => {
             let name = call.func.name();
             match name {
                 "nullif" | "coalesce" | "greatest" | "least" => {
                     let args: Vec<&Expr> = call.args.iter().collect();
                     check_common_type(&format!("{} operands", name.to_uppercase()), &args, schema)
+                }
+                // `ARRAY[...]` plans as DataFusion's `make_array`, which
+                // casts every element to one common type and would answer
+                // `ARRAY[1, '2']` with `[1, 2]` (or fail at run time with
+                // an Arrow cast error for `ARRAY[1, 'a']`). Trino refuses
+                // the mix at analysis time, like every other operand list.
+                "make_array" => {
+                    let args: Vec<&Expr> = call.args.iter().collect();
+                    check_common_type("ARRAY elements", &args, schema)
                 }
                 _ => {
                     if let Some(index) = date_argument(name)
@@ -295,6 +589,41 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
                             trino_type_name(&t)
                         )));
                     }
+                    for index in numeric_arguments(name) {
+                        check_argument_class(
+                            name,
+                            &call.args,
+                            *index,
+                            Class::Number,
+                            "a numeric argument",
+                            schema,
+                        )?;
+                    }
+                    for index in array_arguments(name) {
+                        check_argument_class(
+                            name,
+                            &call.args,
+                            *index,
+                            Class::Array,
+                            "an array",
+                            schema,
+                        )?;
+                    }
+                    for index in string_arguments(name) {
+                        if let Some(arg) = call.args.get(*index)
+                            && let Ok(t) = arg.get_type(schema)
+                            && !matches!(class(&t), Class::String | Class::Null)
+                            && !(name == "character_length" && class(&t) == Class::Binary)
+                        {
+                            let actual = trino_expr_type_name(arg, &t);
+                            return Err(GlauxSqlError::type_mismatch(format!(
+                                "Unexpected parameters ({actual}) for function {}: expected \
+                                 varchar (Trino does not convert {actual} to varchar implicitly; \
+                                 use CAST)",
+                                trino_function_name(name),
+                            )));
+                        }
+                    }
                     Ok(())
                 }
             }
@@ -303,8 +632,72 @@ fn check_expr(expr: &Expr, schema: &DFSchema) -> Result<(), GlauxSqlError> {
     }
 }
 
+/// Trino refuses a window function in a `WHERE` or `HAVING` predicate at
+/// analysis time (`EXPRESSION_NOT_SCALAR`). DataFusion plans it and only
+/// gives up in the physical planner, where it dumps the Rust `Debug` of the
+/// window expression.
+fn check_no_window_function(node: &LogicalPlan) -> Result<(), GlauxSqlError> {
+    let LogicalPlan::Filter(filter) = node else {
+        return Ok(());
+    };
+    let mut found = false;
+    let _ = filter.predicate.apply(|e| {
+        if matches!(e, Expr::WindowFunction(_)) {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    if !found {
+        return Ok(());
+    }
+    // `HAVING` plans as a `Filter` over the `Aggregate` (through the
+    // aggregate's own projection); `WHERE` sits under it.
+    let having = matches!(
+        strip_projection(&filter.input),
+        LogicalPlan::Aggregate(_) | LogicalPlan::Distinct(_)
+    );
+    Err(GlauxSqlError::runtime(
+        "EXPRESSION_NOT_SCALAR",
+        if having {
+            "HAVING clause cannot contain window functions or grouping operations"
+        } else {
+            "WHERE clause cannot contain aggregations, window functions or grouping operations"
+        },
+    ))
+}
+
+/// The `i`-th output expression of a set-operation branch, when the branch
+/// is a projection: `SELECT 'a' UNION ALL SELECT 1` must name the literal
+/// types Trino gives them (`varchar(1)`, `integer`), not the `varchar` /
+/// `bigint` DataFusion planned them as.
+fn branch_output(plan: &LogicalPlan, i: usize) -> Option<&Expr> {
+    match plan {
+        LogicalPlan::Projection(projection) => projection.expr.get(i),
+        LogicalPlan::SubqueryAlias(alias) => branch_output(&alias.input, i),
+        _ => None,
+    }
+}
+
+/// [`trino_expr_type_name`] for a set-operation branch column, falling back
+/// to the schema type when the branch is not a projection.
+fn branch_type_name(plan: &LogicalPlan, i: usize, data_type: &DataType) -> String {
+    match branch_output(plan, i) {
+        Some(expr) => trino_expr_type_name(expr, data_type),
+        None => trino_type_name(data_type),
+    }
+}
+
+fn strip_projection(plan: &LogicalPlan) -> &LogicalPlan {
+    match plan {
+        LogicalPlan::Projection(projection) => strip_projection(&projection.input),
+        other => other,
+    }
+}
+
 /// Plan-level checks: join conditions and set-operation columns.
 fn check_plan_node(node: &LogicalPlan, schema: &DFSchema) -> Result<(), GlauxSqlError> {
+    check_no_window_function(node)?;
     match node {
         LogicalPlan::Join(join) => {
             for (left, right) in &join.on {
@@ -328,16 +721,148 @@ fn check_plan_node(node: &LogicalPlan, schema: &DFSchema) -> Result<(), GlauxSql
                         return Err(GlauxSqlError::type_mismatch(format!(
                             "column {} in UNION query has incompatible types: {}, {}",
                             i + 1,
-                            trino_type_name(a.data_type()),
-                            trino_type_name(b.data_type())
+                            branch_type_name(first, i, a.data_type()),
+                            branch_type_name(other, i, b.data_type())
                         )));
                     }
                 }
             }
             Ok(())
         }
+        // A multi-row `VALUES` is an operand list like the others: Trino
+        // requires the rows to share a type and reports `Values rows have
+        // mismatched types` otherwise, where DataFusion's planner coerces
+        // `(VALUES (1), ('2'))` into a bigint column with the rows `1, 2`.
+        // The row expressions are read through
+        // [`values_row_expr`] so the planner's own coercion casts do not
+        // hide the type the user wrote.
+        LogicalPlan::Values(values) => {
+            let row_types: Vec<Vec<Option<(DataType, String)>>> = values
+                .values
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|e| {
+                            let inner = values_row_expr(e);
+                            inner.get_type(schema).ok().map(|t| {
+                                let name = trino_expr_type_name(inner, &t);
+                                (t, name)
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            let Some(first) = row_types.first() else {
+                return Ok(());
+            };
+            for other in row_types.iter().skip(1) {
+                let clash = first.iter().zip(other).any(|(a, b)| match (a, b) {
+                    (Some((a, _)), Some((b, _))) => !comparable(a, b),
+                    _ => false,
+                });
+                if clash {
+                    return Err(GlauxSqlError::type_mismatch(format!(
+                        "Values rows have mismatched types: {} vs {}",
+                        row_type_text(first),
+                        row_type_text(other)
+                    )));
+                }
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
+}
+
+/// Trino's `row(integer, varchar(1))` rendering of a `VALUES` row's types.
+fn row_type_text(types: &[Option<(DataType, String)>]) -> String {
+    let names: Vec<&str> = types
+        .iter()
+        .map(|t| match t {
+            Some((_, name)) => name.as_str(),
+            None => "unknown",
+        })
+        .collect();
+    format!("row({})", names.join(", "))
+}
+
+/// `IN (subquery)` / `EXISTS` used as a *value* (in the select list, a sort
+/// key, a join condition — anywhere but a `WHERE` / `HAVING` predicate,
+/// which plans as a `Filter`): DataFusion cannot evaluate the expression
+/// (`Physical plan does not support logical expression InSubquery`), so it
+/// is refused by name here instead of leaking that error.
+fn check_subquery_position(node: &LogicalPlan, expr: &Expr) -> Result<(), GlauxSqlError> {
+    if matches!(node, LogicalPlan::Filter(_)) {
+        return Ok(());
+    }
+    let construct = match expr {
+        Expr::InSubquery(_) => "IN (subquery) as a value",
+        Expr::Exists(_) => "EXISTS as a value",
+        _ => return Ok(()),
+    };
+    Err(GlauxSqlError::unsupported(
+        construct,
+        "DataFusion only decorrelates IN / EXISTS subqueries used as WHERE / HAVING predicates; \
+         use them there, or rewrite with a JOIN",
+    ))
+}
+
+/// Correlated inner columns that share a bare name across relations.
+///
+/// DataFusion decorrelates a correlated subquery into a left join and
+/// re-qualifies every correlated inner column onto the join's subquery
+/// alias **by its bare name**
+/// (`scalar_subquery_to_join::build_join` → `replace_qualified_name`). Two
+/// correlated columns called `id` that come from different relations
+/// therefore collapse onto the same join key: `... FROM customers c JOIN
+/// orders x ON x.customer_id = c.id WHERE c.id = o.customer_id AND x.id =
+/// o.id` plans as `o.customer_id = sq.id AND o.id = sq.id` and answers
+/// every row with `0` / `NULL`. Trino runs the query, so a wrong answer is
+/// the one outcome that is never allowed: refuse it by name.
+fn check_correlation_names(plan: &LogicalPlan) -> Result<(), GlauxSqlError> {
+    let mut correlated: Vec<datafusion::common::Column> = Vec::new();
+    let visit = plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            expr.apply(|e| {
+                if let Expr::BinaryExpr(binary) = e {
+                    let (left, right) = (binary.left.as_ref(), binary.right.as_ref());
+                    let partner = match (left.contains_outer(), right.contains_outer()) {
+                        (true, false) => right,
+                        (false, true) => left,
+                        _ => return Ok(TreeNodeRecursion::Continue),
+                    };
+                    let _ = partner.apply(|inner| {
+                        if let Expr::Column(column) = inner {
+                            correlated.push(column.clone());
+                        }
+                        Ok(TreeNodeRecursion::Continue)
+                    });
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+    });
+    debug_assert!(visit.is_ok());
+    for (i, column) in correlated.iter().enumerate() {
+        if let Some(clash) = correlated[i + 1..]
+            .iter()
+            .find(|other| other.name == column.name && other.relation != column.relation)
+        {
+            return Err(GlauxSqlError::unsupported(
+                format!("correlated subquery over two `{}` columns", column.name),
+                format!(
+                    "the correlation conditions reference both `{}` and `{}`, and DataFusion's \
+                     decorrelation re-qualifies correlated columns by their bare name, so the two \
+                     would collapse onto one join key and the query would return wrong rows; give \
+                     one of them a distinct name in a derived table, or rewrite the subquery as a \
+                     JOIN",
+                    column.flat_name(),
+                    clash.flat_name()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reject operator applications Trino refuses. Run on the freshly planned
@@ -352,11 +877,15 @@ pub fn check(plan: &LogicalPlan) -> Result<(), GlauxSqlError> {
             return Ok(TreeNodeRecursion::Stop);
         }
         node.apply_expressions(|expr| {
-            expr.apply(|e| match check_expr(e, &schema) {
-                Ok(()) => Ok(TreeNodeRecursion::Continue),
-                Err(err) => {
-                    failure = Some(err);
-                    Ok(TreeNodeRecursion::Stop)
+            expr.apply(|e| {
+                let checked =
+                    check_subquery_position(node, e).and_then(|()| check_expr(e, &schema));
+                match checked {
+                    Ok(()) => Ok(TreeNodeRecursion::Continue),
+                    Err(err) => {
+                        failure = Some(err);
+                        Ok(TreeNodeRecursion::Stop)
+                    }
                 }
             })
         })
@@ -372,6 +901,22 @@ pub fn check(plan: &LogicalPlan) -> Result<(), GlauxSqlError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cast_matrix_follows_trino() {
+        use Class::*;
+        assert!(castable(String, Timestamp));
+        assert!(castable(Number, String));
+        assert!(castable(Number, Boolean));
+        assert!(castable(Date, Timestamp));
+        assert!(castable(Timestamp, Date));
+        assert!(!castable(Number, Date));
+        assert!(!castable(Number, Timestamp));
+        assert!(!castable(Date, Number));
+        assert!(!castable(Timestamp, Number));
+        assert!(!castable(Boolean, Date));
+        assert!(castable(Null, Date));
+    }
 
     #[test]
     fn class_compatibility_follows_trino() {

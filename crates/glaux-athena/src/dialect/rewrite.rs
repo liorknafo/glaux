@@ -23,18 +23,20 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    AccessExpr, BinaryOperator, CaseWhen, CastKind, CharacterLength, DataType, DateTimeField,
-    Distinct, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr,
+    AccessExpr, BinaryOperator, CaseWhen, CastKind, CeilFloorKind, CharacterLength, DataType,
+    DateTimeField, Distinct, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident,
     JoinConstraint, JoinOperator, NamedWindowExpr, ObjectName, ObjectNamePart, OrderByExpr,
-    OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Subscript, TableAlias, TableFactor,
-    TimezoneInfo, TypedString, UnaryOperator, Value, VisitMut, VisitorMut, WindowType,
+    OrderByKind, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
+    Subscript, TableAlias, TableFactor, TableWithJoins, TimezoneInfo, TrimWhereField,
+    UnaryOperator, Value, Visit, VisitMut, Visitor, VisitorMut, WindowType,
 };
 
 use super::error::GlauxSqlError;
 use super::formats::{Direction, joda_to_chrono, mysql_to_chrono};
 use super::naming;
 use super::registry::{self, ShimKind};
+use super::udf::timestamps::parse_trino_timestamp;
 
 /// Rewrite `statement` in place. On error the statement is left partially
 /// rewritten and must not be used.
@@ -59,6 +61,11 @@ struct Rewriter {
 
 impl VisitorMut for Rewriter {
     type Break = Box<GlauxSqlError>;
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        fold_negative_integer_literal(expr);
+        ControlFlow::Continue(())
+    }
 
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         match rewrite_expr(expr) {
@@ -104,7 +111,12 @@ impl VisitorMut for Rewriter {
             }
             | TableFactor::NestedJoin {
                 alias: Some(alias), ..
-            } => fold_alias(alias),
+            } => {
+                if let Err(err) = check_alias_quoting(alias.name.clone()) {
+                    return ControlFlow::Break(Box::new(err));
+                }
+                fold_alias(alias);
+            }
             _ => {}
         }
         let refused = match table_factor {
@@ -160,10 +172,19 @@ impl VisitorMut for Rewriter {
 fn rewrite_query(query: &mut Query, wrap_values: bool) -> Result<(), GlauxSqlError> {
     // CTE names are identifiers too.
     if let Some(with) = &mut query.with {
+        if with.recursive {
+            return Err(GlauxSqlError::unsupported(
+                "WITH RECURSIVE",
+                "recursive CTEs are not supported in v0.1: DataFusion's recursive execution has \
+                 not been vetted against Trino's semantics (its type unification differs); \
+                 rewrite the recursion as an explicit UNION ALL of the levels",
+            ));
+        }
         for cte in &mut with.cte_tables {
             fold_alias(&mut cte.alias);
         }
     }
+    rewrite_fetch(query)?;
     if !query.locks.is_empty() {
         return Err(GlauxSqlError::unsupported(
             "FOR UPDATE / FOR SHARE",
@@ -193,10 +214,272 @@ fn rewrite_query(query: &mut Query, wrap_values: bool) -> Result<(), GlauxSqlErr
             OrderByKind::Expressions(items) => default_nulls_last(items)?,
         }
     }
+    check_row_counts(query)?;
     if wrap_values && matches!(query.body.as_ref(), SetExpr::Values(_)) {
         wrap_values_body(&mut query.body);
     }
+    for select in selects_of(&query.body) {
+        check_using_references(select, query.order_by.as_ref())?;
+    }
     rewrite_set_expr(&mut query.body)
+}
+
+/// Trino's grammar takes a bare `INTEGER_VALUE` for `LIMIT` and `OFFSET`,
+/// so `LIMIT -1` is a parse error there. DataFusion accepts the negative
+/// literal and fails inside an optimizer rule, leaking the rule's name
+/// (`Optimizer rule 'eliminate_limit' failed`), so the row counts are
+/// checked here instead.
+fn check_row_counts(query: &Query) -> Result<(), GlauxSqlError> {
+    let Some(limit_clause) = &query.limit_clause else {
+        return Ok(());
+    };
+    let (limit, offset) = match limit_clause {
+        sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. } => {
+            (limit.as_ref(), offset.as_ref().map(|o| &o.value))
+        }
+        sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
+            (Some(limit), Some(offset))
+        }
+    };
+    for (clause, value) in [("LIMIT", limit), ("OFFSET", offset)] {
+        if value.is_some_and(is_negative_number) {
+            return Err(GlauxSqlError::Parse {
+                message: format!(
+                    "{clause} takes a non-negative row count in Trino (its grammar has no sign \
+                     there), so `{clause} -n` is refused"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A negative numeric literal, however the parser spelled it.
+fn is_negative_number(expr: &Expr) -> bool {
+    match expr {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => matches!(expr.as_ref(), Expr::Value(v) if matches!(&v.value, Value::Number(..))),
+        Expr::Value(v) => matches!(&v.value, Value::Number(text, _) if text.starts_with('-')),
+        _ => false,
+    }
+}
+
+/// `FETCH FIRST n ROWS ONLY` is Trino syntax equivalent to `LIMIT n`;
+/// DataFusion's planner does not implement the `fetch` clause, so it is
+/// rewritten onto the limit clause here. `WITH TIES` (keep the rows tying
+/// with the last one, per the `ORDER BY`) and `PERCENT` have no DataFusion
+/// equivalent and are refused by name.
+fn rewrite_fetch(query: &mut Query) -> Result<(), GlauxSqlError> {
+    let Some(fetch) = query.fetch.take() else {
+        return Ok(());
+    };
+    if fetch.with_ties {
+        return Err(GlauxSqlError::unsupported(
+            "FETCH FIRST n ROWS WITH TIES",
+            "ties have no DataFusion equivalent; use `FETCH FIRST n ROWS ONLY` / LIMIT, or rank \
+             with a window function and filter",
+        ));
+    }
+    if fetch.percent {
+        return Err(GlauxSqlError::unsupported(
+            "FETCH FIRST n PERCENT ROWS",
+            "not Trino syntax (Trino's FETCH takes a row count)",
+        ));
+    }
+    // `FETCH FIRST ROW ONLY` (no quantity) is one row.
+    let quantity = fetch.quantity.unwrap_or_else(|| num_lit(1));
+    match &mut query.limit_clause {
+        None => {
+            query.limit_clause = Some(sqlparser::ast::LimitClause::LimitOffset {
+                limit: Some(quantity),
+                offset: None,
+                limit_by: vec![],
+            });
+            Ok(())
+        }
+        Some(sqlparser::ast::LimitClause::LimitOffset {
+            limit: limit @ None,
+            limit_by,
+            ..
+        }) if limit_by.is_empty() => {
+            *limit = Some(quantity);
+            Ok(())
+        }
+        Some(_) => Err(GlauxSqlError::Parse {
+            message: "LIMIT and FETCH cannot be combined".to_string(),
+        }),
+    }
+}
+
+/// The selects of a query body: the select itself or, for a set
+/// operation, every select on either side (nested queries are visited on
+/// their own).
+pub(crate) fn selects_of(body: &SetExpr) -> Vec<&Select> {
+    match body {
+        SetExpr::Select(select) => vec![select],
+        SetExpr::SetOperation { left, right, .. } => {
+            let mut out = selects_of(left);
+            out.extend(selects_of(right));
+            out
+        }
+        _ => vec![],
+    }
+}
+
+/// Mutable [`selects_of`].
+pub(crate) fn selects_of_mut(body: &mut SetExpr) -> Vec<&mut Select> {
+    match body {
+        SetExpr::Select(select) => vec![select],
+        SetExpr::SetOperation { left, right, .. } => {
+            let mut out = selects_of_mut(left);
+            out.extend(selects_of_mut(right));
+            out
+        }
+        _ => vec![],
+    }
+}
+
+/// The `USING` column names of a join, if it is one.
+pub(crate) fn join_using_columns(operator: &JoinOperator) -> Option<&[ObjectName]> {
+    match operator {
+        JoinOperator::Join(JoinConstraint::Using(columns))
+        | JoinOperator::Inner(JoinConstraint::Using(columns))
+        | JoinOperator::Left(JoinConstraint::Using(columns))
+        | JoinOperator::LeftOuter(JoinConstraint::Using(columns))
+        | JoinOperator::Right(JoinConstraint::Using(columns))
+        | JoinOperator::RightOuter(JoinConstraint::Using(columns))
+        | JoinOperator::FullOuter(JoinConstraint::Using(columns)) => Some(columns),
+        _ => None,
+    }
+}
+
+/// Whether the `FROM` clause has a `USING` join anywhere in its join trees
+/// (not inside derived tables, whose output is already projected).
+pub(crate) fn has_using_join(from: &[TableWithJoins]) -> bool {
+    fn table_has_using(table: &TableWithJoins) -> bool {
+        let nested = |factor: &TableFactor| match factor {
+            TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => table_has_using(table_with_joins),
+            _ => false,
+        };
+        nested(&table.relation)
+            || table.joins.iter().any(|join| {
+                join_using_columns(&join.join_operator).is_some() || nested(&join.relation)
+            })
+    }
+    from.iter().any(table_has_using)
+}
+
+/// The `USING` column names and the relation names / aliases of a `FROM`
+/// clause (lower-case), through nested joins.
+fn using_scope(from: &[TableWithJoins]) -> (Vec<String>, Vec<String>) {
+    fn factor(factor: &TableFactor, columns: &mut Vec<String>, relations: &mut Vec<String>) {
+        match factor {
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+            } => {
+                walk(table_with_joins, columns, relations);
+                if let Some(alias) = alias {
+                    relations.push(alias.name.value.to_lowercase());
+                }
+            }
+            TableFactor::Table { name, alias, .. } => {
+                if let Some(ObjectNamePart::Identifier(id)) = name.0.last() {
+                    relations.push(id.value.to_lowercase());
+                }
+                if let Some(alias) = alias {
+                    relations.push(alias.name.value.to_lowercase());
+                }
+            }
+            TableFactor::Derived {
+                alias: Some(alias), ..
+            } => relations.push(alias.name.value.to_lowercase()),
+            _ => {}
+        }
+    }
+    fn walk(table: &TableWithJoins, columns: &mut Vec<String>, relations: &mut Vec<String>) {
+        factor(&table.relation, columns, relations);
+        for join in &table.joins {
+            factor(&join.relation, columns, relations);
+            if let Some(using) = join_using_columns(&join.join_operator) {
+                for column in using {
+                    if let Some(ObjectNamePart::Identifier(id)) = column.0.last() {
+                        columns.push(id.value.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
+    let (mut columns, mut relations) = (vec![], vec![]);
+    for table in from {
+        walk(table, &mut columns, &mut relations);
+    }
+    (columns, relations)
+}
+
+/// Trino exposes the columns of a `JOIN ... USING (k)` only unqualified
+/// (a single `k`, `coalesce(l.k, r.k)` for outer joins): `SELECT a.k` is
+/// `Column 'a.k' cannot be resolved`. DataFusion would return one side's
+/// raw value, so the qualified reference is refused here.
+fn check_using_references(
+    select: &Select,
+    order_by: Option<&sqlparser::ast::OrderBy>,
+) -> Result<(), GlauxSqlError> {
+    let (columns, relations) = using_scope(&select.from);
+    if columns.is_empty() {
+        return Ok(());
+    }
+    struct Checker {
+        columns: Vec<String>,
+        relations: Vec<String>,
+    }
+    impl Visitor for Checker {
+        type Break = GlauxSqlError;
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<GlauxSqlError> {
+            if let Expr::CompoundIdentifier(ids) = expr
+                && let [.., relation, column] = ids.as_slice()
+                && self.columns.contains(&column.value.to_lowercase())
+                && self.relations.contains(&relation.value.to_lowercase())
+            {
+                return ControlFlow::Break(GlauxSqlError::Parse {
+                    message: format!(
+                        "Column '{}.{}' cannot be resolved: a JOIN ... USING column is only available \
+                         unqualified on Trino",
+                        relation.value, column.value
+                    ),
+                });
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut checker = Checker { columns, relations };
+    let mut result = select.visit(&mut checker);
+    if let (ControlFlow::Continue(()), Some(order_by)) = (&result, order_by) {
+        result = order_by.visit(&mut checker);
+    }
+    match result {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(err) => Err(err),
+    }
+}
+
+/// A select-item or table alias written as a string literal (`SELECT 'a'
+/// 'b'`, which Trino rejects and sqlparser reads as `'a' AS "b"`).
+fn check_alias_quoting(alias: Ident) -> Result<(), GlauxSqlError> {
+    if alias.quote_style == Some('\'') {
+        return Err(GlauxSqlError::Parse {
+            message: format!(
+                "mismatched input '{}': a string literal cannot be used as an alias (write AS \
+                 \"{}\" or separate the values with a comma)",
+                alias.value, alias.value
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Trino sorts NULLs last whatever the direction; DataFusion (like
@@ -299,7 +582,13 @@ fn wrap_values_body(body: &mut Box<SetExpr>) {
 fn rewrite_set_expr(body: &mut SetExpr) -> Result<(), GlauxSqlError> {
     match body {
         SetExpr::Select(select) => rewrite_select(select),
-        SetExpr::SetOperation { left, right, .. } => {
+        SetExpr::SetOperation {
+            left,
+            right,
+            op,
+            set_quantifier,
+        } => {
+            check_set_operation(*op, *set_quantifier)?;
             rewrite_set_expr(left)?;
             rewrite_set_expr(right)
         }
@@ -315,6 +604,30 @@ fn rewrite_set_expr(body: &mut SetExpr) -> Result<(), GlauxSqlError> {
                 "writes arrive in v0.2",
             ))
         }
+    }
+}
+
+/// `EXCEPT ALL` is bag difference in Trino (`{1, 1, 1} EXCEPT ALL {1}` is
+/// `{1, 1}`); DataFusion plans it as an anti-join, which removes every
+/// left row whose value appears on the right at all, so it is refused
+/// rather than run with the wrong multiplicities. `INTERSECT ALL` is
+/// correct in DataFusion. The `BY NAME` quantifiers are not Trino syntax.
+fn check_set_operation(op: SetOperator, quantifier: SetQuantifier) -> Result<(), GlauxSqlError> {
+    match (op, quantifier) {
+        (SetOperator::Except, SetQuantifier::All) => Err(GlauxSqlError::unsupported(
+            "EXCEPT ALL",
+            "Trino's EXCEPT ALL keeps the left rows by multiplicity (bag difference); DataFusion \
+             runs it as an anti-join and would drop every matching row. Use EXCEPT (distinct), \
+             or count the rows per value with a GROUP BY and row_number() on each side",
+        )),
+        (_, SetQuantifier::ByName | SetQuantifier::AllByName | SetQuantifier::DistinctByName) => {
+            Err(GlauxSqlError::unsupported(
+                format!("{op} {quantifier}"),
+                "`BY NAME` set operations are not Trino syntax; set operations match columns by \
+             position",
+            ))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -365,6 +678,17 @@ fn rewrite_select(select: &mut Select) -> Result<(), GlauxSqlError> {
     if let Some((construct, message)) = refused {
         return Err(GlauxSqlError::unsupported(construct, message));
     }
+    // Trino's `GROUP BY ()` is the empty grouping set — one global group,
+    // exactly what no GROUP BY means. sqlparser parses it as an empty tuple
+    // expression, which DataFusion refuses with `This feature is not
+    // implemented: Empty tuple not supported yet`.
+    if let GroupByExpr::Expressions(keys, _) = &mut select.group_by {
+        for key in keys.iter_mut() {
+            if matches!(key, Expr::Tuple(items) if items.is_empty()) {
+                *key = Expr::GroupingSets(vec![vec![]]);
+            }
+        }
+    }
     for table in &select.from {
         for join in &table.joins {
             check_join(&join.join_operator)?;
@@ -380,6 +704,7 @@ fn rewrite_select(select: &mut Select) -> Result<(), GlauxSqlError> {
     naming::name_nested_select(select);
     for item in &mut select.projection {
         if let SelectItem::ExprWithAlias { alias, .. } = item {
+            check_alias_quoting(alias.clone())?;
             fold_ident(alias);
         }
     }
@@ -435,6 +760,14 @@ fn check_join(operator: &JoinOperator) -> Result<(), GlauxSqlError> {
             "not Trino syntax; write the join condition with ON or USING",
         ));
     }
+    if matches!(constraint, JoinConstraint::None) && !matches!(operator, JoinOperator::CrossJoin(_))
+    {
+        return Err(GlauxSqlError::unsupported(
+            "JOIN without ON or USING",
+            "not Trino syntax (DataFusion would run it as a cross join); write CROSS JOIN or \
+             a join condition",
+        ));
+    }
     Ok(())
 }
 
@@ -452,6 +785,24 @@ fn default_call_nulls_last(f: &mut Function) -> Result<(), GlauxSqlError> {
     if let FunctionArguments::List(list) = &mut f.args {
         for clause in &mut list.clauses {
             if let FunctionArgumentClause::OrderBy(items) = clause {
+                // `array_agg(x ORDER BY y) OVER (...)` is valid Trino, but
+                // DataFusion's window executor ignores the aggregate's own
+                // ORDER BY and refuses to plan it ("Aggregate ORDER BY is
+                // not implemented for window functions"), so the construct
+                // is refused by name rather than left to leak DataFusion's
+                // wording as a syntax error.
+                if f.over.is_some() {
+                    return Err(GlauxSqlError::unsupported(
+                        "aggregate ORDER BY inside a window function",
+                        format!(
+                            "`{}(... ORDER BY ...) OVER (...)` is valid Trino, but glaux's \
+                             engine cannot order an aggregate's input inside a window frame. \
+                             Sort in a derived table, or drop the ORDER BY when the aggregate \
+                             does not depend on it",
+                            f.name
+                        ),
+                    ));
+                }
                 default_nulls_last(items)?;
             }
         }
@@ -459,24 +810,36 @@ fn default_call_nulls_last(f: &mut Function) -> Result<(), GlauxSqlError> {
     Ok(())
 }
 
-/// Refuse `TIMESTAMP '... <zone>'` literals: DataFusion would silently
-/// convert the instant to UTC and drop the zone, while `AT TIME ZONE` and
-/// zoned arithmetic are refused, so the value could never be interpreted
-/// the way the query meant it.
-fn check_typed_string(typed: &TypedString) -> Result<(), GlauxSqlError> {
+/// Typed literals. `TIMESTAMP '...'` and `DATE '...'` go through glaux's
+/// strict parsers (DataFusion's would accept zone suffixes, `T` separators,
+/// and trailing time parts Trino rejects, and would overflow on years
+/// outside Arrow's nanosecond window); `DECIMAL '1.5'` becomes the
+/// `decimal(2,1)` literal Trino types it as (DataFusion would make it
+/// `decimal(38,10)`); zoned timestamp / time literals and every other typed
+/// literal are refused by name.
+fn rewrite_typed_string(expr: &mut Expr) -> Result<(), GlauxSqlError> {
+    let Expr::TypedString(typed) = expr else {
+        unreachable!("rewrite_typed_string called on a non-typed-string expression");
+    };
+    let text = match &typed.value.value {
+        Value::SingleQuotedString(s) => s.clone(),
+        other => {
+            return Err(GlauxSqlError::unsupported(
+                format!("{} literal", typed.data_type),
+                format!("`{other}` is not a single-quoted string"),
+            ));
+        }
+    };
     let zoned_type = matches!(
         typed.data_type,
         DataType::Timestamp(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz)
             | DataType::Time(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz)
     );
-    let text = match &typed.value.value {
-        Value::SingleQuotedString(s) => s.as_str(),
-        _ => "",
+    let has_zone_suffix = match typed.data_type {
+        DataType::Timestamp(..) => parse_trino_timestamp(&text).is_some_and(|p| p.has_zone),
+        DataType::Time(..) => literal_has_zone(&text),
+        _ => false,
     };
-    let has_zone_suffix = matches!(
-        typed.data_type,
-        DataType::Timestamp(..) | DataType::Time(..)
-    ) && literal_has_zone(text);
     if zoned_type || has_zone_suffix {
         return Err(GlauxSqlError::unsupported(
             "timestamp with time zone literal",
@@ -486,7 +849,89 @@ fn check_typed_string(typed: &TypedString) -> Result<(), GlauxSqlError> {
             ),
         ));
     }
-    Ok(())
+    match &typed.data_type {
+        DataType::Timestamp(precision, _) => {
+            if let Some(p) = precision
+                && *p != 3
+            {
+                return Err(GlauxSqlError::unsupported(
+                    format!("TIMESTAMP({p}) literal"),
+                    "glaux only carries timestamp(3), Athena's precision",
+                ));
+            }
+            *expr = func("trino_timestamp_literal", vec![str_lit(&text)]);
+            Ok(())
+        }
+        DataType::Date => {
+            *expr = func("trino_date", vec![str_lit(&text)]);
+            Ok(())
+        }
+        DataType::Time(..) => Ok(()),
+        DataType::Decimal(_) | DataType::Numeric(_) | DataType::Dec(_) => {
+            *expr = decimal_literal(&text).map_err(|why| {
+                GlauxSqlError::unsupported(
+                    "DECIMAL literal",
+                    match why {
+                        DecimalLiteralError::NotANumber => format!(
+                            "`{typed}` is not a plain decimal number (digits with an optional \
+                             sign and point)"
+                        ),
+                        DecimalLiteralError::TooManyDigits(digits) => {
+                            format!("`{typed}` has {digits} digits; Trino decimals hold at most 38")
+                        }
+                    },
+                )
+            })?;
+            Ok(())
+        }
+        other => Err(GlauxSqlError::unsupported(
+            format!("{other} literal"),
+            format!(
+                "`{typed}`: typed literals other than DATE, TIME, TIMESTAMP, and DECIMAL are not supported"
+            ),
+        )),
+    }
+}
+
+/// `DECIMAL 'text'` → `CAST('text' AS DECIMAL(p, s))` with Trino's
+/// precision (all digits, ignoring leading zeros, at least 1) and scale
+/// (digits after the point). `None` when the text is not a decimal number.
+fn decimal_literal(text: &str) -> Result<Expr, DecimalLiteralError> {
+    let trimmed = text.trim();
+    let unsigned = trimmed.strip_prefix(['-', '+']).unwrap_or(trimmed);
+    let (int_part, frac_part) = match unsigned.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (unsigned, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty()
+        || !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(DecimalLiteralError::NotANumber);
+    }
+    let digits = decimal_digits(int_part, frac_part);
+    let scale = frac_part.len() as i64;
+    if digits > 38 {
+        return Err(DecimalLiteralError::TooManyDigits(digits));
+    }
+    Ok(cast_to(
+        str_lit(trimmed),
+        DataType::Decimal(ExactNumberInfo::PrecisionAndScale(digits as u64, scale)),
+    ))
+}
+
+/// Why a `DECIMAL '...'` literal could not be typed.
+enum DecimalLiteralError {
+    /// Not digits with an optional sign and point.
+    NotANumber,
+    /// More significant digits than a Trino decimal holds.
+    TooManyDigits(usize),
+}
+
+/// Trino's precision for a decimal literal: significant integer digits plus
+/// every fractional digit, at least one.
+fn decimal_digits(int_part: &str, frac_part: &str) -> usize {
+    (int_part.trim_start_matches('0').len() + frac_part.len()).max(1)
 }
 
 /// Whether a timestamp / time literal text has a trailing zone (`Z`, an
@@ -780,7 +1225,7 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
         Expr::Identifier(id)
             if id.quote_style.is_none() && id.value.eq_ignore_ascii_case("localtimestamp") =>
         {
-            *expr = func("now", vec![]);
+            *expr = func("trino_timestamp", vec![func("now", vec![])]);
             Ok(())
         }
         Expr::Identifier(id) => {
@@ -797,9 +1242,98 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             let Value::Number(text, _) = &v.value else {
                 unreachable!()
             };
-            *expr = cast_to(str_lit(text), double());
+            // The same `trino_double` shim a written-out `CAST(... AS
+            // DOUBLE)` becomes, so the plan never carries a bare
+            // `CAST(<varchar literal> AS DOUBLE)` that glaux cannot tell
+            // apart from one DataFusion's own coercion inserted.
+            *expr = func("trino_double", vec![str_lit(text)]);
             Ok(())
         }
+        // An integer literal beyond bigint is a *parse* error in Trino, not a
+        // decimal. Its grammar has one production for a digits-only token
+        // (`number : MINUS? INTEGER_VALUE #integerLiteral`), `AstBuilder`
+        // turns it into a `LongLiteral`, and that constructor parses with
+        // `Long.parseLong` and raises `Invalid numeric literal: ...` when it
+        // does not fit; the `#decimalLiteral` production needs a decimal
+        // point. glaux relies on exactly that rule for the (correct)
+        // `-9223372036854775808` → bigint fold, so it has to hold here too.
+        // Handing back a `decimal(20,0)` value would be a value where Athena
+        // refuses the query.
+        Expr::Value(v) if is_oversized_integer_literal(&v.value) => {
+            let Value::Number(text, _) = &v.value else {
+                unreachable!()
+            };
+            let digits = decimal_digits(text.trim_start_matches(['-', '+']), "");
+            let hint = if digits > 38 {
+                "and it has more digits than a Trino decimal holds, so DECIMAL '...' will not \
+                 carry it either"
+                    .to_string()
+            } else {
+                format!("write DECIMAL '{text}' for a decimal of that value")
+            };
+            Err(GlauxSqlError::Parse {
+                message: format!(
+                    "Invalid numeric literal: {text} — Trino reads a digits-only literal as a \
+                     bigint and has no production taking it to a decimal, so a value beyond \
+                     bigint is refused at parse time; {hint}"
+                ),
+            })
+        }
+        Expr::Value(v) if matches!(v.value, Value::HexStringLiteral(_)) => {
+            Err(GlauxSqlError::unsupported(
+                "binary literal",
+                "`0x1F` is not Trino syntax and `X'1F'` varbinary literals are not supported in v0.1",
+            ))
+        }
+        // Under a dialect without lambda support `x -> ...` reads as the
+        // PostgreSQL `->` operator; name the construct Trino users mean.
+        Expr::BinaryOp {
+            op: BinaryOperator::Arrow,
+            ..
+        } => Err(GlauxSqlError::unsupported(
+            "lambda expression",
+            "`x -> ...` arguments are not translated; express the logic with explicit SQL",
+        )),
+        // `interval * n` / `interval / n` are valid Trino (an interval
+        // result, which glaux cannot return in v0.1); DataFusion's planner
+        // would fail with an unnamed `Cannot get result type for temporal
+        // operation` error, so they are refused by name here.
+        Expr::BinaryOp { left, op, right }
+            if matches!(op, BinaryOperator::Multiply | BinaryOperator::Divide)
+                && (is_interval_operand(left) || is_interval_operand(right)) =>
+        {
+            Err(GlauxSqlError::unsupported(
+                "interval * n",
+                "multiplying or dividing an interval produces an INTERVAL in Trino, which glaux \
+                 cannot return in v0.1; use date_add with a computed count instead",
+            ))
+        }
+        Expr::BinaryOp { op, .. }
+            if !matches!(
+                op,
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+                    | BinaryOperator::StringConcat
+                    | BinaryOperator::Gt
+                    | BinaryOperator::Lt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::And
+                    | BinaryOperator::Or
+            ) =>
+        {
+            Err(GlauxSqlError::unsupported(
+                format!("operator {op}"),
+                "not a Trino operator (Trino has no bitwise, regex-match, or PostgreSQL \
+                 operators; use the equivalent function: bitwise_and, regexp_like, ...)",
+            ))
+        }
+        Expr::Interval(interval) => check_interval(interval),
         Expr::Cast {
             kind: CastKind::DoubleColon,
             ..
@@ -816,7 +1350,7 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
         )),
         Expr::Cast { .. } => rewrite_cast(expr),
         Expr::Extract { .. } => rewrite_extract(expr),
-        Expr::TypedString(typed) => check_typed_string(typed),
+        Expr::TypedString(_) => rewrite_typed_string(expr),
         Expr::Array(array) if !array.named => Err(GlauxSqlError::unsupported(
             "[...] array literal",
             "`[1, 2]` is not Trino syntax; use ARRAY[1, 2]",
@@ -851,6 +1385,30 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             *expr = func("trino_substr", args);
             Ok(())
         }
+        Expr::Trim {
+            expr: source,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => {
+            if trim_characters.is_some() {
+                return Err(GlauxSqlError::unsupported(
+                    "TRIM(x, chars)",
+                    "not Trino syntax; use TRIM(BOTH chars FROM x)",
+                ));
+            }
+            let name = match trim_where {
+                None | Some(TrimWhereField::Both) => "trino_trim",
+                Some(TrimWhereField::Leading) => "trino_ltrim",
+                Some(TrimWhereField::Trailing) => "trino_rtrim",
+            };
+            let mut args = vec![take(source)];
+            if let Some(what) = trim_what.take() {
+                args.push(*what);
+            }
+            *expr = func(name, args);
+            Ok(())
+        }
         Expr::Position { expr: needle, r#in } => {
             let args = vec![take(r#in), take(needle)];
             *expr = cast_to(func("strpos", args), bigint());
@@ -880,6 +1438,88 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             *expr = current;
             Ok(())
         }
+        // sqlparser reads `ceil(x)` / `floor(x)` into dedicated nodes (for
+        // the `CEIL(x TO unit)` syntax), so they never reach the function
+        // registry; route them to the Trino UDFs here.
+        Expr::Ceil { .. } | Expr::Floor { .. } => {
+            let name = if matches!(expr, Expr::Ceil { .. }) {
+                "ceil"
+            } else {
+                "floor"
+            };
+            let (Expr::Ceil { expr: inner, field } | Expr::Floor { expr: inner, field }) = expr
+            else {
+                unreachable!()
+            };
+            if !matches!(
+                field,
+                CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)
+            ) {
+                return Err(GlauxSqlError::unsupported(
+                    format!("{}(x TO unit) / {}(x, scale)", name.to_uppercase(), name),
+                    "not Trino syntax; use date_trunc or round",
+                ));
+            }
+            let arg = take(inner);
+            *expr = func(&format!("trino_{name}"), vec![arg]);
+            Ok(())
+        }
+        Expr::Like {
+            any,
+            pattern,
+            escape_char,
+            ..
+        } => {
+            if *any {
+                return Err(GlauxSqlError::unsupported(
+                    "LIKE ANY",
+                    "not Trino syntax; combine LIKE predicates with OR",
+                ));
+            }
+            rewrite_like_pattern(pattern, escape_char.take())
+        }
+        Expr::IsTrue(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotFalse(_)
+        | Expr::IsUnknown(_)
+        | Expr::IsNotUnknown(_) => {
+            let form = match expr {
+                Expr::IsTrue(_) => "IS TRUE",
+                Expr::IsNotTrue(_) => "IS NOT TRUE",
+                Expr::IsFalse(_) => "IS FALSE",
+                Expr::IsNotFalse(_) => "IS NOT FALSE",
+                Expr::IsUnknown(_) => "IS UNKNOWN",
+                _ => "IS NOT UNKNOWN",
+            };
+            Err(GlauxSqlError::unsupported(
+                form,
+                "not Trino syntax (its predicates are IS [NOT] NULL and IS [NOT] DISTINCT \
+                 FROM); write `x = true`, `coalesce(x, false)`, `x IS NULL`, ... instead",
+            ))
+        }
+        Expr::IsNormalized { .. } => Err(GlauxSqlError::unsupported(
+            "IS NORMALIZED",
+            "not Trino syntax; use normalize(x) = x",
+        )),
+        Expr::ILike { .. } => Err(GlauxSqlError::unsupported(
+            "ILIKE",
+            "not Trino syntax; use lower(x) LIKE lower(pattern)",
+        )),
+        Expr::SimilarTo { .. } | Expr::RLike { .. } => Err(GlauxSqlError::unsupported(
+            "SIMILAR TO / RLIKE",
+            "not Trino syntax; use regexp_like",
+        )),
+        // A scalar subquery over a non-nullable source (`VALUES`, a
+        // literal, a NOT NULL column) is NULL when it returns no rows, but
+        // DataFusion carries the source's nullability into the output
+        // schema and fails at execution (`declared as non-nullable but
+        // contains null values`). The wrapper declares a nullable result.
+        Expr::Subquery(_) => {
+            let subquery = take(expr);
+            *expr = func("trino_nullable", vec![subquery]);
+            Ok(())
+        }
         Expr::Lambda(_) => Err(GlauxSqlError::unsupported(
             "lambda expression",
             "`x -> ...` arguments are not translated; express the logic with explicit SQL",
@@ -898,8 +1538,244 @@ fn rewrite_expr(expr: &mut Expr) -> Result<(), GlauxSqlError> {
     }
 }
 
+/// Trino interval literals are `INTERVAL '<n>' <unit>` with a whole number
+/// (a decimal fraction is allowed for `SECOND`); the unit is mandatory.
+/// DataFusion also accepts PostgreSQL strings (`INTERVAL '1 day'`, `'1
+/// hour 30 minutes'`) and the range forms (`'1-2' YEAR TO MONTH`), which
+/// glaux refuses by name.
+fn check_interval(interval: &sqlparser::ast::Interval) -> Result<(), GlauxSqlError> {
+    let text = match interval.value.as_ref() {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(s) => s.clone(),
+            other => {
+                return Err(GlauxSqlError::Parse {
+                    message: format!(
+                        "INTERVAL {other}: the interval value must be a quoted string \
+                         (INTERVAL '1' DAY)"
+                    ),
+                });
+            }
+        },
+        other => {
+            return Err(GlauxSqlError::Parse {
+                message: format!(
+                    "INTERVAL {other}: the interval value must be a string literal (INTERVAL \
+                     '1' DAY)"
+                ),
+            });
+        }
+    };
+    let Some(unit) = &interval.leading_field else {
+        return Err(GlauxSqlError::unsupported(
+            "PostgreSQL interval string",
+            format!(
+                "INTERVAL '{text}' has no unit; Trino requires INTERVAL '<n>' DAY / HOUR / \
+                 MINUTE / SECOND / MONTH / YEAR"
+            ),
+        ));
+    };
+    if let Some(to) = &interval.last_field {
+        return Err(GlauxSqlError::unsupported(
+            format!("INTERVAL ... {unit} TO {to}"),
+            "interval range literals (YEAR TO MONTH, DAY TO SECOND, ...) are not supported in \
+             v0.1; add the parts separately",
+        ));
+    }
+    if interval.leading_precision.is_some() || interval.fractional_seconds_precision.is_some() {
+        return Err(GlauxSqlError::unsupported(
+            "INTERVAL with precision",
+            "`INTERVAL '1' SECOND(3)` is not Trino syntax",
+        ));
+    }
+    let allowed = matches!(
+        unit,
+        DateTimeField::Year
+            | DateTimeField::Month
+            | DateTimeField::Day
+            | DateTimeField::Hour
+            | DateTimeField::Minute
+            | DateTimeField::Second
+    );
+    if !allowed {
+        return Err(GlauxSqlError::unsupported(
+            format!("INTERVAL ... {unit}"),
+            "Trino interval units are YEAR, MONTH, DAY, HOUR, MINUTE, SECOND",
+        ));
+    }
+    let body = text.trim();
+    let unsigned = body.strip_prefix(['-', '+']).unwrap_or(body);
+    let (int_part, frac_part) = match unsigned.split_once('.') {
+        Some((i, f)) if matches!(unit, DateTimeField::Second) => (i, Some(f)),
+        Some(_) => {
+            return Err(GlauxSqlError::Parse {
+                message: format!(
+                    "Invalid INTERVAL {unit} value: '{text}' (a fraction is only \
+                     allowed for SECOND)"
+                ),
+            });
+        }
+        None => (unsigned, None),
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(int_part) || frac_part.is_some_and(|f| !digits(f)) {
+        return Err(GlauxSqlError::Parse {
+            message: format!(
+                "Invalid INTERVAL {unit} value: '{text}' (Trino expects a whole number, as in \
+                 INTERVAL '1' {unit}; PostgreSQL strings such as '1 day' are not accepted)"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// `LIKE` patterns: Trino has no default escape character, so `\` is a
+/// literal backslash unless an `ESCAPE` clause names it; DataFusion (and
+/// Arrow) always treat `\` as the escape. A literal pattern is rewritten so
+/// DataFusion's backslash-escaped form means what Trino's pattern meant:
+/// every backslash is doubled, and with an `ESCAPE` clause the escape
+/// sequences (`#%`, `#_`, `##`) become `\%`, `\_`, `#`; any other use of
+/// the escape character is an error, as in Trino. Computed patterns get the
+/// same backslash doubling from the `TrinoSemantics` analyzer, once their
+/// type is known.
+fn rewrite_like_pattern(
+    pattern: &mut Expr,
+    escape: Option<sqlparser::ast::ValueWithSpan>,
+) -> Result<(), GlauxSqlError> {
+    let escape = match escape {
+        None => None,
+        Some(v) => match &v.value {
+            Value::SingleQuotedString(e) => {
+                let mut chars = e.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => Some(c),
+                    _ => {
+                        return Err(GlauxSqlError::invalid_arguments(
+                            "LIKE",
+                            format!("Escape string must be a single character, got {e:?}"),
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(GlauxSqlError::invalid_arguments(
+                    "LIKE",
+                    format!("the ESCAPE clause must be a string literal, got {other}"),
+                ));
+            }
+        },
+    };
+    let literal = match pattern {
+        Expr::Value(v) => match &v.value {
+            Value::SingleQuotedString(p) => Some(p.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    match (literal, escape) {
+        (Some(text), escape) => {
+            *pattern = str_lit(&translate_like_pattern(&text, escape)?);
+        }
+        (None, None) => {
+            // A computed pattern (or a non-varchar literal) is left for the
+            // plan-level passes, where its type is known: the strict
+            // checker refuses non-varchar patterns with Trino's diagnostic,
+            // and the `TrinoSemantics` analyzer doubles the backslashes of
+            // varchar patterns at run time.
+        }
+        (None, Some(_)) => {
+            return Err(GlauxSqlError::unsupported(
+                "LIKE ... ESCAPE with a non-literal pattern",
+                "the pattern must be a string literal for glaux to translate the escape \
+                 character",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Translate a Trino `LIKE` pattern (with optional escape character) to
+/// DataFusion's backslash-escaped form.
+fn translate_like_pattern(pattern: &str, escape: Option<char>) -> Result<String, GlauxSqlError> {
+    let mut out = String::with_capacity(pattern.len() + 4);
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if Some(c) == escape {
+            match chars.next() {
+                Some(next @ ('%' | '_')) => {
+                    out.push('\\');
+                    out.push(next);
+                }
+                Some(next) if next == c => {
+                    if c == '\\' {
+                        out.push_str("\\\\");
+                    } else {
+                        out.push(c);
+                    }
+                }
+                _ => {
+                    return Err(GlauxSqlError::invalid_arguments(
+                        "LIKE",
+                        format!(
+                            "Escape character must be followed by '%', '_' or the escape \
+                             character itself (pattern {pattern:?}, escape {c:?})"
+                        ),
+                    ));
+                }
+            }
+        } else if c == '\\' {
+            out.push_str("\\\\");
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// Trino's grammar reads `-<digits>` as one literal (`MINUS? INTEGER_VALUE`),
+/// so `-9223372036854775808` is a `bigint` and `-9223372036854775808 - 1`
+/// overflows. sqlparser reads a unary minus applied to the unsigned
+/// literal, which glaux would type as `decimal(19,0)` (the magnitude is
+/// beyond bigint) before the minus is seen. Folded before the children are
+/// visited so the literal rules see the signed text.
+fn fold_negative_integer_literal(expr: &mut Expr) {
+    if let Expr::UnaryOp {
+        op: UnaryOperator::Minus,
+        expr: inner,
+    } = expr
+        && let Expr::Value(v) = inner.as_ref()
+        && let Value::Number(text, long) = &v.value
+        && !text.contains(['e', 'E', '.'])
+        && !text.starts_with(['-', '+'])
+    {
+        let folded = Value::Number(format!("-{text}"), *long).with_span(v.span);
+        *expr = Expr::Value(folded);
+    }
+}
+
+/// Whether an operand is an interval literal (possibly parenthesised).
+fn is_interval_operand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Interval(_) => true,
+        Expr::Nested(inner) => is_interval_operand(inner),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus | UnaryOperator::Minus,
+            expr: inner,
+        } => is_interval_operand(inner),
+        _ => false,
+    }
+}
+
 fn is_exponent_literal(value: &Value) -> bool {
     matches!(value, Value::Number(text, _) if text.contains(['e', 'E']))
+}
+
+/// A plain integer literal that does not fit in a signed 64-bit integer.
+fn is_oversized_integer_literal(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Number(text, _)
+            if !text.contains(['e', 'E', '.']) && text.parse::<i64>().is_err()
+    )
 }
 
 fn is_row_or_map(data_type: &DataType) -> bool {
@@ -941,21 +1817,97 @@ fn rewrite_cast(expr: &mut Expr) -> Result<(), GlauxSqlError> {
         | DataType::Integer(_)
         | DataType::SmallInt(_)
         | DataType::TinyInt(_) => {
-            // Rounds floating/decimal operands half away from zero and
-            // leaves every other type alone; the Arrow cast then sees
-            // integral values only. Applied once even if the same node is
-            // visited again.
-            if !matches!(inner.as_ref(), Expr::Function(f) if f.name.to_string() == "trino_round_for_cast")
+            // Rounds floating/decimal operands half away from zero, checks
+            // a varchar operand against Java's `Long.parseLong` grammar,
+            // and leaves every other type alone; the Arrow cast then sees
+            // only values Trino would accept. Applied once even if the same
+            // node is visited again.
+            let target = match data_type {
+                DataType::BigInt(_) => "bigint",
+                DataType::SmallInt(_) => "smallint",
+                DataType::TinyInt(_) => "tinyint",
+                _ => "integer",
+            };
+            let name = match kind {
+                CastKind::TryCast => "trino_try_round_for_cast",
+                _ => "trino_round_for_cast",
+            };
+            if !matches!(inner.as_ref(), Expr::Function(f)
+                if matches!(f.name.to_string().as_str(),
+                    "trino_round_for_cast" | "trino_try_round_for_cast"))
             {
                 let operand = take(inner);
-                **inner = func("trino_round_for_cast", vec![operand]);
+                **inner = func(name, vec![operand, str_lit(target)]);
             }
             Ok(())
         }
-        DataType::Varchar(length)
-        | DataType::CharacterVarying(length)
-        | DataType::Char(length)
-        | DataType::Character(length) => {
+        DataType::JSON | DataType::JSONB => Err(GlauxSqlError::unsupported(
+            "CAST(... AS JSON)",
+            "glaux carries Trino's JSON type as the varchar holding its text, and Trino's \
+             `CAST(x AS JSON)` does not mean \"the text\": it builds the JSON *value* for x, so \
+             `CAST('abc' AS JSON)` is the JSON string `\"abc\"` and casting a column of JSON \
+             documents wraps each document in quotes. Returning the text would be a different \
+             answer from Athena's. Use json_parse(x) to read a document, json_format(x) to write \
+             one, and json_extract / json_extract_scalar to read inside it",
+        )),
+        DataType::Char(_) | DataType::Character(_) => Err(GlauxSqlError::unsupported(
+            "CAST(... AS CHAR(n))",
+            "Trino's CHAR type pads to n characters and compares ignoring trailing spaces; \
+             glaux does not model it. Use VARCHAR(n)",
+        )),
+        DataType::Timestamp(precision, TimezoneInfo::None) => {
+            if let Some(p) = precision
+                && *p != 3
+            {
+                return Err(GlauxSqlError::unsupported(
+                    format!("CAST(... AS TIMESTAMP({p}))"),
+                    "glaux only carries timestamp(3), Athena's precision",
+                ));
+            }
+            let name = match kind {
+                CastKind::TryCast => "trino_try_timestamp",
+                _ => "trino_timestamp",
+            };
+            *expr = func(name, vec![take(inner)]);
+            Ok(())
+        }
+        DataType::Timestamp(_, _)
+        | DataType::Time(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => {
+            Err(GlauxSqlError::unsupported(
+                "CAST(... AS TIMESTAMP WITH TIME ZONE)",
+                "time-zone aware casts are not supported in v0.1",
+            ))
+        }
+        DataType::Date => {
+            let name = match kind {
+                CastKind::TryCast => "trino_try_date",
+                _ => "trino_date",
+            };
+            *expr = func(name, vec![take(inner)]);
+            Ok(())
+        }
+        DataType::Boolean | DataType::Bool => {
+            let name = match kind {
+                CastKind::TryCast => "trino_try_boolean",
+                _ => "trino_boolean",
+            };
+            *expr = func(name, vec![take(inner)]);
+            Ok(())
+        }
+        DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => {
+            let (precision, scale) = match info {
+                ExactNumberInfo::None => (38, 0),
+                ExactNumberInfo::Precision(p) => (*p as i64, 0),
+                ExactNumberInfo::PrecisionAndScale(p, s) => (*p as i64, *s),
+            };
+            let name = match kind {
+                CastKind::TryCast => "trino_try_to_decimal",
+                _ => "trino_to_decimal",
+            };
+            *expr = func(name, vec![take(inner), num_lit(precision), num_lit(scale)]);
+            Ok(())
+        }
+        DataType::Varchar(length) | DataType::CharacterVarying(length) => {
             let limit = match length {
                 None | Some(CharacterLength::Max) => None,
                 Some(CharacterLength::IntegerLength { length, .. }) => Some(*length),
@@ -964,15 +1916,35 @@ fn rewrite_cast(expr: &mut Expr) -> Result<(), GlauxSqlError> {
             if let Some(n) = limit {
                 args.push(num_lit(n as i64));
             }
-            // TRY_CAST(x AS VARCHAR) cannot fail for castable types; the
-            // type errors it would mask are refused at plan time either way.
-            let _ = kind;
-            *expr = func("trino_varchar", args);
+            // TRY_CAST matters for bounded targets: a non-varchar value whose
+            // text exceeds `n` is an error under CAST and NULL under TRY_CAST.
+            let name = match kind {
+                CastKind::TryCast => "trino_try_varchar",
+                _ => "trino_varchar",
+            };
+            *expr = func(name, args);
             Ok(())
         }
         DataType::String(_) | DataType::Text => {
             *expr = func("trino_varchar", vec![take(inner)]);
             Ok(())
+        }
+        DataType::Double(_) | DataType::DoublePrecision | DataType::Real => {
+            let real = matches!(data_type, DataType::Real);
+            let name = match (kind, real) {
+                (CastKind::TryCast, false) => "trino_try_double",
+                (CastKind::TryCast, true) => "trino_try_real",
+                (_, false) => "trino_double",
+                (_, true) => "trino_real",
+            };
+            *expr = func(name, vec![take(inner)]);
+            Ok(())
+        }
+        DataType::Float(_) | DataType::Float4 | DataType::Float8 | DataType::Float64 => {
+            Err(GlauxSqlError::unsupported(
+                format!("CAST(... AS {data_type})"),
+                "not a Trino type name; use DOUBLE or REAL",
+            ))
         }
         _ => Ok(()),
     }
@@ -1064,16 +2036,90 @@ fn rewrite_function(expr: &mut Expr) -> Result<(), GlauxSqlError> {
     Ok(())
 }
 
+/// The window offset arguments Trino validates (`LeadFunction` /
+/// `NthValueFunction` / `NtileFunction` raise `INVALID_FUNCTION_ARGUMENT`)
+/// but DataFusion silently reinterprets: `lead(x, -1)` runs as `lag`,
+/// `lead(x, NULL)` returns `x`, `nth_value(x, 0)` returns NULL, `ntile(0)`
+/// fails with the wrong error code. Validated here on the literal; a
+/// non-literal offset is refused, because it could only be validated row by
+/// row at execution.
+fn check_window_offset(name: &str, f: &Function) -> Result<(), GlauxSqlError> {
+    let (index, minimum) = match name {
+        "lead" | "lag" => (1, 0),
+        "nth_value" => (1, 1),
+        "ntile" => (0, 1),
+        _ => return Ok(()),
+    };
+    let FunctionArguments::List(list) = &f.args else {
+        return Ok(());
+    };
+    let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(offset))) = list.args.get(index) else {
+        return Ok(());
+    };
+    let what = if name == "ntile" { "Buckets" } else { "Offset" };
+    match offset {
+        Expr::Value(v) => match &v.value {
+            Value::Number(text, _) => match text.parse::<i64>() {
+                Ok(n) if n >= minimum => Ok(()),
+                Ok(_) => Err(GlauxSqlError::invalid_arguments(
+                    name,
+                    format!("{what} must be at least {minimum}"),
+                )),
+                Err(_) => Err(GlauxSqlError::invalid_arguments(
+                    name,
+                    format!("{what} must be an integer, got {text}"),
+                )),
+            },
+            Value::Null => Err(GlauxSqlError::invalid_arguments(
+                name,
+                format!("{what} must not be null"),
+            )),
+            other => Err(GlauxSqlError::invalid_arguments(
+                name,
+                format!("{what} must be an integer literal, got {other}"),
+            )),
+        },
+        _ => Err(GlauxSqlError::invalid_arguments(
+            name,
+            format!(
+                "the {} argument must be an integer literal (glaux validates it at translation, \
+                 where Trino would check every row at execution)",
+                what.to_lowercase()
+            ),
+        )),
+    }
+}
+
 /// Passthroughs whose Trino overloads go beyond what DataFusion implements.
 fn check_passthrough_arity(name: &str, f: &Function) -> Result<(), GlauxSqlError> {
+    check_window_offset(name, f)?;
     let count = match &f.args {
         FunctionArguments::List(list) => list.args.len(),
         _ => return Ok(()),
     };
+    // Trino declares only `count()` and `count(x)`; `count(DISTINCT a, b)`
+    // is an unknown overload there. DataFusion answers "This feature is not
+    // implemented: COUNT DISTINCT with multiple arguments", which reads as
+    // a glaux TODO rather than a refusal Athena would make too.
+    if name == "count" && count > 1 {
+        return Err(GlauxSqlError::type_mismatch(format!(
+            "Unexpected parameters ({count} arguments) for function count. Expected: count(), \
+             count(t)"
+        )));
+    }
     match (name, count) {
         ("strpos", 3) => Err(GlauxSqlError::invalid_arguments(
             name,
             "the 3-argument form strpos(string, substring, instance) is not supported",
+        )),
+        // Trino has only `log(base, x)`; DataFusion's one-argument `log`
+        // is `log10`.
+        ("log", n) if n != 2 => Err(GlauxSqlError::invalid_arguments(
+            name,
+            format!(
+                "Unexpected parameters ({n} argument(s)) for function log: Trino has only \
+                 log(base, x); use log10(x), log2(x), or ln(x)"
+            ),
         )),
         _ => Ok(()),
     }
@@ -1093,7 +2139,7 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
                      arrays of percentages)",
                 ));
             }
-            rename(f, "approx_percentile_cont");
+            rename(f, "trino_approx_percentile");
             return Ok(None);
         }
         "arbitrary" => {
@@ -1135,14 +2181,35 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             case_when(cond, then, it.next())
         }
         // String
-        "codepoint" => return simple_rename("ascii", &[1]),
+        "codepoint" => return simple_rename("trino_codepoint", &[1]),
+        "trim" | "ltrim" | "rtrim" => {
+            if args.len() != 1 {
+                return Err(GlauxSqlError::invalid_arguments(
+                    name,
+                    format!(
+                        "{name} takes one argument in Trino; to strip specific characters use \
+                         TRIM({} 'chars' FROM x)",
+                        match name {
+                            "ltrim" => "LEADING",
+                            "rtrim" => "TRAILING",
+                            _ => "BOTH",
+                        }
+                    ),
+                ));
+            }
+            return simple_rename(&format!("trino_{name}"), &[1]);
+        }
+        "lpad" => return simple_rename("trino_lpad", &[3]),
+        "rpad" => return simple_rename("trino_rpad", &[3]),
+        "upper" => return simple_rename("trino_upper", &[1]),
+        "lower" => return simple_rename("trino_lower", &[1]),
         "replace" => {
             arity(name, &args, &[2, 3])?;
             let mut full = args.clone();
             if full.len() == 2 {
                 full.push(str_lit(""));
             }
-            func("replace", full)
+            func("trino_replace", full)
         }
         "levenshtein_distance" => return simple_rename("levenshtein", &[2]),
         "substr" | "substring" => return simple_rename("trino_substr", &[2, 3]),
@@ -1172,50 +2239,40 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
         // Regular expressions
         "regexp_replace" => {
             arity(name, &args, &[2, 3])?;
-            let mut it = args.into_iter();
-            let (s, p) = (it.next().unwrap(), it.next().unwrap());
-            let r = it.next().unwrap_or_else(|| str_lit(""));
-            if matches!(r, Expr::Lambda(_)) {
+            if matches!(args.get(2), Some(Expr::Lambda(_))) {
                 return Err(GlauxSqlError::unsupported(
                     "lambda expression",
                     "regexp_replace with a lambda replacement is not translated",
                 ));
             }
-            // Java replacement syntax ($1, \$) → Rust regex syntax.
-            let r = func("trino_regexp_replacement", vec![r]);
-            func("regexp_replace", vec![s, p, r, str_lit("g")])
+            return simple_rename("trino_regexp_replace", &[2, 3]);
         }
+        "regexp_like" => return simple_rename("trino_regexp_like", &[2]),
         "regexp_extract" => {
             arity(name, &args, &[2, 3])?;
-            let group = match args.get(2) {
-                Some(g) => integer_literal(name, "group", g)?,
-                None => 0,
-            };
-            let wrapped = match &args[1] {
-                Expr::Value(v) if matches!(v.value, Value::SingleQuotedString(_)) => {
-                    let Value::SingleQuotedString(p) = &v.value else {
-                        unreachable!()
-                    };
-                    str_lit(&format!("({p})"))
-                }
-                other => binary(
-                    binary(str_lit("("), BinaryOperator::StringConcat, other.clone()),
-                    BinaryOperator::StringConcat,
-                    str_lit(")"),
-                ),
-            };
+            if let Some(g) = args.get(2) {
+                integer_literal(name, "group", g)?;
+            }
+            return simple_rename("trino_regexp_extract", &[2, 3]);
+        }
+        // Date and time
+        "date" => return simple_rename("trino_date", &[1]),
+        // Trino's `current_timestamp` / `now()` are `timestamp(3) with time
+        // zone` (UTC on Athena); `localtimestamp` is a zone-less
+        // `timestamp(3)`. DataFusion's `now()` is nanosecond-precise.
+        "current_timestamp" | "now" => {
+            arity(name, &args, &[0])?;
             func(
-                "array_element",
+                "arrow_cast",
                 vec![
-                    func("regexp_match", vec![args[0].clone(), wrapped]),
-                    num_lit(group + 1),
+                    func("trino_timestamp_millis", vec![func("now", vec![])]),
+                    str_lit("Timestamp(Millisecond, Some(\"UTC\"))"),
                 ],
             )
         }
-        // Date and time
-        "date" => {
-            arity(name, &args, &[1])?;
-            cast_to(args.into_iter().next().unwrap(), DataType::Date)
+        "localtimestamp" => {
+            arity(name, &args, &[0])?;
+            func("trino_timestamp", vec![func("now", vec![])])
         }
         "date_parse" | "parse_datetime" => {
             arity(name, &args, &[2])?;
@@ -1225,7 +2282,30 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             } else {
                 joda_to_chrono(name, &fmt, Direction::Parse)?
             };
-            func("to_timestamp", vec![args[0].clone(), str_lit(&chrono)])
+            // `date_parse` is a zone-less `timestamp(3)`, which is what
+            // the UDF returns; `parse_datetime` is a `timestamp(3) with
+            // time zone` (UTC), so its result is re-tagged.
+            let target = "Timestamp(Millisecond, Some(\"UTC\"))";
+            // DataFusion's `to_timestamp` resolves the parsed fields with
+            // chrono, which drops the whole time of day when the format
+            // names an hour but no minute (or a 12-hour field with no
+            // AM/PM) and rolls a leap second over into the next minute.
+            // `trino_date_parse` follows Joda: epoch defaults for every
+            // field the format does not name, and a loud refusal for `:60`.
+            let parsed = func(
+                "trino_date_parse",
+                vec![
+                    args[0].clone(),
+                    str_lit(&chrono),
+                    str_lit(name),
+                    str_lit(&fmt),
+                ],
+            );
+            if name == "date_parse" {
+                parsed
+            } else {
+                func("arrow_cast", vec![parsed, str_lit(target)])
+            }
         }
         "date_format" | "format_datetime" => {
             arity(name, &args, &[2])?;
@@ -1237,7 +2317,6 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             };
             func("to_char", vec![args[0].clone(), str_lit(&chrono)])
         }
-        "localtimestamp" => return simple_rename("now", &[0]),
         "date_trunc" => return simple_rename("trino_date_trunc", &[2]),
         "from_unixtime" => {
             if args.len() > 1 {
@@ -1248,23 +2327,15 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
                 ));
             }
             arity(name, &args, &[1])?;
-            // Trino rounds to the millisecond (`from_unixtime(1.9999)` is
-            // `...:02.000`); a plain cast would truncate.
-            let millis = cast_to(
-                func(
-                    "round",
-                    vec![binary(
-                        args.into_iter().next().unwrap(),
-                        BinaryOperator::Multiply,
-                        num_lit(1000),
-                    )],
-                ),
-                bigint(),
-            );
-            func(
-                "arrow_cast",
-                vec![millis, str_lit("Timestamp(Millisecond, None)")],
-            )
+            // Trino rounds to the millisecond with Java's `Math.round`
+            // (`from_unixtime(1.9999)` is `...:02.000`, and the tie goes
+            // towards positive infinity: `from_unixtime(-0.0005)` is the
+            // epoch, not a millisecond before it), and returns a
+            // `timestamp(3) with time zone` at UTC — printed `... UTC` on
+            // Athena, like `parse_datetime` and `now()`. DataFusion's
+            // `round` rounds half away from zero, so the UDF does the
+            // rounding itself.
+            func("trino_from_unixtime", args)
         }
         "to_unixtime" => return simple_rename("trino_to_unixtime", &[1]),
         "year" | "month" | "day" | "day_of_month" | "hour" | "minute" | "second" | "quarter"
@@ -1283,6 +2354,17 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             day_of_week(args.into_iter().next().unwrap())
         }
         // Math
+        // Trino's two float constructors. glaux has no way to write a NaN
+        // or an infinite literal in the AST, and DataFusion's own parser
+        // has no such function; `trino_double` is glaux's `CAST(varchar AS
+        // DOUBLE)`, which follows Java's `Double.parseDouble` and so reads
+        // exactly `NaN` and `Infinity` (`-infinity()` is the negation).
+        "nan" | "infinity" => {
+            require_scalar_call(name, f)?;
+            arity(name, &args, &[0])?;
+            let text = if name == "nan" { "NaN" } else { "Infinity" };
+            func("trino_double", vec![str_lit(text)])
+        }
         "mod" => {
             require_scalar_call(name, f)?;
             arity(name, &args, &[2])?;
@@ -1293,7 +2375,34 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
                 it.next().unwrap(),
             )
         }
-        "ceiling" => return simple_rename("ceil", &[1]),
+        "ceiling" | "ceil" => return simple_rename("trino_ceil", &[1]),
+        "floor" => return simple_rename("trino_floor", &[1]),
+        "round" => return simple_rename("trino_round", &[1, 2]),
+        // Trino's `MathFunctions.log2` is literally `Math.log(num) /
+        // Math.log(2)`, not a base-2 logarithm routine, and the two differ
+        // by an ULP for inputs such as 3 and 100. DataFusion's `log2` is
+        // Rust's `f64::log2` intrinsic, so route the call through
+        // `log(2, x)` — DataFusion's two-argument `log` is `ln(x) /
+        // ln(base)`, the same expression Trino evaluates.
+        "log2" => {
+            arity(name, &args, &[1])?;
+            func(
+                "log",
+                vec![
+                    cast_to(num_lit(2), double()),
+                    cast_to(args.into_iter().next().unwrap(), double()),
+                ],
+            )
+        }
+        // Trino: power(x, p) → double, whatever the argument types;
+        // DataFusion keeps integer arguments integral.
+        "pow" | "power" => {
+            arity(name, &args, &[2])?;
+            func(
+                "trino_power",
+                args.into_iter().map(|a| cast_to(a, double())).collect(),
+            )
+        }
         // Trino: NULL if any argument is NULL; DataFusion skips NULLs.
         "greatest" | "least" => {
             require_scalar_call(name, f)?;
@@ -1319,29 +2428,29 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             )
         }
         "rand" => return simple_rename("random", &[0]),
-        "sign" => return simple_rename("signum", &[1]),
-        "truncate" => return simple_rename("trunc", &[1, 2]),
-        // Arrays
-        "array_join" => return simple_rename("array_to_string", &[2, 3]),
-        "array_position" => {
-            arity(name, &args, &[2])?;
-            let array = args[0].clone();
-            case_when(
-                Expr::IsNull(Box::new(array.clone())),
-                Expr::Value(Value::Null.with_empty_span()),
-                Some(func(
-                    "coalesce",
-                    vec![
-                        cast_to(
-                            func("array_position", vec![array, args[1].clone()]),
-                            bigint(),
-                        ),
-                        num_lit(0),
-                    ],
-                )),
-            )
+        // Trino has a bounded overload, `random(n) -> [0, n)`, that
+        // DataFusion's nullary `random()` does not; the draw itself stays
+        // DataFusion's.
+        "random" => {
+            arity(name, &args, &[0, 1])?;
+            match args.into_iter().next() {
+                Some(bound) => func("trino_random", vec![bound, func("random", vec![])]),
+                None => func("random", vec![]),
+            }
         }
-        "array_remove" => return simple_rename("array_remove_all", &[2]),
+        "sign" => return simple_rename("trino_sign", &[1]),
+        "sqrt" => return simple_rename("trino_sqrt", &[1]),
+        "truncate" => return simple_rename("trino_truncate", &[1, 2]),
+        // Arrays
+        "array_join" => return simple_rename("trino_array_join", &[2, 3]),
+        "array_max" => return simple_rename("trino_array_max", &[1]),
+        "array_min" => return simple_rename("trino_array_min", &[1]),
+        // The Rust UDF: NULL for a NULL array or element argument, 0 when
+        // absent, IEEE equality for float elements (DataFusion's
+        // `array_position` would return NULL when absent and treat NaN as
+        // equal to NaN).
+        "array_position" => return simple_rename("trino_array_position", &[2]),
+        "array_remove" => return simple_rename("trino_array_remove", &[2]),
         "array_sort" => {
             if args.len() == 2 {
                 return Err(GlauxSqlError::invalid_arguments(
@@ -1350,8 +2459,14 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
                 ));
             }
             arity(name, &args, &[1])?;
-            // Trino sorts NULL elements last; DataFusion's default is first.
-            let mut full = args;
+            // Trino sorts NULL elements last; DataFusion's default is
+            // first. Elements that are themselves arrays rank through
+            // Trino's array ordering operator, which refuses NULLs inside
+            // them, so the argument goes through the guard first.
+            let mut full = vec![func(
+                "trino_array_element_sort_key",
+                vec![args.into_iter().next().expect("arity checked")],
+            )];
             full.push(str_lit("ASC"));
             full.push(str_lit("NULLS LAST"));
             func("array_sort", full)
@@ -1421,7 +2536,7 @@ mod tests {
                 "SELECT arbitrary(x) AS a, every(b) AS e, approx_percentile(v, 0.9) AS p FROM t"
             )
             .unwrap(),
-            "SELECT first_value(x) AS a, bool_and(b) AS e, approx_percentile_cont(v, 0.9) AS p FROM t"
+            "SELECT first_value(x) AS a, bool_and(b) AS e, trino_approx_percentile(v, 0.9) AS p FROM t"
         );
     }
 
@@ -1443,18 +2558,20 @@ mod tests {
     }
 
     #[test]
-    fn regexp_shims_add_global_flag_and_group_wrapping() {
+    fn regexp_shims_route_to_the_checked_udfs() {
         assert_eq!(
-            rewrite("SELECT regexp_replace(s, 'a+') AS a, regexp_extract(s, '\\d+') AS b, regexp_extract(s, '(a)(b)', 2) AS c FROM t").unwrap(),
-            "SELECT regexp_replace(s, 'a+', trino_regexp_replacement(''), 'g') AS a, array_element(regexp_match(s, '(\\d+)'), 1) AS b, array_element(regexp_match(s, '((a)(b))'), 3) AS c FROM t"
+            rewrite("SELECT regexp_replace(s, 'a+') AS a, regexp_extract(s, '\\d+') AS b, regexp_extract(s, '(a)(b)', 2) AS c, regexp_like(s, 'x') AS d FROM t").unwrap(),
+            "SELECT trino_regexp_replace(s, 'a+') AS a, trino_regexp_extract(s, '\\d+') AS b, trino_regexp_extract(s, '(a)(b)', 2) AS c, trino_regexp_like(s, 'x') AS d FROM t"
         );
+        let err = rewrite("SELECT regexp_extract(s, 'x', n) FROM t").unwrap_err();
+        assert!(err.to_string().contains("integer literal"), "{err}");
     }
 
     #[test]
     fn date_functions_translate_formats_and_units() {
         assert_eq!(
-            rewrite("SELECT date_parse(s, '%Y-%m-%d %H:%i:%s') AS a, format_datetime(ts, 'yyyy-MM-dd') AS b FROM t").unwrap(),
-            "SELECT to_timestamp(s, '%Y-%m-%d %H:%M:%S') AS a, to_char(ts, '%Y-%m-%d') AS b FROM t"
+            rewrite("SELECT date_parse(s, '%Y-%m-%d %H:%i:%s') AS a, format_datetime(ts, 'yyyy-MM-dd') AS b, parse_datetime(s, 'yyyy') AS c FROM t").unwrap(),
+            "SELECT trino_date_parse(s, '%Y-%m-%d %H:%M:%S', 'date_parse', '%Y-%m-%d %H:%i:%s') AS a, to_char(ts, '%Y-%m-%d') AS b, arrow_cast(trino_date_parse(s, '%Y', 'parse_datetime', 'yyyy'), 'Timestamp(Millisecond, Some(\"UTC\"))') AS c FROM t"
         );
         assert_eq!(
             rewrite("SELECT day_of_week(d) AS a, month(d) AS b FROM t").unwrap(),
@@ -1462,7 +2579,7 @@ mod tests {
         );
         assert_eq!(
             rewrite("SELECT from_unixtime(t) AS a, to_unixtime(ts) AS b, date_trunc('day', ts) AS c FROM t").unwrap(),
-            "SELECT arrow_cast(CAST(round(t * 1000) AS BIGINT), 'Timestamp(Millisecond, None)') AS a, trino_to_unixtime(ts) AS b, trino_date_trunc('day', ts) AS c FROM t"
+            "SELECT trino_from_unixtime(t) AS a, trino_to_unixtime(ts) AS b, trino_date_trunc('day', ts) AS c FROM t"
         );
     }
 
@@ -1481,7 +2598,7 @@ mod tests {
     fn casts_get_trino_semantics() {
         assert_eq!(
             rewrite("SELECT CAST(x AS BIGINT) AS a, TRY_CAST(y AS INTEGER) AS b, CAST(z AS VARCHAR) AS c, CAST(z AS VARCHAR(2)) AS d FROM t").unwrap(),
-            "SELECT CAST(trino_round_for_cast(x) AS BIGINT) AS a, TRY_CAST(trino_round_for_cast(y) AS INTEGER) AS b, trino_varchar(z) AS c, trino_varchar(z, 2) AS d FROM t"
+            "SELECT CAST(trino_round_for_cast(x, 'bigint') AS BIGINT) AS a, TRY_CAST(trino_try_round_for_cast(y, 'integer') AS INTEGER) AS b, trino_varchar(z) AS c, trino_varchar(z, 2) AS d FROM t"
         );
         let err = rewrite("SELECT CAST(x AS VARBINARY) FROM t").unwrap_err();
         assert!(
@@ -1492,7 +2609,7 @@ mod tests {
         // DataFusion's decimal parsing.
         assert_eq!(
             rewrite("SELECT 1e2 AS a, 1.5 AS b, 10 AS c").unwrap(),
-            "SELECT CAST('1e2' AS DOUBLE) AS a, 1.5 AS b, 10 AS c"
+            "SELECT trino_double('1e2') AS a, 1.5 AS b, 10 AS c"
         );
     }
 
@@ -1565,7 +2682,7 @@ mod tests {
         );
         assert_eq!(
             rewrite("SELECT array_sort(a) AS s, reverse(a) AS r, contains(a, 1) AS c, arrays_overlap(a, b) AS o, split(s, ',') AS p FROM t").unwrap(),
-            "SELECT array_sort(a, 'ASC', 'NULLS LAST') AS s, trino_reverse(a) AS r, trino_contains(a, 1) AS c, trino_arrays_overlap(a, b) AS o, trino_split(s, ',') AS p FROM t"
+            "SELECT array_sort(trino_array_element_sort_key(a), 'ASC', 'NULLS LAST') AS s, trino_reverse(a) AS r, trino_contains(a, 1) AS c, trino_arrays_overlap(a, b) AS o, trino_split(s, ',') AS p FROM t"
         );
         let err = rewrite("SELECT array_sort(a, (x, y) -> 1) FROM t").unwrap_err();
         assert!(err.to_string().contains("lambda"), "{err}");
@@ -1592,6 +2709,11 @@ mod tests {
                 "SEMI / ANTI JOIN",
             ),
             ("SELECT [1, 2]", "[...] array literal"),
+            ("SELECT a IS TRUE FROM t", "IS TRUE"),
+            ("SELECT a FROM t WHERE a IS NOT FALSE", "IS NOT FALSE"),
+            ("SELECT a IS UNKNOWN FROM t", "IS UNKNOWN"),
+            ("SELECT 1 EXCEPT ALL SELECT 1", "EXCEPT ALL"),
+            ("SELECT 1 UNION BY NAME SELECT 1", "UNION BY NAME"),
             ("SELECT 1::INT", ":: cast"),
             ("SELECT TOP 1 a FROM t", "TOP"),
             (
@@ -1624,6 +2746,44 @@ mod tests {
         assert!(!literal_has_zone("10:00:00"));
         assert!(literal_has_zone("2024-01-05 10:00:00 UTC"));
         assert!(literal_has_zone("2024-01-05 10:00:00 -05:00"));
+    }
+
+    #[test]
+    fn unary_minus_folds_into_integer_literals_only() {
+        assert_eq!(
+            rewrite("SELECT -9223372036854775808 AS a, -1 AS b, -(1) AS c, 3 -1 AS d, -1.5 AS e, -1e2 AS f, -x AS g FROM t")
+                .unwrap(),
+            "SELECT -9223372036854775808 AS a, -1 AS b, -(1) AS c, 3 - 1 AS d, -1.5 AS e, -trino_double('1e2') AS f, -x AS g FROM t"
+        );
+        // Beyond bigint either way: Trino's grammar reads the whole thing as
+        // one integer literal and `Long.parseLong` refuses it, so glaux does
+        // too (it used to answer a decimal(20,0)).
+        let err = rewrite("SELECT -99999999999999999999 AS a").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Invalid numeric literal: -99999999999999999999"),
+            "{err}"
+        );
+        // Set operations other than EXCEPT ALL keep their quantifiers.
+        rewrite("SELECT 1 INTERSECT ALL SELECT 1").unwrap();
+        rewrite("SELECT 1 EXCEPT SELECT 1").unwrap();
+        rewrite("SELECT 1 EXCEPT DISTINCT SELECT 1").unwrap();
+    }
+
+    #[test]
+    fn one_argument_log_is_refused() {
+        let err = rewrite("SELECT log(100)").unwrap_err();
+        assert!(err.to_string().contains("log(base, x)"), "{err}");
+        rewrite("SELECT log(10, 100)").unwrap();
+    }
+
+    #[test]
+    fn scalar_subqueries_are_wrapped_nullable() {
+        assert_eq!(
+            rewrite("SELECT (SELECT max(a) FROM t) AS m, b IN (SELECT a FROM t) AS i FROM u")
+                .unwrap(),
+            "SELECT trino_nullable((SELECT max(a) AS _col0 FROM t)) AS m, b IN (SELECT a FROM t) AS i FROM u"
+        );
     }
 
     #[test]

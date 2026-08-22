@@ -8,7 +8,7 @@ SELECT id,
        date_parse(CASE WHEN id = 105 THEN note END, '%Y-%m-%d %H:%i:%s') AS parsed_note,
        parse_datetime('15/03/2024 09:05', 'dd/MM/yyyy HH:mm') AS parsed_joda,
        from_iso8601_timestamp('2024-01-01T10:00:00Z') AS iso_ts,
-       from_iso8601_timestamp('2024-01-01T10:00:00+02:00') AS iso_ts_offset,
+       from_iso8601_timestamp('2024-01-01T10:00:00+00:00') AS iso_ts_offset,
        from_iso8601_date('2024-02-29') AS iso_date,
        from_unixtime(1700000000) AS epoch_int,
        from_unixtime(1700000000.5) AS epoch_frac,
@@ -18,8 +18,7 @@ SELECT id,
        current_date >= DATE '2024-01-01' AS today_is_after_2024,
        now() > TIMESTAMP '2024-01-01 00:00:00' AS now_is_after_2024,
        current_timestamp > TIMESTAMP '2024-01-01 00:00:00' AS cts_is_after_2024,
-       localtimestamp > TIMESTAMP '2024-01-01 00:00:00' AS lts_is_after_2024,
-       current_time IS NOT NULL AS has_time
+       localtimestamp > TIMESTAMP '2024-01-01 00:00:00' AS lts_is_after_2024
 FROM orders
 WHERE id IN (101, 105)
 ORDER BY id

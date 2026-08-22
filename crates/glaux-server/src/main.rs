@@ -1,8 +1,10 @@
 //! `glaux-server` — the standalone glaux binary.
 //!
-//! Serves the Athena and Firehose APIs over HTTP against externally
-//! configured S3 and Glue endpoints (fakecloud over HTTP, MinIO, or real
-//! AWS). Endpoints are configuration, never assumptions.
+//! Target architecture (wired up in the stories after LIO-18): serve the
+//! Athena and Firehose APIs over HTTP against externally configured S3 and
+//! Glue endpoints (fakecloud over HTTP, MinIO, or real AWS). Endpoints are
+//! configuration, never assumptions. At this scaffolding stage nothing is
+//! wired and the binary refuses to start.
 
 use tracing_subscriber::EnvFilter;
 

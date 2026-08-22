@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Fields, SchemaRef};
+use arrow::datatypes::{DataType, Field, Fields, SchemaRef, TimeUnit};
 use arrow::json::ReaderBuilder;
 use bytes::Bytes;
 use datafusion::common::metadata::FieldMetadata;
@@ -223,7 +223,20 @@ fn parquet_type_fits(physical: &DataType, logical: &DataType) -> bool {
             Utf8 | LargeUtf8 | Utf8View,
         ) => true,
         (Binary | LargeBinary | BinaryView, Binary | LargeBinary | BinaryView) => true,
-        (Timestamp(_, _), Timestamp(_, _)) => true,
+        // Unit widening never changes the instant (Arrow multiplies; an
+        // out-of-range value is a cast error, not a wrong value), narrowing
+        // would silently truncate. A zoned file column read as Glue's naive
+        // `timestamp` keeps its UTC epoch value, which is exactly how Athena
+        // reads it; any other zone change would shift the wall-clock value.
+        (Timestamp(pu, ptz), Timestamp(lu, ltz)) => {
+            let unit_rank = |u: &TimeUnit| match u {
+                TimeUnit::Second => 0,
+                TimeUnit::Millisecond => 1,
+                TimeUnit::Microsecond => 2,
+                TimeUnit::Nanosecond => 3,
+            };
+            unit_rank(pu) <= unit_rank(lu) && (ltz.is_none() || ptz == ltz)
+        }
         (Date32 | Date64, Date32 | Date64) => true,
         (Decimal128(p1, s1), Decimal128(p2, s2)) => s1 == s2 && p1 <= p2,
         (List(p) | LargeList(p), List(l) | LargeList(l)) => {
@@ -572,7 +585,7 @@ fn find_field<'a>(fields: &'a Fields, key: &str) -> Option<&'a Arc<Field>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{Schema, TimeUnit};
+    use arrow::datatypes::Schema;
 
     #[test]
     fn type_fit_rules() {
@@ -584,6 +597,29 @@ mod tests {
         assert!(parquet_type_fits(
             &Timestamp(TimeUnit::Millisecond, None),
             &Timestamp(TimeUnit::Nanosecond, None)
+        ));
+        // Narrowing the unit truncates; rejected.
+        assert!(!parquet_type_fits(
+            &Timestamp(TimeUnit::Nanosecond, None),
+            &Timestamp(TimeUnit::Millisecond, None)
+        ));
+        // Zoned file column into Glue's naive timestamp keeps the UTC value.
+        assert!(parquet_type_fits(
+            &Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            &Timestamp(TimeUnit::Nanosecond, None)
+        ));
+        assert!(parquet_type_fits(
+            &Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            &Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        ));
+        // Naive -> zoned and zone changes shift wall-clock values; rejected.
+        assert!(!parquet_type_fits(
+            &Timestamp(TimeUnit::Microsecond, None),
+            &Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        ));
+        assert!(!parquet_type_fits(
+            &Timestamp(TimeUnit::Microsecond, Some("+02:00".into())),
+            &Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
         ));
         assert!(parquet_type_fits(&Decimal128(10, 2), &Decimal128(18, 2)));
         assert!(!parquet_type_fits(&Decimal128(10, 3), &Decimal128(18, 2)));
@@ -643,6 +679,22 @@ mod tests {
         assert_eq!(value["userid"], 7);
         assert_eq!(value["profile"]["firstname"], "a");
         assert!(value.get("extra").is_none());
+
+        // High-precision decimals must survive the rewrite byte-for-byte
+        // (serde_json `arbitrary_precision`), or decimal(38,9) data would
+        // be rounded through f64.
+        let mut out = Vec::new();
+        rewriter
+            .rewrite_line(
+                br#"{"userId": 123456789012345678901.123456789}"#,
+                1,
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap().trim_end(),
+            r#"{"userid":123456789012345678901.123456789}"#
+        );
 
         let err = rewriter
             .rewrite_line(br#"{"userId": 7, "USERID": 8}"#, 2, &mut Vec::new())

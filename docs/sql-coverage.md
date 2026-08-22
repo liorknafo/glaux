@@ -4,40 +4,48 @@
 
 glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusion. This table is generated from the shim registry that drives the translator, so it is exactly what the engine accepts: anything not listed is refused with an error naming the construct — never silently approximated.
 
-**Functions:** 133 supported (68 passthrough, 55 rewritten, 10 Rust UDFs), 28 refused by name.
+**Functions:** 134 supported (47 passthrough, 77 rewritten, 10 Rust UDFs), 29 refused by name.
 
 ## SQL constructs
 
 | Construct | Category | Status | Notes |
 |---|---|---|---|
 | SELECT / DISTINCT / WHERE | Query shape | supported | Full projection, `SELECT DISTINCT`, arbitrary predicates. Anonymous output columns are named `_col0`, `_col1`, … by position (also inside derived tables and CTEs) and duplicate output names are allowed, as on Athena. `DISTINCT ON`, `QUALIFY`, `GROUP BY ALL`, `TOP`, `SELECT INTO`, `TABLESAMPLE`, `FOR UPDATE`, and `SELECT * EXCLUDE` are refused as non-Trino syntax. |
-| JOIN (INNER, LEFT, RIGHT, FULL, CROSS) | Query shape | supported | `ON` and `USING` forms; join keys must have comparable types (`TYPE_MISMATCH` otherwise). `NATURAL`, `SEMI` / `ANTI`, `APPLY`, and `ASOF` joins are refused as non-Trino syntax. |
+| JOIN (INNER, LEFT, RIGHT, FULL, CROSS) | Query shape | supported | `ON` and `USING` forms; join keys must have comparable types (`TYPE_MISMATCH` otherwise). `JOIN ... USING (k)` follows Trino: one `k` column (the left value for inner / left joins, the right value for right joins, `coalesce(l.k, r.k)` for full joins — DataFusion alone would return one side's NULL), `SELECT *` lists the `USING` columns first, then the remaining left columns, then the remaining right columns, and a qualified `a.k` is refused (`Column 'a.k' cannot be resolved`, as on Trino). A `JOIN` with neither `ON` nor `USING` is refused (DataFusion would run a cross join); write `CROSS JOIN`. Equi-join keys of `DOUBLE` / `REAL` type run through a nested-loop join with IEEE equality, because Trino's join equality never matches NaN while DataFusion's hash join would (`USING` over float keys is refused; write `ON`). `NATURAL`, `SEMI` / `ANTI`, `APPLY`, and `ASOF` joins are refused as non-Trino syntax. |
 | Common table expressions (WITH) | Query shape | supported | Including multiple and chained CTEs. |
-| Subqueries (derived tables, scalar, IN, EXISTS) | Query shape | supported | Correlated `EXISTS` / `IN` are decorrelated by DataFusion. |
-| Window functions | Query shape | supported | `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` and named windows. Ranking functions return `bigint` (cast from DataFusion's unsigned result). Window `ORDER BY` sorts NULLs last by default, as in Trino. |
-| GROUP BY / HAVING / ROLLUP / CUBE / GROUPING SETS | Query shape | supported |  |
-| ORDER BY / LIMIT / OFFSET | Query shape | supported | `NULLS FIRST/LAST` honoured. Trino's default — NULLs last whatever the direction, also for window `ORDER BY` and aggregate `ORDER BY` arguments — is applied when unspecified (DataFusion's own default would sort NULLs first under `DESC`). `ORDER BY ALL` is refused. |
-| UNION / UNION ALL / INTERSECT / EXCEPT | Query shape | supported | Corresponding columns must have comparable types (`SELECT 1 UNION SELECT 'a'` is a `TYPE_MISMATCH`, as on Athena). |
-| VALUES | Query shape | supported | Inline tables, also as a `FROM` source with column aliases; anonymous columns are `_col0`, `_col1`, … as on Athena. |
+| Subqueries (derived tables, scalar, IN, EXISTS) | Query shape | supported | Correlated `EXISTS` / `IN` are decorrelated by DataFusion. A scalar subquery that returns no rows is NULL, also over a non-nullable source such as `VALUES` or a literal (DataFusion alone would fail with `declared as non-nullable but contains null values`). A **correlated scalar subquery that is not itself an aggregate** — `SELECT (SELECT c.id FROM customers c WHERE c.id = o.customer_id) FROM orders o`, valid Trino — is rewritten into `trino_scalar_subquery((SELECT trino_single_value(x) …), (SELECT trino_group_rows(x) …))`: DataFusion's decorrelation needs an aggregate, and the row count is checked *outside* the subquery so that only groups an outer row really matches raise `SUBQUERY_MULTIPLE_ROWS`, as on Trino (checking inside the aggregate would refuse a group no outer row selects). Refused by name, not answered differently: a correlated scalar subquery in `ORDER BY` or a `JOIN` condition (Trino allows it; DataFusion decorrelates only in `SELECT` / `WHERE` / `GROUP BY`), one carrying an `ORDER BY` or `LIMIT` (Trino applies it per outer row, which decorrelation cannot express), one whose correlation condition compares `DOUBLE` / `REAL`, and one whose correlation conditions name two columns with the same bare name from different relations (`… WHERE c.id = o.customer_id AND x.id = o.id`) — DataFusion re-qualifies correlated columns by their bare name, so the two would collapse onto one join key and every row would come back wrong. `IN (subquery)` / `EXISTS` used as a *value* (in the select list or any position other than a `WHERE` / `HAVING` predicate) is refused by name — DataFusion cannot evaluate it as an expression. `IN (subquery)` over `DOUBLE` / `REAL` operands is refused by name: Trino compares with IEEE equality (NaN never matches), which DataFusion's semi-join does not reproduce. The quantified comparison predicates `> ALL` / `= ANY` / `< SOME` are refused by name; see their own row. |
+| Window functions | Query shape | supported | `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` and named windows. Ranking functions return `bigint` (cast from DataFusion's unsigned result). Window `ORDER BY` sorts NULLs last by default, as in Trino. The offset arguments of `lead` / `lag` / `nth_value` / `ntile` are validated as on Trino (`lead(x, -1)` is `INVALID_FUNCTION_ARGUMENT: Offset must be at least 0`; DataFusion would run it as `lag`). An aggregate's own `ORDER BY` inside a window — `array_agg(x ORDER BY y) OVER (...)`, valid Trino — is refused by name (`NOT_SUPPORTED: aggregate ORDER BY inside a window function`): DataFusion's window executor cannot order an aggregate's input, and it used to leak that as a syntax error. Order in a derived table instead. |
+| GROUP BY / HAVING / ROLLUP / CUBE / GROUPING SETS | Query shape | supported | `GROUP BY` and `HAVING` resolve against the source columns only, as on Trino: `SELECT status s, count(*) FROM t GROUP BY s` and `HAVING c > 1` over an alias `c` are `Column cannot be resolved` unless the source has a column of that name (DataFusion would resolve the output alias). `ORDER BY` may use output aliases. `GROUP BY ()` — Trino's empty grouping set, one global group — is planned as `GROUPING SETS (())`; sqlparser parses it as an empty tuple, which DataFusion refused with `Empty tuple not supported yet`. |
+| ORDER BY / LIMIT / OFFSET | Query shape | supported | `NULLS FIRST/LAST` honoured. Trino's default — NULLs last whatever the direction, also for window `ORDER BY` and aggregate `ORDER BY` arguments — is applied when unspecified (DataFusion's own default would sort NULLs first under `DESC`). An `ORDER BY` name matching several output columns (`SELECT id x, amount x ... ORDER BY x`) is refused as ambiguous, as on Trino. `ORDER BY ALL` is refused. `FETCH FIRST n ROWS ONLY` (Trino's standard form of LIMIT) is rewritten onto LIMIT; `WITH TIES` and `PERCENT` are refused by name. A negative `LIMIT` / `OFFSET` is refused up front, as Trino's grammar does (it has no sign there); DataFusion accepted the literal and failed inside an optimizer rule, naming the rule. |
+| UNION / UNION ALL / INTERSECT / EXCEPT | Query shape | supported | Corresponding columns must have comparable types (`SELECT 1 UNION SELECT 'a'` is a `TYPE_MISMATCH`, as on Athena). The result types follow Trino: `SELECT 1 UNION SELECT 1` is `integer`, `1 UNION ALL 1.5` is `decimal(11,1)`, and `1.5 UNION 2e0` is `double` (DataFusion alone would report `bigint`, `decimal(21,1)`, and `decimal(30,15)`). `INTERSECT ALL` keeps the minimum multiplicity of each row, as on Trino; `EXCEPT ALL` (bag difference on Trino: `{1, 1, 1} EXCEPT ALL {1}` is `{1, 1}`) is refused by name because DataFusion plans it as an anti-join that drops every matching row. `FETCH FIRST n ROWS WITH TIES` is refused, as are the `BY NAME` quantifiers. |
+| VALUES | Query shape | supported | Inline tables, also as a `FROM` source with column aliases; anonymous columns are `_col0`, `_col1`, … as on Athena. Bare (unparenthesised) row expressions — `VALUES 1, 2`, valid Trino — are wrapped for sqlparser at the token level. The rows must share a type, as on Trino: `(VALUES (1), ('2'))` is `TYPE_MISMATCH: Values rows have mismatched types: row(integer) vs row(varchar(1))` — the literals are named with the types Trino gives them, not the `bigint` / unbounded `varchar` DataFusion planned them as (DataFusion alone coerced it into a bigint column with the rows `1, 2`), and the pairs DataFusion refuses itself carry the same diagnostic instead of its `Inconsistent data type across values list` text. Column types follow Trino: `(VALUES (1), (2))` is `integer`, `(VALUES (1), (1.5))` is `decimal(11,1)`, and a column mixing a double with an exact number is `double` (DataFusion alone would report `decimal(30,15)`). |
 | CASE | Expressions | supported | Simple and searched forms. The operand must be comparable with the `WHEN` values and all results must share a type (`TYPE_MISMATCH` otherwise, as on Athena); the same applies to `if`, `nullif`, and `coalesce`. |
-| CAST | Expressions | supported | Trino type names (`VARCHAR[(n)]`, `BIGINT`, `INTEGER`, `SMALLINT`, `TINYINT`, `DOUBLE`, `REAL`, `DECIMAL(p,s)`, `BOOLEAN`, `DATE`, `TIMESTAMP`) map to Arrow types. The `x::type` form is refused as non-Trino syntax. Double/decimal → integer rounds half away from zero (`CAST(2.5 AS BIGINT)` is 3) and fails on overflow (`INVALID_CAST_ARGUMENT`; NULL under `TRY_CAST`). `CAST(... AS VARCHAR)` uses Trino's text forms (`2024-01-05 10:30:00.000`, `1.0E20`) and `VARCHAR(n)` truncates to `n` characters. `VARBINARY`, `JSON`, `ROW`, `MAP` targets are refused by name. |
+| CAST | Expressions | supported | Trino type names (`VARCHAR[(n)]`, `BIGINT`, `INTEGER`, `SMALLINT`, `TINYINT`, `DOUBLE`, `REAL`, `DECIMAL(p,s)`, `BOOLEAN`, `DATE`, `TIMESTAMP`) map to Arrow types; casts Trino does not define (`CAST(12 AS DATE)`, `CAST(DATE ... AS BIGINT)`, `CAST(TIMESTAMP ... AS DOUBLE)`) are a `TYPE_MISMATCH` instead of running with DataFusion's semantics. The `x::type` form is refused as non-Trino syntax. Double/decimal → integer rounds half away from zero (`CAST(2.5 AS BIGINT)` is 3) and fails on overflow (`INVALID_CAST_ARGUMENT`; NULL under `TRY_CAST`). `CAST(... AS VARCHAR)` uses Trino's text forms (`2024-01-05 10:30:00.000`, `1.0E20`); `VARCHAR(n)` truncates a varchar source but refuses a longer text of any other type (`CAST(12345 AS VARCHAR(2))` fails, as on Trino). Varchar → `TIMESTAMP` follows Trino's pattern (`YYYY-MM-DD[ HH:MM[:SS[.fraction]]]`, rounded HALF_UP to milliseconds, zone suffixes refused); varchar → `DATE` must be exactly a calendar date (`'2024-01-05 10:00:00'` fails, as on Trino); both trim the text first, as Trino's `VarcharToTimestampCast` and `DateOperators.castFromSlice` do; varchar → `BIGINT` / `INTEGER` / `SMALLINT` / `TINYINT` follows Java's `Long.parseLong`, which Trino's varchar casts call with the text as it stands: `CAST('12' AS BIGINT)` is 12, and `CAST(' 12 ' AS BIGINT)` (or a trailing newline) is an `INVALID_CAST_ARGUMENT`, not the 12 Arrow's trimming string parser would have returned — the same rule as the `DECIMAL` and `BOOLEAN` casts, whose Java parsers do not trim either; varchar → `BOOLEAN` accepts only `true`/`false`/`t`/`f`/`1`/`0`; varchar → `DOUBLE` / `REAL` follows Java's `Double.parseDouble` (`NaN`, `Infinity`, `-Infinity` exactly — `'nan'`, `'inf'`, `'infinity'` are `INVALID_CAST_ARGUMENT`, worded like Trino's `VarcharOperators.castToDouble` with the lower-case type name, `Cannot cast 'inf' to double`; surrounding whitespace and a `d` / `f` suffix are accepted; hexadecimal floats are refused). `FLOAT` is not a Trino type name and is refused. Double → `DECIMAL(p, s)` uses the exact binary expansion with HALF_UP rounding (`CAST(1e0 AS DECIMAL(38,37))` is exactly 1). `CHAR(n)`, `TIMESTAMP(p ≠ 3)`, `VARBINARY`, `JSON`, `ROW`, `MAP` targets are refused by name — `JSON` because glaux carries the JSON type as the varchar holding its text while Trino's `CAST(x AS JSON)` builds the JSON *value* of x (`CAST('abc' AS JSON)` is the JSON string `"abc"`, and casting a column of documents would quote each document), so returning the text would be a different answer; use `json_parse` / `json_format` instead. Array types use Trino's `ARRAY(T)` syntax (`CAST(NULL AS ARRAY(INTEGER))`); Hive's `ARRAY<T>` is refused as non-Trino syntax. |
 | TRY_CAST | Expressions | supported | NULL on conversion failure. |
-| INTERVAL literals | Expressions | supported | `INTERVAL '1' DAY`, `INTERVAL '2' HOUR`, and `timestamp ± interval` arithmetic. `date - date` and `timestamp - timestamp` (an `interval` result in Trino) are refused; use `date_diff`. |
+| INTERVAL literals | Expressions | supported | `INTERVAL '<n>' YEAR \| MONTH \| DAY \| HOUR \| MINUTE \| SECOND` (a whole number, optionally signed; a fraction only for `SECOND`) and `timestamp ± interval` arithmetic. PostgreSQL interval strings DataFusion would accept (`INTERVAL '1 day'`, `'1 hour 30 minutes'`) are refused as syntax errors, and the range forms (`INTERVAL '1-2' YEAR TO MONTH`, `'1 02:03:04' DAY TO SECOND`) and `interval * n` / `interval / n` (an `interval` result in Trino) are refused by name. `date ± interval` requires a whole number of days (`DATE '2024-01-05' + INTERVAL '1' HOUR` is an error, as on Trino, where DataFusion would drop the hour). `date - date`, `timestamp - timestamp`, and `interval + interval` (an `interval` result in Trino) are refused; use `date_diff`. Comparing intervals (`INTERVAL '1' DAY = INTERVAL '24' HOUR`, true on Trino, which compares the normalised milliseconds / months and refuses mixed kinds) is refused by name, because DataFusion compares its month/day/nanosecond triple structurally and would answer false. |
 | String concatenation (\|\|) | Expressions | supported | NULL-propagating, like Trino. |
-| BETWEEN / IN (list) / LIKE / IS [NOT] NULL / IS DISTINCT FROM | Expressions | supported |  |
-| ARRAY[...] literals and 1-based subscripts | Expressions | supported | `arr[1]` is the first element; `arr[0]`, negative, and out-of-range subscripts are errors, as in Trino (use `element_at` for NULL instead). The bare `[1, 2]` form is refused as non-Trino syntax. |
-| EXTRACT(field FROM x) / POSITION / SUBSTRING / TRIM syntax | Expressions | supported | `EXTRACT` fields: YEAR, QUARTER, MONTH, WEEK, DAY, DAY_OF_MONTH, DAY_OF_WEEK/DOW (1 = Monday … 7 = Sunday, Trino numbering), DAY_OF_YEAR/DOY, HOUR, MINUTE, SECOND; other fields are refused by name. `SUBSTRING` follows `substr`'s rules; `POSITION` returns bigint. |
+| BETWEEN / IN (list) / LIKE / IS [NOT] NULL / IS DISTINCT FROM | Expressions | supported | `LIKE` has no default escape character, as in Trino: a backslash in the pattern is literal (`'a_c' LIKE 'a\_c'` is false) unless an `ESCAPE` clause names it; the escape character must precede `%`, `_`, or itself. `ILIKE`, `SIMILAR TO`, `LIKE ANY`, and the `IS [NOT] TRUE` / `IS [NOT] FALSE` / `IS [NOT] UNKNOWN` predicates (not in Trino's grammar; DataFusion would evaluate them) are refused as non-Trino syntax. Array comparison follows Trino's NULL-element rules: `ARRAY[1, NULL] = ARRAY[1, NULL]` is NULL (a definite element mismatch or a length mismatch is `false`), and ordering arrays with NULL elements is an error, `ARRAY comparison not supported for arrays with null elements`. Every path that ranks arrays raises it: `<` / `<=` / `>` / `>=`, `BETWEEN`, `ORDER BY`, `max` / `min` (aggregate and window), `greatest` / `least`, `array_max` / `array_min`, `array_sort`, and an aggregate's own `ORDER BY`. |
+| ARRAY[...] literals and 1-based subscripts | Expressions | supported | `arr[1]` is the first element; `arr[0]`, negative, and out-of-range subscripts are errors, as in Trino (use `element_at` for NULL instead). The bare `[1, 2]` form is refused as non-Trino syntax. The elements must share a type, like every other operand list: `ARRAY[1, '2']` is `TYPE_MISMATCH: All ARRAY elements must be the same type or coercible to a common type. Cannot find common type between integer and varchar(1)` at planning (DataFusion alone answered `[1, 2]`, or failed at run time with an Arrow cast error for `ARRAY[1, 'a']`). The element type follows Trino too: a double mixed with an exact number is a `double` array, where DataFusion would unify on `decimal(38,15)`. |
+| EXTRACT(field FROM x) / POSITION / SUBSTRING / TRIM syntax | Expressions | supported | `EXTRACT` fields: YEAR, QUARTER, MONTH, WEEK, DAY, DAY_OF_MONTH, DAY_OF_WEEK/DOW (1 = Monday … 7 = Sunday, Trino numbering), DAY_OF_YEAR/DOY, HOUR, MINUTE, SECOND; other fields are refused by name. `SUBSTRING` follows `substr`'s rules; `POSITION` returns bigint. `TRIM(LEADING \| TRAILING \| BOTH FROM x)` without trim characters (valid Trino, and the one `TRIM` spelling sqlparser cannot parse) is turned into the equivalent `ltrim` / `rtrim` / `trim` call at the token level. |
 | Identifiers | Semantics | supported | Identifiers are case-insensitive whether quoted or not, as in Trino: `"Name"` and `name` resolve to the same column. Output aliases are reported in the case they were written (`AS "Total"` is column `Total`) and resolve case-insensitively (`ORDER BY total`, `ORDER BY "TOTAL"`), also from outer queries. |
-| Numeric literals | Semantics | supported | `1.5` is `DECIMAL(2,1)` and `1e2` is `DOUBLE`, as in Trino, so `0.1 + 0.2` is exactly `0.3`. Decimal arithmetic follows DataFusion's result precision/scale rules (division and `avg` keep more fractional digits than Trino: `1.5 / 2` is `0.75000` here, `0.8` on Athena) and math functions compute decimal arguments in double precision. |
-| Integer overflow | Semantics | supported | `bigint` `+`, `-`, `*`, and `sum` fail with `NUMERIC_VALUE_OUT_OF_RANGE` on overflow, as in Trino (DataFusion alone wraps around). Division by zero is `DIVISION_BY_ZERO`. |
-| Operator type checking | Semantics | supported | Comparisons, arithmetic, `\|\|`, `IN` (lists and subqueries), `BETWEEN`, join keys, simple `CASE` operands, `CASE` / `if` / `nullif` / `coalesce` / `greatest` / `least` results, and set-operation columns between types Trino does not combine (`varchar = integer`, `'a' \|\| 1`, `date = varchar`) are refused with `TYPE_MISMATCH` instead of being coerced, and the date-part functions (`year`, `date_trunc`, `date_format`, `to_unixtime`, `EXTRACT`) refuse varchar arguments. Numeric types compare with each other and `date` with `timestamp`, as in Trino. |
-| Runtime errors | Semantics | supported | Failures caused by the query's data (an invalid cast, an unparsable date, a bad subscript) are user errors (Athena `ErrorCategory` 2) with Trino's error code; only I/O and engine failures are category 1. |
+| Numeric literals | Semantics | supported | `1` is `INTEGER` (when it fits in 32 bits, else `BIGINT`), `1.5` and `DECIMAL '1.5'` are `DECIMAL(2,1)`, and `1e2` is `DOUBLE`, so `0.1 + 0.2` is exactly `0.3` and `SELECT 1` reports `integer`. A unary minus directly on an integer literal is part of the literal, as in Trino's grammar (`number : MINUS? INTEGER_VALUE #integerLiteral`): `-9223372036854775808` is a `bigint` (not a `decimal(19,0)`) and `-9223372036854775808 - 1` overflows. The same rule makes a digits-only literal **beyond bigint** a parse error — `AstBuilder` builds a `LongLiteral`, whose constructor parses with `Long.parseLong` and raises `Invalid numeric literal: …`, and the `#decimalLiteral` production needs a decimal point — so `SELECT 12345678901234567890` is refused rather than answered as a `decimal(20,0)` (which glaux used to do: a value where Athena refuses the query). Write `DECIMAL '12345678901234567890'` for a decimal of that value. Decimal arithmetic follows Trino's result types and rounding: `+ - *` use Trino's precision/scale with `Decimal overflow` errors past 38 digits, and `/` rounds HALF_UP to `max(s1, s2)` places (`1.5 / 2` is `0.8`, `10.00 / 3` is `3.33`). A double mixed with an exact number (`least(1.5, 2e0)`) is a double — in `coalesce` / `CASE` / `greatest` / `least`, in `ARRAY[...]`, in a `VALUES` column, and across set operations alike. Decimal literals above 38 digits are refused by name. |
+| Integer overflow | Semantics | supported | `integer` and `bigint` `+`, `-`, `*`, `/`, and `sum` fail with `NUMERIC_VALUE_OUT_OF_RANGE` on overflow, as in Trino (`2147483647 + 1` overflows the 32-bit `integer` literals; DataFusion alone widens or wraps around). The message names the type, the operation, and the operands, as Trino's operator classes do: `bigint addition overflow: 9223372036854775807 + 1`, `tinyint multiplication overflow: 127 * 2`, `bigint negation overflow: -9223372036854775808`. Integer `/` overflows for exactly one pair per type — the type's minimum over `-1` — and is refused with the wording of Trino's `BigintOperators.divide` (`bigint division overflow: -9223372036854775808 / -1`); Trino's narrower `divide` operators have no such check and fail a step later, when the out-of-range value is written to the result block, so glaux's `integer` / `smallint` / `tinyint` division messages are the bigint one's shape rather than Trino's text. Division by zero is `DIVISION_BY_ZERO`. |
+| Operator type checking | Semantics | supported | Comparisons, arithmetic (`1 + '2'`), `\|\|`, `LIKE` over non-varchar operands (`1 LIKE '1'`, refused with Trino's "must evaluate to a varchar" diagnostic), `IN` (lists and subqueries), `BETWEEN`, join keys, simple `CASE` operands, `CASE` / `if` / `nullif` / `coalesce` / `greatest` / `least` results, and set-operation columns between types Trino does not combine (`varchar = integer`, `'a' \|\| 1`, `date = varchar`) are refused with `TYPE_MISMATCH` instead of being coerced, and the date-part functions (`year`, `date_trunc`, `date_format`, `to_unixtime`, `EXTRACT`) refuse varchar arguments. Numeric types compare with each other and `date` with `timestamp`, as in Trino. The operand types are named the way Trino types them, literals included: `1 = '1'` is `Cannot apply operator: integer = varchar(1)`, not DataFusion's `bigint = varchar`. Function arguments are checked the same way: an argument type Trino has no overload for is `TYPE_MISMATCH: Unexpected parameters (varchar(1)) for function abs` (aggregates included — `sum(varchar)` used to leak DataFusion's `Internal error: Function 'sum' failed to match any signature ...`, which ends in an invitation to file a DataFusion bug report). The boolean contexts follow Trino too: `true AND 1` is `Logical expression term must evaluate to a boolean (actual: bigint)`, `NOT 1` is `Value of logical NOT expression must evaluate to a boolean (actual: bigint)`, and `WHERE 1` is `WHERE clause must evaluate to a boolean: actual type bigint`. A unary `-` over a non-numeric operand is refused as well (DataFusion does not name the operand type there, so the message cannot either), and a window function written without `OVER` is refused by name instead of DataFusion's `Invalid function 'rank'.`. A window function or an aggregate *inside* a `WHERE` (or a window function inside a `HAVING`) is refused at planning with Trino's `EXPRESSION_NOT_SCALAR: WHERE clause cannot contain aggregations, window functions or grouping operations`; DataFusion planned it and then dumped the Rust `Debug` of the window expression from the physical planner. A `SELECT` item that is neither grouped nor aggregated says Trino's `'orders.id' must be an aggregate expression or appear in GROUP BY clause` (DataFusion's text talked about `While expanding wildcard` for queries with no wildcard), and a column alias list of the wrong width says `Column alias list has 1 entries but relation has 2 columns`. |
+| Runtime errors | Semantics | supported | Failures caused by the query's data (an invalid cast, an unparsable date, a bad subscript, an invalid regular expression, a missing regexp group) are user errors (Athena `ErrorCategory` 2) with Trino's error code; only I/O and engine failures are category 1. The codes follow Trino: integer overflow in a kernel is `NUMERIC_VALUE_OUT_OF_RANGE` (`abs(-9223372036854775808)`), `chr` outside the Unicode range and an unparsable `date_parse` input are `INVALID_FUNCTION_ARGUMENT`, and a scalar subquery returning several rows is `SUBQUERY_MULTIPLE_ROWS`. The messages name the reason alone: Arrow's and DataFusion's layer prefixes (`Arrow error: Compute error: `, `Execution error: `) and array-type names are stripped, and division by zero says `Division by zero` whether the operands are integers, doubles, or decimals. Integer overflow names the type, the operation, and the operands like Trino (`-CAST(-128 AS TINYINT)` is `tinyint negation overflow: -128`, `2147483647 + 1` is `integer addition overflow: 2147483647 + 1`, `CAST(-9223372036854775808 AS BIGINT) / -1` is `bigint division overflow: -9223372036854775808 / -1`; Arrow said `Overflow happened on: - -128` and named neither the type nor the operands for the binary operators). `abs` over the minimum of an integer type carries the wording of Trino's own `MathFunctions.abs`, one message per type: `abs(CAST(-9223372036854775808 AS BIGINT))` is `Value -9223372036854775808 is out of range for abs(bigint)` and `abs(CAST(-128 AS TINYINT))` is `Value -128 is out of range for abs(tinyint)` (DataFusion named its Arrow array type: `Int64Array overflow on abs(...)`). Integer casts carry Trino's wording rather than Arrow's: `CAST('1.5' AS INTEGER)` is `Cannot cast '1.5' to integer` and `CAST(2147483648 AS INTEGER)` is `Out of range for integer: 2147483648` (Arrow said `Cannot cast string '1.5' to value of Int32 type` and `Can't cast value ... to type Int32`). |
+| Timestamp precision | Semantics | supported | Every timestamp is a `timestamp(3)`, as on Athena: a scanned column with microsecond or nanosecond values is rounded HALF_UP to milliseconds before any function sees it (so `second(x)` and the printed text agree, and `10:00:00.9996` is `10:00:01.000`), `CAST(varchar AS TIMESTAMP)` rounds the fraction, and `now()` is rounded too. `timestamp with time zone` values (`current_timestamp`, `parse_datetime`, `from_iso8601_timestamp`) are UTC and print as `2024-01-05 10:00:00.000 UTC`; `TIME` values print with milliseconds. Calendar arithmetic (`date_add`, `date_diff`, `date_trunc`) works on the calendar value, so dates outside Arrow's nanosecond window (`DATE '9999-12-31'`, `1583-01-01`) are ordinary values; `date_parse` / `parse_datetime` build the millisecond value themselves, so they have no Arrow nanosecond range limit either (`date_parse('1000-01-01', '%Y-%m-%d')` is an ordinary value). |
+| DOUBLE / REAL special values (NaN, -0.0) | Semantics | supported | Comparisons involving a float operand use Trino's IEEE operators (`DoubleType`: Java's primitive `==`, `<`, …): every `=` / `<` / `<=` / `>` / `>=` with NaN is false, `NaN <> NaN` is true, and `-0.0 = 0.0` is true — where Arrow's kernels use a total order (NaN equal to NaN and above every number). The same routing covers `IN` lists, `BETWEEN`, simple `CASE` operands, `nullif` (`nullif(0e0, -0e0)` is NULL, `nullif(NaN, NaN)` is NaN), and equi-join keys (nested-loop joined). `greatest` / `max` / `array_max` rank NaN smallest (`COMPARISON_UNORDERED_FIRST`), so `max` of `{1.0, NaN}` is `1.0`; the min side needs no substitute. `contains` / `array_position` / `array_remove` match with EQUAL semantics, so NaN is never found or removed. `ORDER BY`, `GROUP BY`, `DISTINCT`, and `array_distinct` group and order NaN like Trino already. Ordering *arrays* with NaN elements (`ARRAY[NaN] < ...`) is refused: Trino's per-element IEEE ordering has no total-order equivalent. The values themselves are written with Trino's constructors, `nan()` and `infinity()` / `-infinity()` (`0e0 / 0e0` and `1e0 / 0e0` are the same values), and print as Java does: `NaN`, `Infinity`, `-Infinity`. |
+| Result metadata (ColumnInfo) | Semantics | supported | `GetQueryResults` reports each column's Athena type name, precision and scale from the result schema: `bigint`, `integer`, `smallint`, `tinyint`, `double`, `real`, `decimal(p,s)`, `boolean`, `varchar`, `varbinary`, `date`, `timestamp`, `timestamp with time zone`, `time`, `array`, `row`, `map`, `json`, and `unknown` (Trino's type for a bare `NULL` literal: `SELECT NULL` reports `unknown`, and only a `CAST` gives the column a named type). A JSON-typed expression (`json_parse`, `json_extract`) is reported as `json`: glaux carries Trino's `JSON` type as the varchar holding its text, and the UDFs that build one mark their output field so the reported type is Athena's, not the storage type — a client switching on the column type sees what Athena would send. `json_format` and `json_extract_scalar` return `varchar` on Athena too, and a JSON value that flows through a varchar function or a `UNION` with a varchar loses the marker (both are type errors on Trino, which glaux does not model). An Arrow type Athena has no name for is refused when the result is encoded rather than stringified, so a result glaux cannot describe never reaches a client. |
 | Read-only statements | Semantics | supported | `SELECT`, `WITH`, `VALUES`, `EXPLAIN` (DataFusion's plan text, not Trino's). |
+| Quantified comparison (ALL / ANY / SOME) | Unsupported | refused | `x > ALL (subquery)`, `x = ANY (subquery)`, `x <> SOME (VALUES ...)` — valid Trino — are refused by name on the token stream, before parsing. DataFusion has no equivalent predicate: its planner rewrites the shapes sqlparser parses into `cardinality` / `array_max` / `array_min` / `array_has` over the subquery, which does not reproduce Trino's rules for an empty or NULL-bearing operand (`x > ALL (empty)` is true, `x = ANY (…NULL…)` is NULL rather than false), and it fails naming those internal helpers instead of the predicate. sqlparser cannot parse the `(VALUES 1, 2)` operand at all. Rewrite them: `= ANY` is `IN (subquery)`, `<> ALL` is `NOT IN (subquery)`, and the ordering forms are a comparison against `(SELECT max(y) …)` / `(SELECT min(y) …)` or an `EXISTS` carrying the comparison. |
 | lambda expression | Unsupported | refused | `x -> ...` arguments (`transform`, `filter`, `reduce`, comparator sorts) are refused by name. |
 | AT TIME ZONE | Unsupported | refused | Refused in v0.1; timestamps are handled as UTC instants. |
-| timestamp with time zone literal | Unsupported | refused | `TIMESTAMP '2024-01-05 10:00:00 America/New_York'` (and `Z` / offset suffixes) are refused rather than silently converted to a zone-less UTC instant. |
+| timestamp with time zone literal | Unsupported | refused | `TIMESTAMP '2024-01-05 10:00:00 America/New_York'` (and `Z` / offset suffixes) are refused rather than silently converted to a zone-less UTC instant. Zone-less literals follow Trino's pattern: `TIMESTAMP '2024-01-05'` and `TIMESTAMP '2024-01-05 10:00'` are valid; more than three fractional digits (a `timestamp(4+)` on Trino) are refused, as glaux only carries `timestamp(3)`. |
 | date subtraction | Unsupported | refused | `date - date` and `timestamp - timestamp` produce an `interval` in Trino, which glaux cannot return in v0.1; use `date_diff(unit, a, b)`. |
-| Non-Trino syntax | Unsupported | refused | Syntax DataFusion accepts but Trino does not is refused by name instead of running with DataFusion semantics: `DISTINCT ON`, `QUALIFY`, `GROUP BY ALL`, `ORDER BY ALL`, `TABLESAMPLE`, `FOR UPDATE`, `NATURAL` / `SEMI` / `ANTI` / `APPLY` / `ASOF` joins, `[1, 2]` array literals, `x::type` casts, `TOP`, `SELECT INTO`, `SELECT * EXCLUDE`, PostgreSQL operators. |
+| interval result | Unsupported | refused | A query whose output column is an `interval` (`INTERVAL '1' DAY + INTERVAL '2' HOUR`) is refused at planning: Athena has no result encoding glaux can reproduce for it. |
+| binary literal | Unsupported | refused | `X'1F'` varbinary literals are not supported in v0.1 (and `0x1F` is not Trino syntax at all). |
+| timestamp with time zone | Unsupported | refused | Values with a non-UTC zone or offset cannot be represented: `from_iso8601_timestamp` with a non-zero offset, `parse_datetime` with a zone pattern letter, `current_time`, and `AT TIME ZONE` are refused rather than shifted to UTC (which would change `hour(x)` and the printed text). |
+| WITH RECURSIVE | Unsupported | refused | Recursive CTEs (valid Trino) are refused by name in v0.1: DataFusion's recursive execution has not been vetted against Trino's semantics (its type unification differs and genuinely recursive queries fail with planner errors). Rewrite the recursion as an explicit `UNION ALL` of the levels. |
+| Non-Trino syntax | Unsupported | refused | Syntax DataFusion accepts but Trino does not is refused by name instead of running with DataFusion semantics: `DISTINCT ON`, `QUALIFY`, `GROUP BY ALL`, `ORDER BY ALL`, `TABLESAMPLE`, `FOR UPDATE`, `NATURAL` / `SEMI` / `ANTI` / `APPLY` / `ASOF` joins, `[1, 2]` array literals, `x::type` casts, `TOP`, `SELECT INTO`, `SELECT * EXCLUDE`, `ILIKE`, `IS [NOT] TRUE` / `IS [NOT] FALSE` / `IS [NOT] UNKNOWN`, the operators Trino lacks (`&`, `\|`, `^`, `~`, `==`, `<=>`, `->`, and the other PostgreSQL operators; Trino spells these as functions — `regexp_like` for `~` is supported, while the `bitwise_and` / `bitwise_or` / `bitwise_xor` family is not yet in glaux's coverage table and is refused by name), a string literal as an alias (`SELECT 'a' 'b'`), PostgreSQL interval strings (`INTERVAL '1 day'`), `JOIN` without `ON` / `USING`, `FLOAT` as a type name, `ARRAY<T>` type syntax (Trino writes `ARRAY(T)`), `0x1F` literals, and a number glued to identifier characters (`1_000`, which Trino rejects and sqlparser would read as `1 AS _000`). |
 | ROW / MAP literals and types | Unsupported | refused | `ROW(...)`, `MAP(...)`, `CAST(... AS ROW(...))` are refused. |
 | UNNEST | Unsupported | refused | `CROSS JOIN UNNEST(...)` is refused in v0.1 (Trino's `WITH ORDINALITY` and multi-array forms have no direct DataFusion mapping). |
 | Multiple statements | Unsupported | refused | One statement per query execution, like Athena. |
@@ -50,10 +58,10 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | Function | Trino signature | Handling | Translation |
 |---|---|---|---|
 | `approx_distinct` | `approx_distinct(x) → bigint` | passthrough | `CAST(approx_distinct(x) AS BIGINT)` (HyperLogLog; estimates differ from Trino's within the usual error bound) |
-| `approx_percentile` | `approx_percentile(x, percentage) → same as x` | rewrite | `approx_percentile_cont(x, percentage)` (t-digest). The weighted and array-of-percentages forms are refused. |
+| `approx_percentile` | `approx_percentile(x, percentage) → same as x` | rewrite | `trino_approx_percentile(x, percentage)`, a port of airlift's `TDigest` (the structure Trino uses, same merge rule and `valueAt` interpolation; compression 100), so small inputs give exactly Trino's answer and large ones the same approximation scheme, where Trino's own result already depends on how the input was split across workers. DataFusion's `approx_percentile_cont` is not used: its t-digest interpolates differently (`approx_percentile(amount, 0.9)` over the corpus `orders` gives `216.1` there and `240.0` on Trino). Overloads: `bigint` (result `Math.round`-ed), `real`, `double`; a DECIMAL argument is refused, as are the weighted and array-of-percentages forms. |
 | `arbitrary` | `arbitrary(x) → same as x` | rewrite | `first_value(x)` |
 | `array_agg` | `array_agg(x) → array` | passthrough | DataFusion `array_agg` (supports `ORDER BY` inside the call and `DISTINCT`) |
-| `avg` | `avg(x) → double` | passthrough | DataFusion `avg` |
+| `avg` | `avg(x) → double` | passthrough | DataFusion `avg`; over DECIMAL inputs glaux substitutes its own aggregate so the result is `decimal(p, s)` rounded HALF_UP, as in Trino (DataFusion would add four decimal places: `avg` of `1.5` and `2.5` is `2.0`, not `2.00000`), and over REAL inputs one that returns `real` (a double accumulator cast to float at the end, as Trino's). |
 | `bool_and` | `bool_and(boolean) → boolean` | passthrough | DataFusion `bool_and` |
 | `bool_or` | `bool_or(boolean) → boolean` | passthrough | DataFusion `bool_or` |
 | `corr` | `corr(y, x) → double` | passthrough | DataFusion `corr` |
@@ -63,14 +71,14 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | `covar_samp` | `covar_samp(y, x) → double` | passthrough | DataFusion `covar_samp` |
 | `every` | `every(boolean) → boolean` | rewrite | `bool_and(x)` |
 | `listagg` | `listagg(x, separator) WITHIN GROUP (...)` | unsupported | Refused. Use `array_join(array_agg(x ORDER BY ...), separator)`. |
-| `max` | `max(x)` | passthrough | DataFusion `max` |
+| `max` | `max(x)` | passthrough | DataFusion `max`; over DOUBLE / REAL inputs glaux substitutes its own aggregate ranking NaN smallest (`max` of `{1.0, NaN}` is `1.0`, NaN only when every value is NaN), matching Trino's `COMPARISON_UNORDERED_FIRST`; Arrow's `max` would return NaN. `min` needs no substitute: both engines rank NaN largest there. Over arrays it goes through Trino's array ordering operator, which raises `ARRAY comparison not supported for arrays with null elements` once a shared prefix forces it to read a NULL element (Arrow's kernels would rank the NULL and answer). The same holds for the window form and for an aggregate's own `ORDER BY` (`array_agg(x ORDER BY x)`). |
 | `max_by` | `max_by(x, y)` | unsupported | Refused: DataFusion 55 has no `max_by`. Rewrite with a window function (`row_number() OVER (ORDER BY y DESC)`). |
-| `min` | `min(x)` | passthrough | DataFusion `min` |
+| `min` | `min(x)` | passthrough | DataFusion `min`. Over arrays it goes through Trino's array ordering operator, which raises `ARRAY comparison not supported for arrays with null elements` once a shared prefix forces it to read a NULL element (Arrow's kernels would rank the NULL and answer). |
 | `min_by` | `min_by(x, y)` | unsupported | Refused: DataFusion 55 has no `min_by`. Rewrite with a window function. |
 | `stddev` | `stddev(x) → double` | passthrough | DataFusion `stddev` (sample) |
 | `stddev_pop` | `stddev_pop(x) → double` | passthrough | DataFusion `stddev_pop` |
 | `stddev_samp` | `stddev_samp(x) → double` | passthrough | DataFusion `stddev_samp` |
-| `sum` | `sum(x)` | passthrough | DataFusion `sum`; for integer inputs glaux substitutes an overflow-checked sum so a bigint overflow is an error (`NUMERIC_VALUE_OUT_OF_RANGE`), as in Trino. |
+| `sum` | `sum(x)` | passthrough | DataFusion `sum`; for integer inputs glaux substitutes an overflow-checked sum so a bigint overflow is an error (`NUMERIC_VALUE_OUT_OF_RANGE`), for DECIMAL inputs a `decimal(38, s)` sum with Trino's overflow check, and for REAL inputs a sum accumulated in double and returned as `real` (`3.3000002`, not a `double`), as in Trino. |
 | `var_pop` | `var_pop(x) → double` | passthrough | DataFusion `var_pop` |
 | `var_samp` | `var_samp(x) → double` | passthrough | DataFusion `var_samp` |
 | `variance` | `variance(x) → double` | rewrite | `var_samp(x)` |
@@ -82,11 +90,11 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | `cume_dist` | `cume_dist() OVER (...)` | passthrough | DataFusion `cume_dist` |
 | `dense_rank` | `dense_rank() OVER (...)` | passthrough | `CAST(dense_rank(...) AS BIGINT)` — DataFusion's result is unsigned |
 | `first_value` | `first_value(x) OVER (...)` | passthrough | DataFusion `first_value` |
-| `lag` | `lag(x[, offset[, default]]) OVER (...)` | passthrough | DataFusion `lag` |
+| `lag` | `lag(x[, offset[, default]]) OVER (...)` | passthrough | DataFusion `lag`. The offset must be a non-negative integer literal: a negative offset is `INVALID_FUNCTION_ARGUMENT: Offset must be at least 0` and a NULL offset `Offset must not be null`, as on Trino (DataFusion would silently run `lag(x, -1)` as `lead`). |
 | `last_value` | `last_value(x) OVER (...)` | passthrough | DataFusion `last_value` |
-| `lead` | `lead(x[, offset[, default]]) OVER (...)` | passthrough | DataFusion `lead` |
-| `nth_value` | `nth_value(x, n) OVER (...)` | passthrough | DataFusion `nth_value` |
-| `ntile` | `ntile(n) OVER (...)` | passthrough | `CAST(ntile(...) AS BIGINT)` — DataFusion's result is unsigned |
+| `lead` | `lead(x[, offset[, default]]) OVER (...)` | passthrough | DataFusion `lead`. The offset must be a non-negative integer literal: a negative offset is `INVALID_FUNCTION_ARGUMENT: Offset must be at least 0` and a NULL offset `Offset must not be null`, as on Trino (DataFusion would silently run `lead(x, -1)` as `lag`). |
+| `nth_value` | `nth_value(x, n) OVER (...)` | passthrough | DataFusion `nth_value`. `n` must be a positive integer literal: `nth_value(x, 0)` is `INVALID_FUNCTION_ARGUMENT: Offset must be at least 1` and a NULL `n` `Offset must not be null`, as on Trino (DataFusion would return NULL). |
+| `ntile` | `ntile(n) OVER (...)` | passthrough | `CAST(ntile(...) AS BIGINT)` — DataFusion's result is unsigned. `n` must be a positive integer literal (`ntile(0)` is `INVALID_FUNCTION_ARGUMENT`, as on Trino). |
 | `percent_rank` | `percent_rank() OVER (...)` | passthrough | DataFusion `percent_rank` |
 | `rank` | `rank() OVER (...)` | passthrough | `CAST(rank(...) AS BIGINT)` — DataFusion's result is unsigned |
 | `row_number` | `row_number() OVER (...)` | passthrough | `CAST(row_number(...) AS BIGINT)` — DataFusion's result is unsigned |
@@ -97,7 +105,7 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 |---|---|---|---|
 | `coalesce` | `coalesce(a, b, ...)` | passthrough | DataFusion `coalesce` |
 | `if` | `if(condition, true_value[, false_value])` | rewrite | `CASE WHEN condition THEN true_value ELSE false_value END` (`ELSE NULL` when omitted) |
-| `nullif` | `nullif(a, b)` | passthrough | DataFusion `nullif` |
+| `nullif` | `nullif(a, b)` | passthrough | DataFusion `nullif`. Trino types the expression as the *first* argument's type and coerces only the comparison (`nullif(2, 1.0)` is integer 2), where DataFusion widens the result to the common supertype, so glaux rewrites mixed-type calls to `CASE WHEN a = b THEN NULL ELSE a END` with the coercion confined to the `WHEN`. Over DOUBLE / REAL arguments the substituted comparison uses IEEE equality, so `nullif(0e0, -0e0)` is NULL and `nullif(NaN, NaN)` is NaN, as on Trino (DataFusion's kernel compares bit patterns). |
 | `try` | `try(expr)` | unsupported | Refused: DataFusion has no error-suppressing wrapper. `TRY_CAST` covers the cast case. |
 | `typeof` | `typeof(expr) → varchar` | unsupported | Refused: DataFusion's type names (`Utf8`, `Int64`) are not Trino's. |
 
@@ -106,35 +114,35 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | Function | Trino signature | Handling | Translation |
 |---|---|---|---|
 | `chr` | `chr(n) → varchar` | passthrough | DataFusion `chr` |
-| `codepoint` | `codepoint(varchar) → integer` | rewrite | `ascii(x)` |
+| `codepoint` | `codepoint(varchar) → integer` | rewrite | Rust UDF `trino_codepoint`: the code point of a one-character string; longer (or empty) strings are a `TYPE_MISMATCH`, as Trino only accepts `varchar(1)`. |
 | `concat` | `concat(a, b, ...) → varchar | array` | rewrite | `a \|\| b \|\| ...`. DataFusion's own `concat` skips NULL arguments where Trino returns NULL; the operator form propagates NULL like Trino. |
-| `length` | `length(varchar) → bigint` | passthrough | `CAST(length(x) AS BIGINT)` (characters, not bytes) |
+| `length` | `length(varchar) → bigint` | passthrough | `CAST(length(x) AS BIGINT)` (characters, not bytes). Non-varchar arguments are a `TYPE_MISMATCH` (DataFusion would stringify `length(123)`). |
 | `levenshtein_distance` | `levenshtein_distance(a, b) → bigint` | rewrite | `CAST(levenshtein(a, b) AS BIGINT)` |
-| `lower` | `lower(varchar)` | passthrough | DataFusion `lower` |
-| `lpad` | `lpad(varchar, size, padstring)` | passthrough | DataFusion `lpad` |
-| `ltrim` | `ltrim(varchar)` | passthrough | DataFusion `ltrim` |
-| `replace` | `replace(varchar, search[, replacement])` | rewrite | DataFusion `replace`; the 2-argument (delete) form becomes `replace(x, search, '')` |
+| `lower` | `lower(varchar)` | rewrite | Rust UDF `trino_lower`: Unicode simple (per-code-point) case mapping, as Java's `Character.toLowerCase`: `lower('İstanbul')` is `istanbul`, a final sigma is not special-cased (Rust's full mapping would differ). |
+| `lpad` | `lpad(varchar, size, padstring)` | rewrite | Rust UDF `trino_lpad`: `size` counts code points, a longer input is truncated to `size`, an empty pad string is an error (`Padding string must not be empty`), as in Trino. |
+| `ltrim` | `ltrim(varchar)` | rewrite | Rust UDF `trino_ltrim`: strips every Java whitespace code point (tab, LF, CR, VT, FF, `U+001C`–`U+001F`, the Unicode space separators, `U+2028`, `U+2029`; not NBSP), as Trino does, where DataFusion's `ltrim` strips only the ASCII space. `ltrim(x, chars)` is refused (not a Trino signature); use `TRIM(LEADING chars FROM x)`. |
+| `replace` | `replace(varchar, search[, replacement])` | rewrite | Rust UDF `trino_replace`; the 2-argument (delete) form becomes `replace(x, search, '')`. An **empty** `search` follows Trino's separate branch, which inserts the replacement in front of every code point and at the end: `replace('abc', '', 'X')` is `'XaXbXcX'`, `replace('', '', 'X')` is `'X'`, `replace('a👍', '', '-')` is `'-a-👍-'` (DataFusion's `replace` returned the input unchanged). |
 | `reverse` | `reverse(varchar) → varchar, reverse(array) → array` | rewrite | Rust UDF `trino_reverse`: reverses a string's code points or an array's elements (DataFusion's `reverse` is string-only and would stringify an array) |
-| `rpad` | `rpad(varchar, size, padstring)` | passthrough | DataFusion `rpad` |
-| `rtrim` | `rtrim(varchar)` | passthrough | DataFusion `rtrim` |
-| `split` | `split(varchar, delimiter) → array(varchar)` | rewrite | Rust UDF `trino_split`: `split('', ',')` is `['']` and an empty delimiter splits into characters, as in Trino. The 3-argument `split(x, delimiter, limit)` form is refused. |
+| `rpad` | `rpad(varchar, size, padstring)` | rewrite | Rust UDF `trino_rpad`: `size` counts code points, a longer input is truncated to `size`, an empty pad string is an error (`Padding string must not be empty`), as in Trino. |
+| `rtrim` | `rtrim(varchar)` | rewrite | Rust UDF `trino_rtrim`: strips every Java whitespace code point, like `ltrim`. `rtrim(x, chars)` is refused (not a Trino signature); use `TRIM(TRAILING chars FROM x)`. |
+| `split` | `split(varchar, delimiter) → array(varchar)` | rewrite | Rust UDF `trino_split`: `split('', ',')` is `['']` (DataFusion's `string_to_array` gives `[]`) and an empty delimiter is an `INVALID_FUNCTION_ARGUMENT` error (`The delimiter may not be the empty string`), as in Trino — only `split_part` splits into characters on it. The 3-argument `split(x, delimiter, limit)` form is refused. |
 | `split_part` | `split_part(varchar, delimiter, index) → varchar` | rewrite | Rust UDF `trino_split_part`: 1-based; NULL past the last field (DataFusion returns `''`); `index < 1` is an error; an empty delimiter splits into characters. |
 | `starts_with` | `starts_with(varchar, prefix) → boolean` | passthrough | DataFusion `starts_with` |
 | `strpos` | `strpos(varchar, substring) → bigint` | passthrough | `CAST(strpos(x, sub) AS BIGINT)` (1-based, 0 when absent). The 3-argument `strpos(x, sub, instance)` form is refused. |
 | `substr` | `substr(varchar, start[, length])` | rewrite | Rust UDF `trino_substr` with Trino's rules: 1-based; negative `start` counts from the end; `start = 0`, a non-positive `length`, or a start past either end gives `''` (DataFusion's `substr` follows PostgreSQL, where `substr('hello', -3)` is `'hello'`). |
 | `substring` | `substring(varchar, start[, length])` | rewrite | Same as `substr`, for both the call and the `SUBSTRING(x FROM s FOR n)` syntax. |
 | `translate` | `translate(varchar, from, to)` | passthrough | DataFusion `translate` |
-| `trim` | `trim(varchar)` | passthrough | DataFusion `trim` (also the `TRIM(BOTH ... FROM ...)` syntax) |
-| `upper` | `upper(varchar)` | passthrough | DataFusion `upper` |
+| `trim` | `trim(varchar)` | rewrite | Rust UDF `trino_trim`: strips every Java whitespace code point, like `ltrim`. The `TRIM([BOTH \| LEADING \| TRAILING] [chars] FROM x)` syntax strips any code point of `chars` (Trino's set semantics); the two-argument call `trim(x, chars)` is refused. |
+| `upper` | `upper(varchar)` | rewrite | Rust UDF `trino_upper`: Unicode simple (per-code-point) case mapping, as Java's `Character.toUpperCase`: `upper('straße')` keeps `ß` and `upper('ﬁ')` keeps the ligature (Rust's full mapping gives `SS` / `FI`). |
 
 ### Regular expression
 
 | Function | Trino signature | Handling | Translation |
 |---|---|---|---|
-| `regexp_extract` | `regexp_extract(varchar, pattern[, group]) → varchar` | rewrite | `array_element(regexp_match(x, '(' \|\| pattern \|\| ')'), group + 1)` — the pattern is wrapped in a capturing group so group 0 (the whole match) is addressable; `group` must be a literal. |
+| `regexp_extract` | `regexp_extract(varchar, pattern[, group]) → varchar` | rewrite | Rust UDF `trino_regexp_extract`: `group` must be a literal and is checked against the pattern's capture groups (`Pattern has 1 groups. Cannot access group 2`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\d`, `\w`, `\s`, `\b`, and `(?i)` are Unicode-aware (Trino runs Joni with Unicode character tables, which Rust's defaults match: `regexp_like('٣', '\d')` is true) and `$` (like `\Z`) asserts at the end of the text *or before a final newline*, as in Trino's engine, without consuming that newline (`regexp_extract('ab' \|\| chr(10), 'b$')` is `b` and `regexp_replace('ab' \|\| chr(10), 'b$', 'x')` keeps the newline): Rust's engine has no look-around, so the text is searched twice — whole, and with its final newline removed — which is exactly the pair of positions Joni can assert at, and the leftmost match wins. Two readings that match at the same position with different extents (`'[a-z\n]*$'` over a text ending in a newline) are refused rather than guessed at, as is a `$` that a consuming part of the pattern can follow (`b$\n`, `(a$)b`); `\h` / `\v` (which Joni reads differently from `java.util.regex`), look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors. |
 | `regexp_extract_all` | `regexp_extract_all(varchar, pattern[, group]) → array(varchar)` | unsupported | Refused: DataFusion's `regexp_match` returns only the first match. |
-| `regexp_like` | `regexp_like(varchar, pattern) → boolean` | passthrough | DataFusion `regexp_like` (Rust `regex` syntax, a close superset of Java's for common patterns) |
-| `regexp_replace` | `regexp_replace(varchar, pattern[, replacement]) → varchar` | rewrite | `regexp_replace(x, pattern, trino_regexp_replacement(replacement), 'g')` — Trino replaces every match (DataFusion only the first unless flagged), and the replacement is translated from Java syntax (`$1x` is group 1 then `x`; `\$` a literal dollar) to Rust's. Patterns use Rust `regex` syntax, which lacks look-around and back-references (those fail loudly). The lambda form is refused. |
+| `regexp_like` | `regexp_like(varchar, pattern) → boolean` | rewrite | Rust UDF `trino_regexp_like`. Patterns use Java syntax translated to Rust `regex` syntax: `\d`, `\w`, `\s`, `\b`, and `(?i)` are Unicode-aware (Trino runs Joni with Unicode character tables, which Rust's defaults match: `regexp_like('٣', '\d')` is true) and `$` (like `\Z`) asserts at the end of the text *or before a final newline*, as in Trino's engine, without consuming that newline (`regexp_extract('ab' \|\| chr(10), 'b$')` is `b` and `regexp_replace('ab' \|\| chr(10), 'b$', 'x')` keeps the newline): Rust's engine has no look-around, so the text is searched twice — whole, and with its final newline removed — which is exactly the pair of positions Joni can assert at, and the leftmost match wins. Two readings that match at the same position with different extents (`'[a-z\n]*$'` over a text ending in a newline) are refused rather than guessed at, as is a `$` that a consuming part of the pattern can follow (`b$\n`, `(a$)b`); `\h` / `\v` (which Joni reads differently from `java.util.regex`), look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors. |
+| `regexp_replace` | `regexp_replace(varchar, pattern[, replacement]) → varchar` | rewrite | Rust UDF `trino_regexp_replace`: every match is replaced, advancing the way Trino's `JoniRegexpFunctions` does — `getNextStart` only skips forward when the match *itself* was zero-width, so an empty match landing right after a non-empty one is still replaced (`regexp_replace('aaa', 'a*', 'X')` is `XX` and `regexp_replace('abc', 'b*', 'X')` is `XaXXcX`, exactly as Java's `Matcher.replaceAll`), where Rust's `Regex::replace_all` skips it and lost one replacement per such boundary; the replacement uses Java syntax (`$1x` is group 1 then `x`, `${name}` a named group, `\$` a literal dollar) and every group reference is validated against the pattern (`No group 2`, `No group with name {y}`, as in Trino). Patterns use Java syntax translated to Rust `regex` syntax: `\d`, `\w`, `\s`, `\b`, and `(?i)` are Unicode-aware (Trino runs Joni with Unicode character tables, which Rust's defaults match: `regexp_like('٣', '\d')` is true) and `$` (like `\Z`) asserts at the end of the text *or before a final newline*, as in Trino's engine, without consuming that newline (`regexp_extract('ab' \|\| chr(10), 'b$')` is `b` and `regexp_replace('ab' \|\| chr(10), 'b$', 'x')` keeps the newline): Rust's engine has no look-around, so the text is searched twice — whole, and with its final newline removed — which is exactly the pair of positions Joni can assert at, and the leftmost match wins. Two readings that match at the same position with different extents (`'[a-z\n]*$'` over a text ending in a newline) are refused rather than guessed at, as is a `$` that a consuming part of the pattern can follow (`b$\n`, `(a$)b`); `\h` / `\v` (which Joni reads differently from `java.util.regex`), look-around, back-references, possessive quantifiers (`a*+`, `a++`, `a{n,m}+` — Rust's engine would backtrack where Java's does not), `\p{Alpha}`-style POSIX classes, and the `u` / `U` inline flags are `INVALID_FUNCTION_ARGUMENT` errors. The lambda form is refused. |
 | `regexp_split` | `regexp_split(varchar, pattern) → array(varchar)` | unsupported | Refused: no DataFusion equivalent. |
 
 ### Date and time
@@ -143,13 +151,13 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 |---|---|---|---|
 | `at_timezone` | `at_timezone(timestamp, zone)` | unsupported | Refused in v0.1 along with `AT TIME ZONE`. |
 | `current_date` | `current_date → date` | passthrough | DataFusion `current_date` |
-| `current_time` | `current_time → time` | passthrough | DataFusion `current_time` |
-| `current_timestamp` | `current_timestamp → timestamp` | passthrough | DataFusion `current_timestamp` (UTC) |
-| `date` | `date(x) → date` | rewrite | `CAST(x AS DATE)` |
-| `date_add` | `date_add(unit, value, timestamp) → same type` | udf | Rust UDF: calendar arithmetic for month/quarter/year (clamps to month end), fixed lengths otherwise. Units: millisecond … year; adding sub-day units to a DATE is an error, and so is a fractional `value` (Trino requires bigint). |
-| `date_diff` | `date_diff(unit, timestamp1, timestamp2) → bigint` | udf | Rust UDF: `timestamp2 - timestamp1` in whole units, truncated toward zero; calendar months for month/quarter/year. |
-| `date_format` | `date_format(timestamp, format) → varchar` | rewrite | `to_char(x, <strftime>)` with the MySQL-style format translated specifier by specifier; the format must be a literal and unknown specifiers are refused. |
-| `date_parse` | `date_parse(varchar, format) → timestamp` | rewrite | `to_timestamp(x, <strftime>)` with the MySQL-style format translated; the format must be a literal. `%f` accepts 1-9 fractional digits when parsing, like Trino, but only directly after a `.`. |
+| `current_time` | `current_time → time` | unsupported | Refused: Trino's `current_time` is a `time(3) with time zone`, which glaux cannot return in v0.1. |
+| `current_timestamp` | `current_timestamp → timestamp` | rewrite | `now()` rounded to milliseconds as a `timestamp(3) with time zone` at UTC (Athena prints `2024-01-05 10:30:00.000 UTC`). |
+| `date` | `date(x) → date` | rewrite | Same as `CAST(x AS DATE)` (see `CAST`). |
+| `date_add` | `date_add(unit, value, timestamp) → same type` | udf | Rust UDF: calendar arithmetic for month/quarter/year (clamps to month end), fixed lengths otherwise, on the calendar value itself so dates such as `9999-12-31` work (no Arrow nanosecond range limit). Units: millisecond … year; adding sub-day units to a DATE is an error, and so is a fractional `value` (Trino requires bigint). |
+| `date_diff` | `date_diff(unit, timestamp1, timestamp2) → bigint` | udf | Rust UDF: `timestamp2 - timestamp1` in whole units, truncated toward zero for fixed units; month/quarter/year follow Joda-Time's `getDifference` as Trino does (`date_diff('month', DATE '2024-01-31', DATE '2024-02-29')` is 1; years balance February 29 against non-leap years). No Arrow nanosecond range limit. |
+| `date_format` | `date_format(timestamp, format) → varchar` | rewrite | `to_char(x, <strftime>)` with the MySQL-style format translated specifier by specifier; the format must be a literal and unknown specifiers are refused. `%v` (Monday-first week) and `%x` (the week-year it belongs to) map onto chrono's ISO `%V` / `%G`. |
+| `date_parse` | `date_parse(varchar, format) → timestamp` | rewrite | Rust UDF `trino_date_parse(x, <strftime>, ...)` with the MySQL-style format translated; the format must be a literal and the input a varchar, and the result is a zone-less `timestamp(3)` (fractions beyond milliseconds are truncated, as Joda does). Every field the format does not name keeps the epoch default Joda's parse bucket starts from, so `date_parse('2024-01-05 10', '%Y-%m-%d %H')` is `10:00:00`, `date_parse('2024-01-05 10:30', '%Y-%m-%d %h:%i')` is `10:30:00` (a 12-hour field with no `%p` is AM, as Joda's `clockhourOfHalfday` default is), `date_parse('12:30 AM', '%h:%i %p')` is `1970-01-01 00:30:00`, and `date_parse('2024-01', '%Y-%m')` is the first of the month. DataFusion's `to_timestamp` is not used: chrono's field resolution needs hour + minute (and AM/PM for a 12-hour field) and silently fell back to midnight for the rest, dropping the whole time of day. `%f` accepts 1-9 fractional digits when parsing, like Trino, but only directly after a `.`. A second of `60` (chrono's leap second, which DataFusion would roll over to the next minute) is refused with Joda's `Value 60 for secondOfMinute must be in the range [0,59]`. A format that names a weekday without pinning the date down (`%W` alone, which Joda resolves against its epoch base) is refused rather than guessed at. |
 | `date_trunc` | `date_trunc(unit, x) → same as x` | rewrite | Rust UDF `trino_date_trunc`: a `date` input stays a `date` (DataFusion's `date_trunc` returns a timestamp), sub-day units on a `date` are refused, and varchar input is refused (`TYPE_MISMATCH`, as in Trino). Weeks start on Monday. |
 | `day` | `day(x) → bigint` | rewrite | `CAST(date_part('day', x) AS BIGINT)` |
 | `day_of_month` | `day_of_month(x) → bigint` | rewrite | `CAST(date_part('day', x) AS BIGINT)` |
@@ -157,17 +165,17 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | `day_of_year` | `day_of_year(x) → bigint` | rewrite | `CAST(date_part('doy', x) AS BIGINT)` |
 | `dow` | `dow(x) → bigint` | rewrite | Alias of `day_of_week` |
 | `doy` | `doy(x) → bigint` | rewrite | Alias of `day_of_year` |
-| `format_datetime` | `format_datetime(timestamp, pattern) → varchar` | rewrite | `to_char(x, <strftime>)` with the Joda pattern translated; the pattern must be a literal and unknown pattern letters are refused. `Z` / `ZZ` / `ZZZ` print `+0000` / `+00:00` / `UTC` (timestamps are UTC instants). |
+| `format_datetime` | `format_datetime(timestamp, pattern) → varchar` | rewrite | `to_char(x, <strftime>)` with the Joda pattern translated; the pattern must be a literal and unknown pattern letters are refused. Numeric fields honour Joda's letter count as a minimum digit count (`D` prints `5`, `DDD` `005`, `w` `1`, `ww` `01`, `H:m:s` `14:5:9`); counts chrono cannot pad to (`DD`, `yyyyy`, `ddd`, `ee`, ...) are refused by name. `Z` / `ZZ` / `ZZZ` print `+0000` / `+00:00` / `UTC` (timestamps are UTC instants). |
 | `from_iso8601_date` | `from_iso8601_date(varchar) → date` | udf | Rust UDF: strict ISO-8601 calendar date (`YYYY-MM-DD`, also `YYYY-MM` / `YYYY`); anything else (`2024-1-1`, ordinal or week dates) is an error. |
-| `from_iso8601_timestamp` | `from_iso8601_timestamp(varchar) → timestamp with time zone` | udf | Rust UDF: strict ISO-8601 (`YYYY-MM-DD[THH[:mm[:ss[.fff]]]][Z\|±HH:mm]`); a space separator or single-digit fields are errors, as in Trino. The instant is returned as a UTC `timestamp(3)` (the input's offset is applied, not preserved). |
-| `from_unixtime` | `from_unixtime(double) → timestamp` | rewrite | `arrow_cast(CAST(round(x * 1000) AS BIGINT), 'Timestamp(Millisecond, None)')` (rounded to the millisecond, like Athena: `from_unixtime(1.9999)` is `…:02.000`). The zone-argument forms are refused. |
+| `from_iso8601_timestamp` | `from_iso8601_timestamp(varchar) → timestamp with time zone` | udf | Rust UDF: strict ISO-8601 (`YYYY-MM-DD[THH[:mm[:ss[.fff]]]][Z\|+00:00]`); a space separator or single-digit fields are errors, as in Trino. The result is a `timestamp(3) with time zone` at UTC (Athena prints `... UTC`); an input with a non-zero offset is refused, because Trino keeps the offset and glaux cannot. |
+| `from_unixtime` | `from_unixtime(double) → timestamp(3) with time zone` | rewrite | Rust UDF `trino_from_unixtime`: a `timestamp(3) with time zone` at UTC (Athena prints `1970-01-01 00:00:00.000 UTC`), rounded to the millisecond with Java's `Math.round` — half towards *positive infinity*, so `from_unixtime(-0.0005)` is the epoch and `from_unixtime(1.9999)` is `…:02.000`. DataFusion's `round` is not used: it rounds half away from zero, which is a millisecond off for every negative half-millisecond epoch. `NaN` rounds to the epoch, as `Math.round(NaN)` is `0`; a value beyond the 52 bits Trino packs a zoned timestamp into is `Millis overflow`. Only a numeric argument is accepted (Trino declares `from_unixtime(double)` and does not coerce varchar or boolean to it), and the zone-argument forms are refused. |
 | `hour` | `hour(x) → bigint` | rewrite | `CAST(date_part('hour', x) AS BIGINT)` |
 | `last_day_of_month` | `last_day_of_month(x) → date` | unsupported | Refused: no DataFusion equivalent. Use `date_add('day', -1, date_add('month', 1, date_trunc('month', x)))`. |
-| `localtimestamp` | `localtimestamp → timestamp` | rewrite | `now()` (UTC) |
+| `localtimestamp` | `localtimestamp → timestamp` | rewrite | `now()` rounded to milliseconds as a zone-less `timestamp(3)` (UTC). |
 | `minute` | `minute(x) → bigint` | rewrite | `CAST(date_part('minute', x) AS BIGINT)` |
 | `month` | `month(x) → bigint` | rewrite | `CAST(date_part('month', x) AS BIGINT)` |
-| `now` | `now() → timestamp with time zone` | passthrough | DataFusion `now` (UTC) |
-| `parse_datetime` | `parse_datetime(varchar, pattern) → timestamp` | rewrite | `to_timestamp(x, <strftime>)` with the Joda pattern translated; the pattern must be a literal. `SSS` / `SSSSSS` parse exactly that many fractional digits (Joda accepts fewer). |
+| `now` | `now() → timestamp with time zone` | rewrite | Same as `current_timestamp`. |
+| `parse_datetime` | `parse_datetime(varchar, pattern) → timestamp` | rewrite | Rust UDF `trino_date_parse` (see `date_parse`, including Joda's epoch defaults for the fields the pattern leaves out: `parse_datetime('2024-01-05 10', 'yyyy-MM-dd HH')` is `10:00:00` and `'yyyy-MM-dd hh a'` reads `10 PM` as `22:00:00`) with the Joda pattern translated, re-tagged as a `timestamp(3) with time zone` at UTC (Athena prints `... UTC`); the pattern must be a literal. `SSS` / `SSSSSS` parse exactly that many fractional digits (Joda accepts fewer). Zone letters (`Z`, `z`) are refused: Trino would keep the parsed offset, which glaux cannot. |
 | `quarter` | `quarter(x) → bigint` | rewrite | `CAST(date_part('quarter', x) AS BIGINT)` |
 | `second` | `second(x) → bigint` | rewrite | `CAST(date_part('second', x) AS BIGINT)` |
 | `to_iso8601` | `to_iso8601(x) → varchar` | unsupported | Refused: the output depends on the argument type. Use `format_datetime(x, 'yyyy-MM-dd''T''HH:mm:ss.SSS')` or `CAST(x AS VARCHAR)`. |
@@ -181,28 +189,30 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 
 | Function | Trino signature | Handling | Translation |
 |---|---|---|---|
-| `abs` | `abs(x)` | passthrough | DataFusion `abs` |
+| `abs` | `abs(x)` | passthrough | DataFusion `abs`, which is overflow-checked per type like Trino's: the minimum of an integer type has no positive counterpart, so `abs(CAST(-9223372036854775808 AS BIGINT))` is refused with `NUMERIC_VALUE_OUT_OF_RANGE`, worded as in Trino's `MathFunctions.abs` — `Value -9223372036854775808 is out of range for abs(bigint)` (DataFusion named its Arrow array type: `Int64Array overflow on abs(...)`). Every other numeric type keeps the argument's own type, a `decimal(p, s)` its precision and scale. |
 | `cbrt` | `cbrt(x) → double` | passthrough | DataFusion `cbrt` |
-| `ceil` | `ceil(x)` | passthrough | DataFusion `ceil` (on DECIMAL inputs the result keeps the input's scale — `2.0` where Trino gives `2`) |
-| `ceiling` | `ceiling(x)` | rewrite | `ceil(x)` |
+| `ceil` | `ceil(x)` | rewrite | Rust UDF `trino_ceil`: keeps an integer argument's type (`ceil(5)` is the bigint `5`, not `5.0`) and returns `decimal(p - s + min(s, 1), 0)` for a `decimal(p, s)` (`ceil(2.5)` is `3`), as in Trino. |
+| `ceiling` | `ceiling(x)` | rewrite | Same as `ceil`. |
 | `exp` | `exp(x) → double` | passthrough | DataFusion `exp` |
-| `floor` | `floor(x)` | passthrough | DataFusion `floor` (on DECIMAL inputs the result keeps the input's scale — `-2.0` where Trino gives `-2`) |
-| `greatest` | `greatest(a, b, ...)` | rewrite | `CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE greatest(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type. |
-| `least` | `least(a, b, ...)` | rewrite | `CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE least(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type. |
+| `floor` | `floor(x)` | rewrite | Rust UDF `trino_floor`: keeps an integer argument's type (`floor(5)` is the bigint `5`) and returns `decimal(p - s + min(s, 1), 0)` for a `decimal(p, s)` (`floor(-2.5)` is `-3`), as in Trino. |
+| `greatest` | `greatest(a, b, ...)` | rewrite | `CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE greatest(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type. Over DOUBLE / REAL arguments glaux substitutes its own function ranking NaN smallest (`greatest(1e0, NaN)` is `1.0`), matching Trino's `COMPARISON_UNORDERED_FIRST`; `least` needs no substitute (both engines rank NaN largest there). Over arrays it goes through Trino's array ordering operator, which raises `ARRAY comparison not supported for arrays with null elements` once a shared prefix forces it to read a NULL element (Arrow's kernels would rank the NULL and answer). |
+| `infinity` | `infinity() → double` | rewrite | `trino_double('Infinity')` — glaux's `CAST(varchar AS DOUBLE)`, which follows Java's `Double.parseDouble`. There is no infinite literal to fold onto, and DataFusion has no such function. Negative infinity is `-infinity()`. |
+| `least` | `least(a, b, ...)` | rewrite | `CASE WHEN a IS NULL OR b IS NULL ... THEN NULL ELSE least(a, b, ...) END`: NULL if any argument is NULL, as in Trino (DataFusion skips NULLs). Arguments must share a type. Over arrays it goes through Trino's array ordering operator, which raises `ARRAY comparison not supported for arrays with null elements` once a shared prefix forces it to read a NULL element (Arrow's kernels would rank the NULL and answer). |
 | `ln` | `ln(x) → double` | passthrough | DataFusion `ln` |
-| `log` | `log(base, x) → double` | passthrough | DataFusion `log(base, x)` (same argument order) |
+| `log` | `log(base, x) → double` | passthrough | DataFusion `log(base, x)` (same argument order). Trino has only the two-argument form: `log(x)` is refused (DataFusion would run it as `log10`); use `log10`, `log2`, or `ln`. |
 | `log10` | `log10(x) → double` | passthrough | DataFusion `log10` |
-| `log2` | `log2(x) → double` | passthrough | DataFusion `log2` |
+| `log2` | `log2(x) → double` | rewrite | `log(CAST(2 AS DOUBLE), CAST(x AS DOUBLE))`. Trino's `log2` is not a base-2 logarithm routine: `MathFunctions.log2` evaluates `Math.log(num) / Math.log(2)`, which differs from a correctly rounded base-2 log by an ULP for some inputs (`log2(3e0)` is `1.5849625007211563`, `log2(1e2)` is `6.643856189774725`). DataFusion's `log2` is Rust's `f64::log2` intrinsic and answers `1.584962500721156` / `6.643856189774724`, so the call goes through DataFusion's two-argument `log`, which is `ln(x) / ln(base)` — the expression Trino evaluates. |
 | `mod` | `mod(n, m)` | rewrite | `n % m` |
+| `nan` | `nan() → double` | rewrite | `trino_double('NaN')` — glaux's `CAST(varchar AS DOUBLE)`, which follows Java's `Double.parseDouble`. There is no NaN literal to fold onto, and DataFusion has no such function; `0e0 / 0e0` is the same value. |
 | `pi` | `pi() → double` | passthrough | DataFusion `pi` |
-| `pow` | `pow(x, p) → double` | passthrough | DataFusion `pow` |
-| `power` | `power(x, p) → double` | passthrough | DataFusion `power` |
+| `pow` | `pow(x, p) → double` | rewrite | Rust UDF `trino_power(CAST(x AS DOUBLE), CAST(p AS DOUBLE))`: always a double, as in Trino (DataFusion keeps integer arguments integral), and Java's `Math.pow` value throughout — `power(0, -1)` is `Infinity` and `power(-0e0, -1)` is `-Infinity`, where DataFusion carries PostgreSQL's `zero raised to a negative power is undefined` guard. The four cases where `Math.pow` departs from C's `pow` are reproduced too: `p = 0` is `1.0` for any `x`, `p = 1` is `x`, a NaN `p` is NaN (so `power(1, nan())` is NaN, not `1.0`), and `\|x\| = 1` with an infinite `p` is NaN. |
+| `power` | `power(x, p) → double` | rewrite | Rust UDF `trino_power(CAST(x AS DOUBLE), CAST(p AS DOUBLE))`: always a double, as in Trino (DataFusion keeps integer arguments integral), and Java's `Math.pow` value throughout — `power(0, -1)` is `Infinity` and `power(-0e0, -1)` is `-Infinity`, where DataFusion carries PostgreSQL's `zero raised to a negative power is undefined` guard. The four cases where `Math.pow` departs from C's `pow` are reproduced too: `p = 0` is `1.0` for any `x`, `p = 1` is `x`, a NaN `p` is NaN (so `power(1, nan())` is NaN, not `1.0`), and `\|x\| = 1` with an infinite `p` is NaN. |
 | `rand` | `rand() → double` | rewrite | `random()` |
-| `random` | `random() → double` | passthrough | DataFusion `random` |
-| `round` | `round(x[, d])` | passthrough | DataFusion `round` (half away from zero, like Trino). On DECIMAL inputs the result stays a decimal, so `round(2.5)` renders `3` and `round(2.789, 2)` renders `2.79`, matching Trino. |
-| `sign` | `sign(x)` | rewrite | `signum(x)` (always a double; Trino keeps the argument's type) |
-| `sqrt` | `sqrt(x) → double` | passthrough | DataFusion `sqrt` |
-| `truncate` | `truncate(x[, n])` | rewrite | `trunc(x[, n])`. On DECIMAL inputs the result keeps the input's scale, so the value is right but the text has extra zeros (`truncate(2.789, 2)` renders `2.780`, and `truncate(2.7)` renders `2.0` where Trino gives `2`); on DOUBLE inputs the text matches Trino. |
+| `random` | `random() → double, random(n) → same integer type as n` | rewrite | DataFusion `random` for the nullary form; the bounded overload becomes the Rust UDF `trino_random(n, random())`, a uniform value in `[0, n)` with `n`'s own type and an `INVALID_FUNCTION_ARGUMENT` for `n <= 0`, as in Trino. |
+| `round` | `round(x[, d])` | rewrite | Rust UDF `trino_round`: for doubles exactly Trino's `Math.round(x · 10ⁿ) / 10ⁿ` (sign-flipped for negatives, Trino's BigInteger fallback when `Math.round` saturates), so the double product decides the tie: `round(2.675, 2)` is `2.68` (the product is exactly `267.5`, though the double `2.675` is below 2.675) but `round(1.005, 2)` is `1.0` (the product is `100.49999999999999`); DataFusion rounds the exact decimal instead and answers `2.67` / `1.01`. Trino declares the double overload `neverFails`, so the edge branches return values rather than erroring: a product that overflows to infinity gives `x` back (`round(1e308, 2)` is `1e308`) and an `n` so negative that `10ⁿ` underflows to zero gives a signed zero (`round(-1.5e0, -400)` is `-0.0`). Integers keep their type (`round(1250, -2)` is `1300`); a `decimal(p, s)` rounds HALF_UP to `decimal(p - s + min(s, 1), 0)` with one argument and to `decimal(p + 1, s)` with two (`round(2.789, 2)` is `2.790`). |
+| `sign` | `sign(x)` | rewrite | Rust UDF `trino_sign`: the argument's type for integers and doubles, `decimal(1, 0)` for decimals, as in Trino. |
+| `sqrt` | `sqrt(x) → double` | rewrite | Rust UDF `trino_sqrt`: `NaN` for a negative argument, as Java's `Math.sqrt` (DataFusion raises an error). |
+| `truncate` | `truncate(x[, n])` | rewrite | Rust UDF `trino_truncate`: integers keep their type; a `decimal(p, s)` becomes `decimal(max(1, p - s), 0)` with one argument (Trino's `@Constraint(variable = "rp", expression = "max(1, p - s)")`, one digit narrower than `ceiling` / `floor`'s `p - s + min(s, 1)`, so `truncate(1.98)` is `decimal(1,0)`) and keeps `decimal(p, s)` with two (`truncate(2.789, 2)` is `2.780`); single-argument `truncate(double)` is `signum(x) · floor(\|x\|)`. `truncate(double, n)` is refused by name: the two-argument overload exists only for DECIMAL — neither Trino (Athena engine v3) nor Presto 0.217 (engine v2) declares one for DOUBLE / REAL, so Athena answers it with a function-resolution error, and DataFusion's own two-argument trunc would silently return a value Athena never would. |
 
 ### Array
 
@@ -211,16 +221,16 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | `all_match` | `all_match(array, lambda)` | unsupported | Refused: lambda expressions are not translated. |
 | `any_match` | `any_match(array, lambda)` | unsupported | Refused: lambda expressions are not translated. |
 | `array_distinct` | `array_distinct(array) → array` | passthrough | DataFusion `array_distinct` |
-| `array_join` | `array_join(array, delimiter[, null_replacement]) → varchar` | rewrite | `array_to_string(array, delimiter[, null_replacement])` (NULL elements are skipped unless a replacement is given, like Trino) |
-| `array_max` | `array_max(array)` | passthrough | DataFusion `array_max` |
-| `array_min` | `array_min(array)` | passthrough | DataFusion `array_min` |
-| `array_position` | `array_position(array, element) → bigint` | rewrite | `CASE WHEN array IS NULL THEN NULL ELSE coalesce(CAST(array_position(array, element) AS BIGINT), 0) END` — Trino returns 0 for a missing element where DataFusion returns NULL. |
-| `array_remove` | `array_remove(array, element) → array` | rewrite | `array_remove_all(array, element)` — Trino removes every occurrence, DataFusion's `array_remove` only the first. |
-| `array_sort` | `array_sort(array) → array` | rewrite | `array_sort(x, 'ASC', 'NULLS LAST')`: ascending with NULL elements last, as in Trino (DataFusion's default puts them first). The comparator-lambda form is refused. |
+| `array_join` | `array_join(array, delimiter[, null_replacement]) → varchar` | rewrite | Rust UDF `trino_array_join`: elements are rendered in Trino's text forms (`1.0`, `2024-01-05 10:00:00.000`); NULL elements are skipped unless a replacement is given, like Trino. |
+| `array_max` | `array_max(array)` | rewrite | Rust UDF `trino_array_max`: NULL when the array is empty or has a NULL element, as in Trino (DataFusion skips NULL elements); NaN ranks smallest (`array_max(ARRAY[1e0, NaN])` is `1.0`), matching Trino's `COMPARISON_UNORDERED_FIRST`. Ranking elements that are themselves arrays uses Trino's array ordering operator, so a NULL *inside* one of them raises `ARRAY comparison not supported for arrays with null elements`. |
+| `array_min` | `array_min(array)` | rewrite | Rust UDF `trino_array_min`: NULL when the array is empty or has a NULL element, as in Trino (DataFusion skips NULL elements). Ranking elements that are themselves arrays uses Trino's array ordering operator, so a NULL *inside* one of them raises `ARRAY comparison not supported for arrays with null elements`. |
+| `array_position` | `array_position(array, element) → bigint` | rewrite | Rust UDF `trino_array_position`: 0 for a missing element (DataFusion returns NULL), NULL for a NULL array or element argument, and Trino's EQUAL semantics for float elements (`array_position(ARRAY[NaN], NaN)` is 0; NaN equals nothing). |
+| `array_remove` | `array_remove(array, element) → array` | rewrite | Rust UDF `trino_array_remove`: every occurrence is removed, NULL elements are kept (`array_remove(ARRAY[1, NULL], 1)` is `[NULL]`), a NULL element argument gives NULL, as in Trino. Float elements match with Trino's EQUAL semantics, so NaN is never removed. |
+| `array_sort` | `array_sort(array) → array` | rewrite | `array_sort(x, 'ASC', 'NULLS LAST')`: ascending with NULL elements last, as in Trino (DataFusion's default puts them first). Sorting elements that are themselves arrays uses Trino's array ordering operator, so a NULL *inside* one of them raises `ARRAY comparison not supported for arrays with null elements`. The comparator-lambda form is refused. |
 | `array_union` | `array_union(a, b) → array` | passthrough | DataFusion `array_union` |
-| `arrays_overlap` | `arrays_overlap(a, b) → boolean` | rewrite | Rust UDF `trino_arrays_overlap`: NULL (not false) when no element matches but either array has a NULL element, as in Trino. Element types must be comparable. |
+| `arrays_overlap` | `arrays_overlap(a, b) → boolean` | rewrite | Rust UDF `trino_arrays_overlap`: NULL (not false) when no element matches but either array has a NULL element, as in Trino. An *empty* array short-circuits to false first, as Trino's `ArraysOverlapFunction` tests `leftPositionCount == 0 \|\| rightPositionCount == 0` before it looks at NULL elements, so `arrays_overlap(ARRAY[], ARRAY[NULL])` is false while `arrays_overlap(ARRAY[NULL], ARRAY[NULL])` is NULL. Element types must be comparable. |
 | `cardinality` | `cardinality(array) → bigint` | rewrite | `CAST(cardinality(array) AS BIGINT)` (DataFusion returns an unsigned integer) |
-| `contains` | `contains(array, element) → boolean` | rewrite | Rust UDF `trino_contains`: NULL (not false) when the element is not found but the array has a NULL element, or when the element is NULL, as in Trino. The element type must be comparable with the array's. |
+| `contains` | `contains(array, element) → boolean` | rewrite | Rust UDF `trino_contains`: NULL (not false) when the element is not found but the array has a NULL element, or when the element is NULL, as in Trino. The element type must be comparable with the array's. Float elements match with Trino's EQUAL semantics (`contains(ARRAY[NaN], NaN)` is false, `contains(ARRAY[0e0], -0e0)` is true). |
 | `element_at` | `element_at(array, index)` | rewrite | Rust UDF `trino_element_at`: 1-based, negative indexes count from the end, NULL past either end, `index = 0` is an error (`SQL array indices start at 1`). `element_at` on maps is refused. |
 | `filter` | `filter(array, lambda)` | unsupported | Refused: lambda expressions are not translated. |
 | `flatten` | `flatten(array(array)) → array` | passthrough | DataFusion `flatten` |
@@ -248,12 +258,12 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 |---|---|---|---|
 | `json_array_contains` | `json_array_contains(json, value) → boolean` | unsupported | Refused in v0.1. Use `json_extract_scalar` on known indexes. |
 | `json_array_get` | `json_array_get(json, index) → json` | unsupported | Refused in v0.1. Use `json_extract(json, '$[index]')`. |
-| `json_array_length` | `json_array_length(json) → bigint` | udf | Rust UDF (NULL when the value is not an array) |
-| `json_extract` | `json_extract(json, json_path) → json` | udf | Rust UDF; the JSON type is represented as its text. JSONPath subset: `$`, `.key`, `["key"]`, `[n]` — wildcards, recursive descent, slices and filters are refused. |
-| `json_extract_scalar` | `json_extract_scalar(json, json_path) → varchar` | udf | Rust UDF; same JSONPath subset. NULL for missing paths, JSON nulls, objects and arrays. |
-| `json_format` | `json_format(json) → varchar` | udf | Rust UDF (re-serialises compactly) |
-| `json_parse` | `json_parse(varchar) → json` | udf | Rust UDF: validates the text (invalid JSON is an error, like Trino) and keeps it as text. |
-| `json_size` | `json_size(json, json_path) → bigint` | udf | Rust UDF: member count of the object/array at the path, 0 for scalars |
+| `json_array_length` | `json_array_length(json) → bigint` | udf | Rust UDF: NULL when the value is not an array, and NULL for text that is not valid JSON (Trino's varchar overload; only `json_parse` raises). |
+| `json_extract` | `json_extract(json, json_path) → json` | udf | Rust UDF; the JSON type is represented as its text, and the result column is reported to clients as `json` (see *Result metadata*). JSONPath subset: `$`, `.key`, `["key"]`, `[n]` — wildcards, recursive descent, slices and filters are refused. Text that is not valid JSON gives NULL (Trino's varchar overload). A duplicate key resolves to its first occurrence, as in Trino; the matched value is re-serialised compactly in document order with non-integer numbers in Java double text (`2.50` becomes `2.5`). |
+| `json_extract_scalar` | `json_extract_scalar(json, json_path) → varchar` | udf | Rust UDF; same JSONPath subset. NULL for missing paths, JSON nulls, objects and arrays, and for text that is not valid JSON (Trino's varchar overload; only `json_parse` raises). Numbers are returned as written (`1.50`, `1e2`, a 30-digit integer), and a duplicate key resolves to its first occurrence, as in Trino. |
+| `json_format` | `json_format(json) → varchar` | udf | Rust UDF: Trino's canonical JSON text (sorted keys, last duplicate key wins, exact integers, Java double text for other numbers). |
+| `json_parse` | `json_parse(varchar) → json` | udf | Rust UDF: validates the text (invalid JSON is an error, like Trino) and keeps it as Trino's canonical text — the result column is reported to clients as `json` (see *Result metadata*): sorted keys, last duplicate key wins, integers exact at any size, other numbers in Java double text (`1e2` becomes `100.0`). |
+| `json_size` | `json_size(json, json_path) → bigint` | udf | Rust UDF: member count of the object/array at the path, 0 for scalars, NULL for text that is not valid JSON. |
 
 ### Misc
 
@@ -276,131 +286,403 @@ Functions not in this table are refused with `FUNCTION_NOT_FOUND`, even when Dat
 
 Every corpus query runs against glaux's Athena service over the fixture tables stored as Parquet (`customers`), NDJSON (`orders`) and delimited text (`countries`), and is diffed against a recorded snapshot (`crates/glaux-fidelity/tests/snapshots/`). Rows are compared positionally under a top-level `ORDER BY` and as a multiset otherwise; floating-point columns within a relative 1e-9; timestamps as instants. Negative cases must fail naming the construct the corpus expects.
 
-**119 cases** (37 queries, 82 error cases): 119 match their snapshot. Snapshot provenance: **0 verified against real Athena**, 119 UNVERIFIED (self-recorded from glaux; re-record with `cargo run -p glaux-fidelity -- record`).
+**391 cases** (124 queries, 267 error cases): 391 match their snapshot. Snapshot provenance: **0 verified against real Athena**, 391 UNVERIFIED (self-recorded from glaux; re-record with `cargo run -p glaux-fidelity -- record`).
 
 > **UNVERIFIED** snapshots pin glaux's current behaviour so regressions are caught, but they do not yet prove agreement with AWS Athena. Treat the `match` column for those rows as "stable", not "verified".
 
 | Case | Kind | Tables (format) | Result | Snapshot |
 |---|---|---|---|---|
-| agg_approx_and_stats | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| agg_array_agg_ordered | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| array_functions | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| array_subscripts | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| dt_extract_and_iso | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| dt_formats_and_epochs | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| dt_interval_and_parts | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| expr_case_cast_predicates | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| expr_cast_semantics | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| fmt_csv_countries_anti_join | query, ordered | customers (Parquet), countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| fmt_csv_countries_join | query, ordered | customers (Parquet), countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| fmt_json_orders_types | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| fmt_parquet_customers_types | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| fmt_three_way_join | query, ordered | customers (Parquet), orders (JSON), countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| json_functions | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| math_functions | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_approx_percentile_array | error case (`approx_percentile`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_at_time_zone | error case (`AT TIME ZONE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_bigint_overflow_add | error case (`NUMERIC_VALUE_OUT_OF_RANGE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_bigint_overflow_mul | error case (`NUMERIC_VALUE_OUT_OF_RANGE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_bigint_overflow_sum | error case (`NUMERIC_VALUE_OUT_OF_RANGE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_bracket_array_literal | error case (`[...] array literal`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_cast_invalid_integer | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_cast_overflow | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_cast_varbinary | error case (`CAST(... AS VARBINARY)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_csv_unknown_column | error case (`capital`) | countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_ctas | error case (`not supported`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_datafusion_only_name | error case (`array_element`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_add_fractional | error case (`value must be an integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_add_subday_on_date | error case (`cannot be added to a DATE`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_add_unknown_unit | error case (`fortnight`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_minus_date | error case (`date subtraction`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_parse_bad_input | error case (`garbage`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_parse_non_literal_format | error case (`string literal`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_parse_unknown_specifier | error case (`%Q`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_date_trunc_hour_on_date | error case (`not a valid DATE field`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_distinct_on | error case (`DISTINCT ON`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_division_by_zero | error case (`DIVISION_BY_ZERO`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_double_colon_cast | error case (`:: cast`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_element_at_zero | error case (`SQL array indices start at 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_extract_epoch | error case (`EXTRACT(EPOCH)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_for_update | error case (`FOR UPDATE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_format_datetime_unknown_letter | error case (`'z'`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_from_unixtime_zone | error case (`time-zone`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_group_by_all | error case (`GROUP BY ALL`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_insert | error case (`not supported`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_invalid_date_literal | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_iso8601_date_single_digit | error case (`not an ISO-8601 value`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_iso8601_garbage | error case (`from_iso8601_timestamp`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_iso8601_timestamp_space | error case (`not an ISO-8601 value`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_json_invalid_input | error case (`invalid JSON`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_json_path_wildcard | error case (`wildcard`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_lambda_array_sort | error case (`lambda`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_lambda_transform | error case (`lambda expression`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_map_function | error case (`function map`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_max_by | error case (`function max_by`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_multiple_statements | error case (`Multiple statements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_natural_join | error case (`NATURAL JOIN`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_qualify | error case (`QUALIFY`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_regexp_replace_illegal_group | error case (`illegal group reference`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_repeat_is_a_trap | error case (`function repeat`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_row_type | error case (`ROW / MAP`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_semi_join | error case (`SEMI / ANTI JOIN`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_split_part_zero | error case (`greater than zero`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_split_three_args | error case (`3-argument`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_strpos_three_args | error case (`3-argument`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_subscript_out_of_range | error case (`array subscript must be less than or equal to array length`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_substr_fractional_start | error case (`start must be an integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_syntax_error | error case (`SYNTAX_ERROR`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_tablesample | error case (`TABLESAMPLE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_timestamp_minus_timestamp | error case (`date subtraction`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_try | error case (`function try`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_case_operand | error case (`Cannot apply operator: bigint = varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_case_results | error case (`All CASE results must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_coalesce | error case (`All COALESCE operands must be the same type`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_concat | error case (`Cannot apply operator: varchar || bigint`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_contains | error case (`cannot compare varchar with bigint`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_date_format_varchar | error case (`Unexpected parameters (varchar) for date/time function`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_date_trunc_varchar | error case (`Unexpected parameters (varchar, varchar) for function date_trunc`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_date_union | error case (`column 1 in UNION query has incompatible types: date, varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_date_varchar | error case (`Cannot apply operator: date = varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_extract_varchar | error case (`Unexpected parameters (varchar) for date/time function`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_greatest | error case (`All GREATEST operands must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_if | error case (`All CASE results must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_in_list | error case (`Cannot apply operator: bigint = varchar`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_in_subquery | error case (`value and result of subquery must be of the same type`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_join_on | error case (`Cannot apply operator: bigint = varchar`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_join_using | error case (`Cannot apply operator: bigint = varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_literal_compare | error case (`TYPE_MISMATCH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_nullif | error case (`All NULLIF operands must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_to_unixtime_varchar | error case (`Unexpected parameters (varchar) for function to_unixtime`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_union | error case (`column 1 in UNION query has incompatible types: bigint, varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_varchar_int | error case (`Cannot apply operator: varchar = bigint`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_type_mismatch_year_varchar | error case (`Unexpected parameters (varchar) for date/time function`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_tz_literal | error case (`timestamp with time zone literal`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_unknown_column | error case (`nope`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_unknown_function | error case (`frobnicate`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| neg_unnest | error case (`UNNEST`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| regex_functions | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| sem_alias_case | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| sem_identifiers | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| sem_nested_output_names | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| sem_null_ordering | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| sem_numeric_literals | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| sem_output_names | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_cte_chain | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_group_by_having | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_group_by_rollup | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_join_full_outer | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_join_inner_cross | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_join_left_using | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_order_limit_offset | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_set_operations | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_subqueries | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_values_anonymous | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_values_distinct | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| shape_window_functions | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| str_functions | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| str_substr_split_part | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
+| agg_approx_and_stats | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_approx_percentile_grouped | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_approx_percentile_overloads | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_array_agg_ordered | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_decimal_sum_avg | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_decimal_window | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_group_by_empty | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_real_sum_avg | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_real_window | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_comparison | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_concat_null | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ctor_numeric_unification | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ctor_type_mismatch | error case (`All ARRAY elements must be the same type or coercible to a common type`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ctor_type_mismatch_cast | error case (`Cannot find common type between integer and varchar(1)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ctor_type_mismatch_join | error case (`All ARRAY elements must be the same type or coercible to a common type`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ctor_type_mismatch_subscript | error case (`All ARRAY elements must be the same type or coercible to a common type`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_empty_literal_unification | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_functions | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_elements | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_agg_order_by | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_array_max | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_array_min | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_array_sort | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_between | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_greatest | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_least | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_max | error case (`ARRAY comparison not supported for arrays with null elements`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_min | error case (`ARRAY comparison not supported for arrays with null elements`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_null_ranking_window | error case (`ARRAY comparison not supported for arrays with null elements`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_order_by | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_overlap_empty_arrays | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_overlap_empty_column | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ranking_aggregates | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_ranking_without_nulls | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| array_subscripts | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| cast_varchar_text_grammars | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_nan_comparisons | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_nan_constructors | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_nan_extremes | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_nan_join | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_nan_membership | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_nan_window_max | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_negative_zero | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| double_special_array_eq | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_date_diff_joda | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_date_interval_days | query, unordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_extract_and_iso | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_far_dates | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_format_datetime_joda_digits | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_format_weekyear | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_formats_and_epochs | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_from_unixtime_rounding | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_from_unixtime_zone | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_interval_and_parts | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_parse_far_dates | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_parse_partial_fields | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_timestamp_literals | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_timestamp_precision | query, ordered | events (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_zoned_values | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| exists_double_correlated | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_case_cast_predicates | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_cast_boolean | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_cast_decimal | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_cast_double_text | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_cast_semantics | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_cast_temporal | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_integer_division | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_negation_overflow_types | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| expr_nullif_first_arg_type | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| fetch_first_rows | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| fmt_csv_countries_anti_join | query, ordered | customers (Parquet), countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| fmt_csv_countries_join | query, ordered | customers (Parquet), countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| fmt_json_orders_types | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| fmt_parquet_customers_types | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| fmt_three_way_join | query, ordered | customers (Parquet), orders (JSON), countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| json_functions | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| json_malformed_input | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| json_numeric_text | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_abs_types | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_functions | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_log2_java_formula | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_power_ieee | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_random_bounded | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_round_double_edges | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_sqrt_nan | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_trino_types | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| math_truncate_decimal_precision | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_abs_overflow | error case (`NUMERIC_VALUE_OUT_OF_RANGE: Value -9223372036854775808 is out of range for abs(bigint)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_abs_overflow_integer | error case (`NUMERIC_VALUE_OUT_OF_RANGE: Value -2147483648 is out of range for abs(integer)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_abs_overflow_smallint | error case (`NUMERIC_VALUE_OUT_OF_RANGE: Value -32768 is out of range for abs(smallint)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_abs_overflow_tinyint_column | error case (`NUMERIC_VALUE_OUT_OF_RANGE: Value -128 is out of range for abs(tinyint)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_agg_argument_type | error case (`Unexpected parameters (varchar) for function sum`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_agg_argument_type_avg | error case (`Unexpected parameters (varchar) for function avg`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_aggregate_in_where | error case (`EXPRESSION_NOT_SCALAR: WHERE clause cannot contain aggregations, window functions or grouping operations`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_ambiguous_order_by | error case (`Column 'x' is ambiguous`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_ambiguous_order_by_column_alias | error case (`Column 'status' is ambiguous`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_approx_percentile_array | error case (`approx_percentile`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_approx_percentile_decimal | error case (`approx_percentile`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_approx_percentile_out_of_range | error case (`Percentile must be between 0 and 1`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_array_angle_bracket_type | error case (`ARRAY<...> type syntax`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_array_lt_null_elements | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_array_order_by_null_elements | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_array_order_nan_elements | error case (`ARRAY comparison not supported for arrays with NaN elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_at_time_zone | error case (`AT TIME ZONE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_division_overflow | error case (`NUMERIC_VALUE_OUT_OF_RANGE: bigint division overflow: -9223372036854775808 / -1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_division_overflow_column | error case (`NUMERIC_VALUE_OUT_OF_RANGE: bigint division overflow: -9223372036854775808 / -1`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_min_minus_one | error case (`NUMERIC_VALUE_OUT_OF_RANGE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_overflow_add | error case (`NUMERIC_VALUE_OUT_OF_RANGE: bigint addition overflow: 9223372036854775807 + 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_overflow_mul | error case (`NUMERIC_VALUE_OUT_OF_RANGE: bigint multiplication overflow: 10000000000 * 10000000000`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_overflow_sum | error case (`NUMERIC_VALUE_OUT_OF_RANGE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bitwise_and_operator | error case (`operator &`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bitwise_or_operator | error case (`operator |`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bitwise_xor_operator | error case (`operator ^`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_boolean_context_and | error case (`Logical expression term must evaluate to a boolean (actual: bigint)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_boolean_context_not | error case (`Value of logical NOT expression must evaluate to a boolean (actual: bigint)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_boolean_context_where | error case (`WHERE clause must evaluate to a boolean: actual type bigint`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_boolean_eq_integer | error case (`TYPE_MISMATCH: Cannot apply operator: boolean`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bracket_array_literal | error case (`[...] array literal`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_bigint_to_date | error case (`Cannot cast bigint to date`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_bigint_whitespace | error case (`Cannot cast '  12  ' to bigint`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_char | error case (`CAST(... AS CHAR(n))`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_date_to_bigint | error case (`Cannot cast date to bigint`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_date_with_time | error case (`Value cannot be cast to date`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_double_decimal_overflow | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_float_type | error case (`CAST(... AS FLOAT)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_inf_text | error case (`Cannot cast 'inf' to double`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_infinity_nbsp | error case (`Cannot cast 'Infinity`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_int_to_timestamp | error case (`to timestamp`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_int_varchar_n | error case (`cannot be represented as varchar(2)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_integer_out_of_range | error case (`Out of range for integer: 2147483648`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_integer_trailing_newline | error case (`to integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_invalid_integer | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_json | error case (`CAST(... AS JSON)`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_nan_lowercase | error case (`Cannot cast 'nan' to double`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_overflow | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_timestamp_region | error case (`Value cannot be cast to timestamp`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_timestamp_to_double | error case (`Cannot cast timestamp to double`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_timestamp_zone | error case (`Value cannot be cast to timestamp`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_tinyint_out_of_range | error case (`Out of range for tinyint: 200`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_varbinary | error case (`CAST(... AS VARBINARY)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_varchar_to_integer | error case (`Cannot cast '1.5' to integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_cast_yes_boolean | error case (`Cannot cast 'yes' to BOOLEAN`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_chr_out_of_range | error case (`INVALID_FUNCTION_ARGUMENT: chr: Not a valid Unicode code point`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_codepoint_two_chars | error case (`codepoint(varchar(1))`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_column_alias_count | error case (`Column alias list has 1 entries but relation has 2 columns`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_count_distinct_multiple_arguments | error case (`for function count`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_csv_unknown_column | error case (`capital`) | countries (CSV) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_ctas | error case (`not supported`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_current_time | error case (`function current_time`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_datafusion_only_name | error case (`array_element`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_add_fractional | error case (`value must be an integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_add_subday_on_date | error case (`cannot be added to a DATE`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_add_unknown_unit | error case (`fortnight`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_minus_date | error case (`date subtraction`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_minus_second | error case (`Cannot add hour, minutes or seconds to a date`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_bad_input | error case (`garbage`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_bigint | error case (`TYPE_MISMATCH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_non_literal_format | error case (`string literal`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_out_of_range | error case (`INVALID_FUNCTION_ARGUMENT: date_parse`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_second_60 | error case (`Value 60 for secondOfMinute must be in the range [0,59]`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_unknown_specifier | error case (`%Q`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_weekday_only | error case (`INVALID_FUNCTION_ARGUMENT: date_parse`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_plus_25_hours | error case (`Cannot add hour, minutes or seconds to a date`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_plus_hour | error case (`Cannot add hour, minutes or seconds to a date`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_trunc_hour_on_date | error case (`not a valid DATE field`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_decimal_cast_whitespace | error case (`Cannot cast VARCHAR ' 1.5 ' to DECIMAL(2, 1)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_decimal_division_by_zero | error case (`DIVISION_BY_ZERO`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_decimal_literal_precision | error case (`has 39 digits; Trino decimals hold at most 38`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_decimal_overflow_add | error case (`Decimal overflow`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_decimal_overflow_cast_add | error case (`Decimal overflow`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_decimal_precision_39 | error case (`more digits than a Trino decimal holds`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_digit_identifier | error case (`must not start with a digit`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_distinct_on | error case (`DISTINCT ON`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_distinct_order_by_not_selected | error case (`For SELECT DISTINCT, ORDER BY expressions must appear in select list`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_divide_by_zero_integer | error case (`DIVISION_BY_ZERO: Division by zero`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_division_by_zero | error case (`DIVISION_BY_ZERO`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_double_colon_cast | error case (`:: cast`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_double_equals | error case (`mismatched input '=='`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_element_at_zero | error case (`SQL array indices start at 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_except_all | error case (`EXCEPT ALL`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_extract_epoch | error case (`EXTRACT(EPOCH)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_for_update | error case (`FOR UPDATE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_format_datetime_dd_doy | error case (`'D' (x2)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_format_datetime_unknown_letter | error case (`'z'`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_format_datetime_yyyyy | error case (`'y' (x5)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_from_unixtime_overflow | error case (`Millis overflow`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_from_unixtime_varchar | error case (`Unexpected parameters (varchar) for function from_unixtime`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_from_unixtime_zone | error case (`time-zone`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_group_by_all | error case (`GROUP BY ALL`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_group_by_empty_needs_aggregate | error case (`must be an aggregate expression or appear in GROUP BY clause`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_group_by_missing_column | error case (`'orders.id' must be an aggregate expression or appear in GROUP BY clause`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_group_by_output_alias | error case (`Column 's' cannot be resolved`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_having_output_alias | error case (`Column 'c' cannot be resolved`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_hex_literal | error case (`binary literal`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_ilike | error case (`ILIKE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_in_subquery_double | error case (`IN (subquery) over DOUBLE / REAL`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_in_subquery_projection | error case (`IN (subquery) as a value`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_insert | error case (`not supported`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_division_overflow | error case (`NUMERIC_VALUE_OUT_OF_RANGE: integer division overflow: -2147483648 / -1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_like_varchar | error case (`TYPE_MISMATCH: Left side of LIKE expression must evaluate to a varchar`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_literal_beyond_bigint | error case (`Invalid numeric literal: 12345678901234567890`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_literal_beyond_bigint_arithmetic | error case (`Invalid numeric literal: 9223372036854775808`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_overflow_add | error case (`integer addition overflow: 2147483647 + 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_overflow_cast | error case (`integer addition overflow`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_overflow_mul | error case (`integer multiplication overflow: 65536 * 65536`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_integer_plus_varchar | error case (`TYPE_MISMATCH: Cannot apply operator: bigint + varchar`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_comparison | error case (`interval comparison`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_comparison_mixed | error case (`interval comparison`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_day_to_second | error case (`INTERVAL ... DAY TO SECOND`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_fractional_day | error case (`Invalid INTERVAL DAY value`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_result | error case (`interval result`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_times_number | error case (`interval * n`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_interval_year_to_month | error case (`INTERVAL ... YEAR TO MONTH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_invalid_date_literal | error case (`INVALID_CAST_ARGUMENT`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_is_true | error case (`IS NOT TRUE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_is_unknown | error case (`IS UNKNOWN`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_iso8601_date_single_digit | error case (`not an ISO-8601 value`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_iso8601_garbage | error case (`from_iso8601_timestamp`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_iso8601_offset | error case (`timestamp with time zone`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_iso8601_timestamp_space | error case (`not an ISO-8601 value`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_join_using_column_missing | error case (`Column 'status' cannot be resolved`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_join_using_qualified | error case (`Column 'a.k' cannot be resolved`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_join_without_condition | error case (`JOIN without ON or USING`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_json_invalid_input | error case (`Cannot convert '{not json' to JSON`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_json_path_wildcard | error case (`wildcard`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lag_negative_offset | error case (`Offset must be at least 0`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lambda_array_sort | error case (`lambda`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lambda_transform | error case (`lambda expression`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lead_negative_offset | error case (`Offset must be at least 0`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lead_null_offset | error case (`Offset must not be null`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_length_bigint | error case (`TYPE_MISMATCH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_length_date | error case (`TYPE_MISMATCH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_like_bad_escape | error case (`Escape character must be followed by`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_like_pattern_integer | error case (`TYPE_MISMATCH: Pattern for LIKE expression must evaluate to a varchar`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_limit_negative | error case (`LIMIT takes a non-negative row count`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_log_one_argument | error case (`log(base, x)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lower_bigint | error case (`TYPE_MISMATCH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_lpad_empty_pad | error case (`Padding string must not be empty`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_ltrim_two_args | error case (`ltrim takes one argument`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_map_function | error case (`function map`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_max_by | error case (`function max_by`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_modulo_by_zero | error case (`DIVISION_BY_ZERO: Division by zero`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_multiple_statements | error case (`Multiple statements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_natural_join | error case (`NATURAL JOIN`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_negate_tinyint_overflow | error case (`tinyint negation overflow: -128`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_nth_value_zero_offset | error case (`Offset must be at least 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_ntile_zero_buckets | error case (`Buckets must be at least 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_offset_negative | error case (`OFFSET takes a non-negative row count`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_parse_datetime_second_60 | error case (`Value 60 for secondOfMinute must be in the range [0,59]`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_parse_datetime_zone | error case (`timestamp with time zone`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_pg_regex_operator | error case (`operator ~`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_postgres_interval_day | error case (`PostgreSQL interval string`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_postgres_interval_hour | error case (`PostgreSQL interval string`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_qualify | error case (`QUALIFY`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_quantified_comparison_all | error case (`quantified comparison (ALL)`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_quantified_comparison_any | error case (`quantified comparison (ANY)`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_quantified_comparison_some | error case (`quantified comparison (SOME)`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_quantified_comparison_values | error case (`quantified comparison (ALL)`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_random_bound_not_positive | error case (`bound must be positive`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_dollar_ambiguous | error case (`$` against text ending in a newline`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_dollar_followed | error case (`is followed by a part of the pattern that can match text`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_extract_group_out_of_range | error case (`Pattern has 1 groups. Cannot access group 2`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_horizontal_space | error case (`\h is read differently`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_invalid_pattern | error case (`invalid regular expression`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_lookaround | error case (`invalid regular expression`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_possessive | error case (`possessive quantifier`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_possessive_brace | error case (`possessive quantifier`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_replace_illegal_group | error case (`Illegal group reference`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_replace_missing_group | error case (`No group 2`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_replace_missing_named_group | error case (`No group with name {y}`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_replace_no_groups | error case (`No group 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_repeat_is_a_trap | error case (`function repeat`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_row_type | error case (`ROW / MAP`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_rpad_empty_pad | error case (`Padding string must not be empty`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_rtrim_two_args | error case (`rtrim takes one argument`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_scalar_argument_type_abs | error case (`Unexpected parameters (varchar) for function abs`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_scalar_argument_type_cardinality | error case (`Unexpected parameters (varchar) for function cardinality`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_scalar_subquery_multiple_rows | error case (`SUBQUERY_MULTIPLE_ROWS: Scalar sub-query has returned multiple rows`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_select_list_alias_reference | error case (`Column 'x' cannot be resolved`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_semi_join | error case (`SEMI / ANTI JOIN`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_smallint_overflow_sub | error case (`NUMERIC_VALUE_OUT_OF_RANGE: smallint subtraction overflow: -32768 - 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_spaceship_operator | error case (`operator <=>`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_split_empty_delimiter | error case (`The delimiter may not be the empty string`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_split_part_zero | error case (`greater than zero`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_split_three_args | error case (`3-argument`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_string_literal_alias | error case (`a string literal cannot be used as an alias`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_strpos_three_args | error case (`3-argument`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_subquery_correlated_limit | error case (`correlated scalar subquery is not supported`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_subquery_correlated_multiple_rows | error case (`SUBQUERY_MULTIPLE_ROWS: Scalar sub-query has returned multiple rows`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_subquery_correlated_order_by | error case (`correlated scalar subquery in this clause`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_subquery_correlated_same_column_name | error case (`correlated subquery over two `id` columns`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_subscript_out_of_range | error case (`array subscript must be less than or equal to array length`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_substr_fractional_start | error case (`start must be an integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_syntax_error | error case (`SYNTAX_ERROR`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_tablesample | error case (`TABLESAMPLE`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_timestamp_literal_precision | error case (`timestamp literal`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_timestamp_minus_timestamp | error case (`date subtraction`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_tinyint_division_overflow | error case (`NUMERIC_VALUE_OUT_OF_RANGE: tinyint division overflow: -128 / -1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_tinyint_overflow_mul | error case (`NUMERIC_VALUE_OUT_OF_RANGE: tinyint multiplication overflow: 127 * 2`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_trim_two_args | error case (`Expected: )`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_truncate_double_two_args | error case (`truncate(double, n)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_try | error case (`function try`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_case_operand | error case (`Cannot apply operator: bigint = varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_case_results | error case (`All CASE results must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_coalesce | error case (`All COALESCE operands must be the same type`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_concat | error case (`Cannot apply operator: varchar(1) || integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_contains | error case (`cannot compare varchar with bigint`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_date_format_varchar | error case (`Unexpected parameters (varchar) for date/time function`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_date_trunc_varchar | error case (`Unexpected parameters (varchar, varchar) for function date_trunc`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_date_union | error case (`column 1 in UNION query has incompatible types: date, varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_date_varchar | error case (`Cannot apply operator: date = varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_extract_varchar | error case (`Unexpected parameters (varchar) for date/time function`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_greatest | error case (`All GREATEST operands must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_if | error case (`All CASE results must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_in_list | error case (`Cannot apply operator: bigint = varchar`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_in_subquery | error case (`value and result of subquery must be of the same type`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_join_on | error case (`Cannot apply operator: bigint = varchar`) | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_join_using | error case (`Cannot apply operator: bigint = varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_literal_compare | error case (`TYPE_MISMATCH`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_literal_type_names | error case (`Cannot apply operator: integer = varchar(1)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_nullif | error case (`All NULLIF operands must be the same type`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_to_unixtime_varchar | error case (`Unexpected parameters (varchar) for function to_unixtime`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_union | error case (`column 1 in UNION query has incompatible types: bigint, varchar`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_varchar_int | error case (`Cannot apply operator: varchar = integer`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_type_mismatch_year_varchar | error case (`Unexpected parameters (varchar) for date/time function`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_tz_literal | error case (`timestamp with time zone literal`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_unary_minus_varchar | error case (`Cannot negate the operand of unary '-'`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_union_literal_type_names | error case (`column 1 in UNION query has incompatible types: varchar(1), integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_unknown_column | error case (`nope`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_unknown_function | error case (`frobnicate`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_unnest | error case (`UNNEST`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_using_double_keys | error case (`JOIN ... USING on DOUBLE / REAL keys`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_window_aggregate_order_by | error case (`aggregate ORDER BY inside a window function`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_window_function_in_having | error case (`EXPRESSION_NOT_SCALAR: HAVING clause cannot contain window functions or grouping operations`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_window_function_in_where | error case (`EXPRESSION_NOT_SCALAR: WHERE clause cannot contain aggregations, window functions or grouping operations`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_window_without_over | error case (`rank is a window function and requires an OVER clause`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_with_recursive | error case (`WITH RECURSIVE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| regex_dollar_final_newline | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| regex_functions | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| regex_java_classes | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| regex_replace_empty_matches | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| regex_replace_empty_matches_column | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| result_metadata_json_type | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| result_metadata_unknown_type | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| result_metadata_unknown_union | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_alias_case | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_bigint_min_literal | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_decimal_arithmetic | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_identifiers | query, ordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_integer_literals | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_like_computed_pattern | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_like_no_escape | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_nested_output_names | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_null_ordering | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_numeric_literals | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_output_names | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_set_operation_integer | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_set_operation_types | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_values_types | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_cte_chain | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_group_by_having | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_group_by_rollup | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_group_by_source_column_alias | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_intersect_all | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_join_full_outer | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_join_inner_cross | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_join_left_using | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_join_using_columns | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_join_using_star_order | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_join_using_unqualified | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_order_limit_offset | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_scalar_subquery_empty | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_set_operations | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_subqueries | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_values_anonymous | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_values_distinct | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| shape_window_functions | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| str_case_and_padding | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| str_functions | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| str_substr_split_part | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| str_trim_bare_specification | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| str_trim_whitespace | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| string_replace_empty_search | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| subquery_correlated_scalar | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| subquery_correlated_scalar_where | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| values_bare_rows | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| values_bare_toplevel | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| values_numeric_unification | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| values_row_type_mismatch | error case (`Values rows have mismatched types: row(integer) vs row(varchar(1))`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| values_row_type_mismatch_boolean | error case (`Values rows have mismatched types: row(boolean) vs row(bigint)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| values_row_type_mismatch_date | error case (`Values rows have mismatched types: row(date) vs row(varchar)`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 
 ### Firehose delivery artifacts
 
@@ -408,6 +690,6 @@ Object keys are checked against Firehose's naming contract (prefix resolved at t
 
 | Scenario | Objects | Result | Snapshot |
 |---|---|---|---|
-| firehose_raw_default_prefix | `!{timestamp:yyyy/MM/dd/HH}/clicks-raw-1-<timestamp>-<uuid>` | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| firehose_custom_prefix_gzip | `events/!{timestamp:yyyy/MM/dd}/hour=!{timestamp:HH}/clicks-gz-1-<timestamp>-<uuid>.gz` | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
-| firehose_parquet_conversion | `errors/format-conversion-failed/!{timestamp:yyyy-MM-dd}/orders-parquet-1-<timestamp>-<uuid>`<br>`tables/orders/!{timestamp:yyyy/MM/dd}/orders-parquet-1-<timestamp>-<uuid>.parquet` | match | UNVERIFIED (glaux self-recorded 2026-08-21) |
+| firehose_raw_default_prefix | `!{timestamp:yyyy/MM/dd/HH}/clicks-raw-1-<timestamp>-<uuid>` | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| firehose_custom_prefix_gzip | `events/!{timestamp:yyyy/MM/dd}/hour=!{timestamp:HH}/clicks-gz-1-<timestamp>-<uuid>.gz` | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| firehose_parquet_conversion | `errors/format-conversion-failed/!{timestamp:yyyy-MM-dd}/orders-parquet-1-<timestamp>-<uuid>`<br>`tables/orders/!{timestamp:yyyy/MM/dd}/orders-parquet-1-<timestamp>-<uuid>.parquet` | match | UNVERIFIED (glaux self-recorded 2026-08-22) |

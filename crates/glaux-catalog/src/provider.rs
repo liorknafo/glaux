@@ -37,6 +37,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
+use futures::{StreamExt as _, TryStreamExt as _, stream};
 
 use crate::error::{CatalogError, Result};
 use crate::format::{FormatKind, TableFormat, file_format_for_table};
@@ -45,6 +46,10 @@ use crate::projection::ProjectionConfig;
 use crate::schema_adapt::{GlueExprAdapterFactory, GlueJsonSource};
 use crate::storage::StorageBackend;
 use crate::types::hive_type_to_arrow;
+
+/// Maximum number of partition prefixes listed concurrently during scan
+/// planning.
+const LIST_CONCURRENCY: usize = 16;
 
 /// Hive's marker for a null partition value.
 const HIVE_NULL_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
@@ -572,14 +577,20 @@ impl TableProvider for GlueTableProvider {
         let candidates = self.resolve_candidates().await.map_err(external)?;
         let candidates = self.prune_candidates(state, filters, candidates)?;
 
-        let mut files = Vec::new();
-        for candidate in &candidates {
-            files.extend(
-                self.list_partition_files(candidate)
-                    .await
-                    .map_err(external)?,
-            );
-        }
+        // List partition prefixes with bounded concurrency; `buffered`
+        // keeps candidate order so file groups stay deterministic.
+        let listings: Vec<_> = candidates
+            .iter()
+            .map(|candidate| self.list_partition_files(candidate))
+            .collect();
+        let files: Vec<PartitionedFile> = stream::iter(listings)
+            .buffered(LIST_CONCURRENCY)
+            .try_collect::<Vec<Vec<PartitionedFile>>>()
+            .await
+            .map_err(external)?
+            .into_iter()
+            .flatten()
+            .collect();
 
         if files.is_empty() {
             let projected_schema = project_schema(&self.schema(), projection)?;

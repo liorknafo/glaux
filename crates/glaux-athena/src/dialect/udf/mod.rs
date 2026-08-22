@@ -25,21 +25,31 @@ pub mod arithmetic;
 pub mod arrays;
 pub mod casts;
 pub mod datetime;
+pub mod decimal;
+pub mod floats;
 pub mod iso8601;
+pub mod json;
+pub mod math;
+pub mod nullable;
+pub mod regex;
 pub mod strings;
+pub mod subquery;
+pub mod tdigest;
+pub mod timestamps;
 
 use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, AsArray, Int64Builder, PrimitiveArray, StringArray, StringBuilder,
-    TimestampNanosecondArray,
 };
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, TimeUnit, TimestampNanosecondType};
-use chrono::{DateTime, Datelike, Months, NaiveDateTime, TimeDelta, Timelike};
-use datafusion::common::{DataFusionError, Result, ScalarValue, plan_err};
+use arrow::datatypes::{DataType, TimeUnit};
+use chrono::{DateTime, Datelike, Months, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta};
+use datafusion::common::{DataFusionError, Result, ScalarValue};
 
 use super::error::GlauxSqlError;
+use casts::trino_type_name;
+use timestamps::{MILLIS_PER_DAY, epoch_date};
 
 /// A runtime failure caused by the query's arguments (bad unit, invalid
 /// JSON, unsupported JSONPath). Carried as a [`GlauxSqlError`] so the engine
@@ -65,6 +75,17 @@ pub(crate) fn data_error(code: &str, message: impl Into<String>) -> DataFusionEr
     DataFusionError::External(Box::new(GlauxSqlError::runtime(code, message)))
 }
 
+/// A construct glaux refuses by name, raised from planning-time code that
+/// must return a [`DataFusionError`]. Carried as a
+/// [`GlauxSqlError::Unsupported`] so the client sees `NOT_SUPPORTED` naming
+/// the construct.
+pub(crate) fn unsupported_error(
+    construct: impl Into<String>,
+    message: impl Into<String>,
+) -> DataFusionError {
+    DataFusionError::External(Box::new(GlauxSqlError::unsupported(construct, message)))
+}
+
 macro_rules! user_err {
     ($function:expr, $($arg:tt)*) => {
         Err($crate::dialect::udf::user_error($function, format!($($arg)*)))
@@ -73,9 +94,27 @@ macro_rules! user_err {
 pub(crate) use user_err;
 
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    TypeSignature, Volatility,
+    AggregateUDF, ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, TypeSignature, Volatility,
 };
+
+/// Field metadata key marking a column that carries Trino's `JSON` type.
+/// glaux represents a JSON value as the varchar holding its text, so the
+/// values are Trino's; the marker is what lets the Athena result metadata
+/// report the column as `json` rather than `varchar`, as Athena does.
+pub const TRINO_TYPE_METADATA: &str = "glaux.trino_type";
+
+/// The `Utf8` field a JSON-returning UDF reports, carrying that marker.
+fn json_field(name: &str) -> arrow::datatypes::FieldRef {
+    Arc::new(
+        arrow::datatypes::Field::new(name, DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                TRINO_TYPE_METADATA.to_string(),
+                "json".to_string(),
+            )]),
+        ),
+    )
+}
 
 /// All scalar UDFs the Trino layer registers.
 pub fn all() -> Vec<ScalarUDF> {
@@ -94,13 +133,25 @@ pub fn all() -> Vec<ScalarUDF> {
     udfs.extend(arrays::all());
     udfs.extend(datetime::all());
     udfs.extend(iso8601::all());
+    udfs.extend(timestamps::all());
+    udfs.extend(decimal::scalar_udfs());
+    udfs.extend(floats::all());
+    udfs.extend(math::all());
+    udfs.extend(nullable::all());
+    udfs.extend(regex::all());
     udfs.extend(arithmetic::scalar_udfs());
+    udfs.extend(subquery::all());
     udfs
 }
 
 /// All aggregate UDFs the Trino layer registers.
 pub fn all_aggregates() -> Vec<AggregateUDF> {
-    arithmetic::aggregate_udfs()
+    let mut udafs = arithmetic::aggregate_udfs();
+    udafs.extend(decimal::aggregate_udfs());
+    udafs.extend(floats::aggregate_udfs());
+    udafs.extend(subquery::aggregate_udfs());
+    udafs.extend(tdigest::aggregate_udfs());
+    udafs
 }
 
 /// `true` for Arrow's signed integer types (Trino's tinyint … bigint).
@@ -205,15 +256,15 @@ impl Unit {
         )
     }
 
-    /// Length in nanoseconds for fixed-length units.
-    pub(crate) fn fixed_nanos(self) -> Option<i64> {
+    /// Length in milliseconds for fixed-length units.
+    pub(crate) fn fixed_millis(self) -> Option<i64> {
         Some(match self {
-            Self::Millisecond => 1_000_000,
-            Self::Second => 1_000_000_000,
-            Self::Minute => 60_000_000_000,
-            Self::Hour => 3_600_000_000_000,
-            Self::Day => 86_400_000_000_000,
-            Self::Week => 7 * 86_400_000_000_000,
+            Self::Millisecond => 1,
+            Self::Second => 1_000,
+            Self::Minute => 60_000,
+            Self::Hour => 3_600_000,
+            Self::Day => MILLIS_PER_DAY,
+            Self::Week => 7 * MILLIS_PER_DAY,
             Self::Month | Self::Quarter | Self::Year => return None,
         })
     }
@@ -236,31 +287,135 @@ pub(crate) fn unit_arg(function: &str, arg: &ColumnarValue) -> Result<Unit> {
     }
 }
 
-/// Cast a `DATE`/`TIMESTAMP` column to nanosecond timestamps (keeping its
-/// timezone) so the arithmetic below has one representation to handle.
-pub(crate) fn to_nanos(
-    function: &str,
-    array: &ArrayRef,
-) -> Result<(PrimitiveArray<TimestampNanosecondType>, Option<Arc<str>>)> {
-    let tz = match array.data_type() {
-        DataType::Date32 | DataType::Date64 => None,
-        DataType::Timestamp(_, tz) => tz.clone(),
+/// Decode a `DATE` / `TIMESTAMP` column to naive (UTC wall-clock) date-times,
+/// one per row, so the calendar arithmetic below has one representation to
+/// handle and no Arrow-unit range limit (`DATE '9999-12-31'` is an ordinary
+/// value here, where a nanosecond timestamp would overflow).
+pub(crate) fn to_naive(function: &str, array: &ArrayRef) -> Result<Vec<Option<NaiveDateTime>>> {
+    let out_of_range = |what: String| user_error(function, format!("{what} is out of range"));
+    Ok(match array.data_type() {
+        DataType::Date32 => array
+            .as_primitive::<arrow::datatypes::Date32Type>()
+            .iter()
+            .map(|d| {
+                d.map(|d| {
+                    epoch_date()
+                        .checked_add_signed(TimeDelta::days(i64::from(d)))
+                        .map(|d| d.and_time(NaiveTime::MIN))
+                        .ok_or_else(|| out_of_range(format!("date (day {d})")))
+                })
+                .transpose()
+            })
+            .collect::<Result<_>>()?,
+        DataType::Date64 => array
+            .as_primitive::<arrow::datatypes::Date64Type>()
+            .iter()
+            .map(|ms| {
+                ms.map(|ms| {
+                    DateTime::from_timestamp_millis(ms)
+                        .map(|t| t.naive_utc())
+                        .ok_or_else(|| out_of_range(format!("date ({ms} ms)")))
+                })
+                .transpose()
+            })
+            .collect::<Result<_>>()?,
+        DataType::Timestamp(unit, _) => {
+            let values = cast(array, &DataType::Int64)?;
+            let values = values.as_primitive::<arrow::datatypes::Int64Type>();
+            let unit = *unit;
+            values
+                .iter()
+                .map(|v| {
+                    v.map(|v| {
+                        let (secs, nanos) = match unit {
+                            TimeUnit::Second => (v, 0),
+                            TimeUnit::Millisecond => (
+                                v.div_euclid(1_000),
+                                (v.rem_euclid(1_000) * 1_000_000) as u32,
+                            ),
+                            TimeUnit::Microsecond => (
+                                v.div_euclid(1_000_000),
+                                (v.rem_euclid(1_000_000) * 1_000) as u32,
+                            ),
+                            TimeUnit::Nanosecond => (
+                                v.div_euclid(1_000_000_000),
+                                v.rem_euclid(1_000_000_000) as u32,
+                            ),
+                        };
+                        DateTime::from_timestamp(secs, nanos)
+                            .map(|t| t.naive_utc())
+                            .ok_or_else(|| out_of_range(format!("timestamp ({v} {unit:?})")))
+                    })
+                    .transpose()
+                })
+                .collect::<Result<_>>()?
+        }
         other => {
             return user_err!(
                 function,
                 "expected a DATE or TIMESTAMP argument, got {other}"
             );
         }
-    };
-    let casted = cast(
-        array,
-        &DataType::Timestamp(TimeUnit::Nanosecond, tz.clone()),
-    )?;
-    Ok((casted.as_primitive::<TimestampNanosecondType>().clone(), tz))
+    })
 }
 
-pub(crate) fn naive(nanos: i64) -> Option<NaiveDateTime> {
-    DateTime::from_timestamp_nanos(nanos).naive_utc().into()
+/// Encode naive date-times back into `data_type` (the input's type).
+pub(crate) fn from_naive(
+    function: &str,
+    values: Vec<Option<NaiveDateTime>>,
+    data_type: &DataType,
+) -> Result<ArrayRef> {
+    let out_of_range = |t: &NaiveDateTime| {
+        user_error(
+            function,
+            format!("{t} is out of range for {}", trino_type_name(data_type)),
+        )
+    };
+    Ok(match data_type {
+        DataType::Date32 => {
+            let days = values
+                .into_iter()
+                .map(|v| {
+                    v.map(|t| {
+                        i32::try_from((t.date() - epoch_date()).num_days())
+                            .map_err(|_| out_of_range(&t))
+                    })
+                    .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Arc::new(arrow::array::Date32Array::from(days))
+        }
+        DataType::Timestamp(unit, tz) => {
+            let unit = *unit;
+            let ints = values
+                .into_iter()
+                .map(|v| {
+                    v.map(|t| {
+                        let utc = t.and_utc();
+                        match unit {
+                            TimeUnit::Second => Some(utc.timestamp()),
+                            TimeUnit::Millisecond => Some(utc.timestamp_millis()),
+                            TimeUnit::Microsecond => Some(utc.timestamp_micros()),
+                            TimeUnit::Nanosecond => utc.timestamp_nanos_opt(),
+                        }
+                        .ok_or_else(|| out_of_range(&t))
+                    })
+                    .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let array = PrimitiveArray::<arrow::datatypes::Int64Type>::from(ints);
+            cast(
+                &(Arc::new(array) as ArrayRef),
+                &DataType::Timestamp(unit, tz.clone()),
+            )?
+        }
+        other => {
+            return user_err!(
+                function,
+                "expected a DATE or TIMESTAMP argument, got {other}"
+            );
+        }
+    })
 }
 
 fn shift(ts: NaiveDateTime, unit: Unit, n: i64) -> Option<NaiveDateTime> {
@@ -279,24 +434,82 @@ fn shift(ts: NaiveDateTime, unit: Unit, n: i64) -> Option<NaiveDateTime> {
             }
         }
         fixed => {
-            let nanos = fixed.fixed_nanos()?.checked_mul(n)?;
-            ts.checked_add_signed(TimeDelta::nanoseconds(nanos))
+            let millis = fixed.fixed_millis()?.checked_mul(n)?;
+            ts.checked_add_signed(TimeDelta::try_milliseconds(millis)?)
         }
     }
 }
 
-/// Joda-style whole months between two instants (sign-aware, truncating).
-fn months_between(a: NaiveDateTime, b: NaiveDateTime) -> i64 {
-    let mut months = (i64::from(b.year()) - i64::from(a.year())) * 12
-        + (i64::from(b.month()) - i64::from(a.month()));
-    let a_rest = (a.day(), a.num_seconds_from_midnight(), a.nanosecond());
-    let b_rest = (b.day(), b.num_seconds_from_midnight(), b.nanosecond());
-    if months > 0 && b_rest < a_rest {
-        months -= 1;
-    } else if months < 0 && b_rest > a_rest {
-        months += 1;
+fn days_in_month(year: i32, month: u32) -> u32 {
+    let next = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
+    };
+    next.and_then(|n| n.pred_opt())
+        .map(|d| d.day())
+        .unwrap_or(31)
+}
+
+fn is_leap_year(year: i32) -> bool {
+    NaiveDate::from_ymd_opt(year, 2, 29).is_some()
+}
+
+/// Joda-Time's `BasicMonthOfYearDateTimeField.getDifferenceAsLong(minuend,
+/// subtrahend)`, which Trino's `date_diff('month', ...)` uses: whole months,
+/// where a minuend on the last day of its month counts a subtrahend later in
+/// its own month as a full month (`2024-01-31 → 2024-02-29` is 1).
+pub(crate) fn joda_months_between(minuend: NaiveDateTime, subtrahend: NaiveDateTime) -> i64 {
+    if minuend < subtrahend {
+        return -joda_months_between(subtrahend, minuend);
     }
-    months
+    let mut difference = (i64::from(minuend.year()) - i64::from(subtrahend.year())) * 12
+        + (i64::from(minuend.month()) - i64::from(subtrahend.month()));
+    let minuend_dom = minuend.day();
+    let mut subtrahend = subtrahend;
+    if minuend_dom == days_in_month(minuend.year(), minuend.month())
+        && subtrahend.day() > minuend_dom
+    {
+        subtrahend = subtrahend
+            .with_day(minuend_dom)
+            .expect("clamping to an existing day of the month");
+    }
+    if (minuend.day(), minuend.time()) < (subtrahend.day(), subtrahend.time()) {
+        difference -= 1;
+    }
+    difference
+}
+
+/// Joda-Time's `BasicChronology.getYearDifference`, which Trino's
+/// `date_diff('year', ...)` uses: whole years comparing the offsets into the
+/// year, with February 29 balanced against non-leap years.
+pub(crate) fn joda_years_between(minuend: NaiveDateTime, subtrahend: NaiveDateTime) -> i64 {
+    if minuend < subtrahend {
+        return -joda_years_between(subtrahend, minuend);
+    }
+    let remainder = |t: NaiveDateTime| {
+        let start = NaiveDate::from_ymd_opt(t.year(), 1, 1)
+            .expect("January 1st exists")
+            .and_time(NaiveTime::MIN);
+        (t - start).num_milliseconds()
+    };
+    const FEB_29: i64 = (31 + 29 - 1) * MILLIS_PER_DAY;
+    let mut minuend_rem = remainder(minuend);
+    let mut subtrahend_rem = remainder(subtrahend);
+    if subtrahend_rem >= FEB_29 {
+        if is_leap_year(subtrahend.year()) {
+            if !is_leap_year(minuend.year()) {
+                subtrahend_rem -= MILLIS_PER_DAY;
+            }
+        } else if minuend_rem >= FEB_29 && is_leap_year(minuend.year()) {
+            minuend_rem -= MILLIS_PER_DAY;
+        }
+    }
+    let mut difference = i64::from(minuend.year()) - i64::from(subtrahend.year());
+    if minuend_rem < subtrahend_rem {
+        difference -= 1;
+    }
+    difference
 }
 
 // ---------------------------------------------------------------------------
@@ -337,15 +550,20 @@ impl ScalarUDFImpl for DateAdd {
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         if !is_integer(&arg_types[1]) && !matches!(arg_types[1], DataType::Null) {
-            return plan_err!(
-                "date_add: value must be an integer, got {}; Trino does not truncate \
-                 fractional values (use date_add with a finer unit instead)",
-                arg_types[1]
-            );
+            return Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function date_add: the value must be an \
+                 integer (Trino does not truncate fractional values; use date_add with a \
+                 finer unit instead)",
+                trino_type_name(&arg_types[1])
+            )));
         }
         match &arg_types[2] {
             t @ (DataType::Date32 | DataType::Timestamp(_, _)) => Ok(t.clone()),
-            other => plan_err!("date_add: third argument must be a DATE or TIMESTAMP, got {other}"),
+            other => Err(type_mismatch(format!(
+                "Unexpected parameters ({}) for function date_add: the third argument must \
+                 be a date or timestamp",
+                trino_type_name(other)
+            ))),
         }
     }
 
@@ -362,33 +580,30 @@ impl ScalarUDFImpl for DateAdd {
                 "unit {unit:?} cannot be added to a DATE; cast to TIMESTAMP first"
             );
         }
-        let (nanos, tz) = to_nanos("date_add", &input)?;
+        let inputs = to_naive("date_add", &input)?;
         let mut out = Vec::with_capacity(rows);
-        for i in 0..rows {
-            if nanos.is_null(i) || values.is_null(i) {
+        for (i, ts) in inputs.into_iter().enumerate() {
+            let (Some(ts), false) = (ts, values.is_null(i)) else {
                 out.push(None);
                 continue;
-            }
-            let shifted = naive(nanos.value(i))
-                .and_then(|ts| shift(ts, unit, values.value(i)))
-                .and_then(|ts| ts.and_utc().timestamp_nanos_opt());
-            match shifted {
+            };
+            match shift(ts, unit, values.value(i)) {
                 Some(v) => out.push(Some(v)),
                 None => {
                     return user_err!(
                         "date_add",
-                        "{} {unit:?} from {} overflows the timestamp range",
+                        "{} {unit:?} from {ts} overflows the {} range",
                         values.value(i),
-                        naive(nanos.value(i))
-                            .map(|t| t.to_string())
-                            .unwrap_or_default()
+                        trino_type_name(&input_type)
                     );
                 }
             }
         }
-        let result = TimestampNanosecondArray::from(out).with_timezone_opt(tz);
-        let result = cast(&(Arc::new(result) as ArrayRef), &input_type)?;
-        Ok(ColumnarValue::Array(result))
+        Ok(ColumnarValue::Array(from_naive(
+            "date_add",
+            out,
+            &input_type,
+        )?))
     }
 }
 
@@ -430,10 +645,12 @@ impl ScalarUDFImpl for DateDiff {
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         for (i, t) in arg_types[1..].iter().enumerate() {
             if !matches!(t, DataType::Date32 | DataType::Timestamp(_, _)) {
-                return plan_err!(
-                    "date_diff: argument {} must be a DATE or TIMESTAMP, got {t}",
+                return Err(type_mismatch(format!(
+                    "Unexpected parameters ({}) for function date_diff: argument {} must be \
+                     a date or timestamp",
+                    trino_type_name(t),
                     i + 2
-                );
+                )));
             }
         }
         Ok(DataType::Int64)
@@ -442,28 +659,21 @@ impl ScalarUDFImpl for DateDiff {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let unit = unit_arg("date_diff", &args.args[0])?;
         let rows = args.number_rows;
-        let (a, _) = to_nanos("date_diff", &args.args[1].to_array(rows)?)?;
-        let (b, _) = to_nanos("date_diff", &args.args[2].to_array(rows)?)?;
+        let a = to_naive("date_diff", &args.args[1].to_array(rows)?)?;
+        let b = to_naive("date_diff", &args.args[2].to_array(rows)?)?;
         let mut out = Int64Builder::with_capacity(rows);
-        for i in 0..rows {
-            if a.is_null(i) || b.is_null(i) {
+        for (x, y) in a.into_iter().zip(b) {
+            let (Some(x), Some(y)) = (x, y) else {
                 out.append_null();
                 continue;
-            }
-            let (x, y) = (a.value(i), b.value(i));
-            let diff = match unit.fixed_nanos() {
-                Some(len) => (y - x) / len,
-                None => {
-                    let (Some(x), Some(y)) = (naive(x), naive(y)) else {
-                        return user_err!("date_diff", "timestamp out of range");
-                    };
-                    let months = months_between(x, y);
-                    match unit {
-                        Unit::Month => months,
-                        Unit::Quarter => months / 3,
-                        _ => months / 12,
-                    }
-                }
+            };
+            let diff = match unit.fixed_millis() {
+                Some(len) => (y - x).num_milliseconds() / len,
+                None => match unit {
+                    Unit::Month => joda_months_between(y, x),
+                    Unit::Quarter => joda_months_between(y, x) / 3,
+                    _ => joda_years_between(y, x),
+                },
             };
             out.append_value(diff);
         }
@@ -578,19 +788,27 @@ fn parse_json_path(function: &str, path: &str) -> Result<Vec<Step>> {
     Ok(steps)
 }
 
-fn navigate<'a>(value: &'a serde_json::Value, steps: &[Step]) -> Option<&'a serde_json::Value> {
+fn navigate<'a>(value: &'a json::Json, steps: &[Step]) -> Option<&'a json::Json> {
     let mut current = value;
     for step in steps {
         current = match step {
-            Step::Key(k) => current.as_object()?.get(k)?,
-            Step::Index(i) => current.as_array()?.get(*i)?,
+            Step::Key(k) => current.get(k)?,
+            Step::Index(i) => current.index(*i)?,
         };
     }
     Some(current)
 }
 
-fn parse_json(function: &str, text: &str) -> Result<serde_json::Value> {
-    serde_json::from_str(text).map_err(|e| user_error(function, format!("invalid JSON input: {e}")))
+/// Trino's `JsonFunctions.jsonParse` catches every parse failure and
+/// reports `Cannot convert '<text>' to JSON`; serde-style offsets ("expected
+/// `null` at offset 0") are the parser's wording, not Athena's.
+fn parse_json(text: &str) -> Result<json::Json> {
+    json::parse(text).map_err(|_| {
+        data_error(
+            "INVALID_FUNCTION_ARGUMENT",
+            format!("Cannot convert '{text}' to JSON"),
+        )
+    })
 }
 
 /// Evaluate a `(json, path) -> T` function row by row. `f` receives the
@@ -598,7 +816,7 @@ fn parse_json(function: &str, text: &str) -> Result<serde_json::Value> {
 fn json_path_map<T>(
     function: &str,
     args: &ScalarFunctionArgs,
-    mut f: impl FnMut(Option<&serde_json::Value>) -> Option<T>,
+    mut f: impl FnMut(Option<&json::Json>) -> Option<T>,
     mut append: impl FnMut(Option<T>),
 ) -> Result<()> {
     let rows = args.number_rows;
@@ -615,7 +833,12 @@ fn json_path_map<T>(
             cached = Some((path.to_string(), parse_json_path(function, path)?));
         }
         let steps = &cached.as_ref().expect("cached path").1;
-        let value = parse_json(function, json.value(i))?;
+        // Trino's varchar overloads return NULL for text that is not JSON
+        // (only `json_parse` raises); a bad path is still an error.
+        let Ok(value) = json::parse(json.value(i)) else {
+            append(None);
+            continue;
+        };
         append(f(navigate(&value, steps)));
     }
     Ok(())
@@ -666,12 +889,10 @@ impl ScalarUDFImpl for JsonExtractScalar {
             "json_extract_scalar",
             &args,
             |v| match v? {
-                serde_json::Value::String(s) => Some(s.clone()),
-                serde_json::Value::Number(n) => Some(n.to_string()),
-                serde_json::Value::Bool(b) => Some(b.to_string()),
-                serde_json::Value::Null
-                | serde_json::Value::Object(_)
-                | serde_json::Value::Array(_) => None,
+                json::Json::String(s) => Some(s.clone()),
+                json::Json::Number(token) => Some(token.clone()),
+                json::Json::Bool(b) => Some(b.to_string()),
+                json::Json::Null | json::Json::Object(_) | json::Json::Array(_) => None,
             },
             |v| out.append_option(v),
         )?;
@@ -714,12 +935,16 @@ impl ScalarUDFImpl for JsonExtract {
         Ok(DataType::Utf8)
     }
 
+    fn return_field_from_args(&self, _: ReturnFieldArgs) -> Result<arrow::datatypes::FieldRef> {
+        Ok(json_field(self.name()))
+    }
+
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let mut out = StringBuilder::new();
         json_path_map(
             "json_extract",
             &args,
-            |v| v.map(|v| v.to_string()),
+            |v| v.map(json::Json::compact),
             |v| out.append_option(v),
         )?;
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -767,8 +992,8 @@ impl ScalarUDFImpl for JsonSize {
             "json_size",
             &args,
             |v| match v? {
-                serde_json::Value::Object(o) => Some(o.len() as i64),
-                serde_json::Value::Array(a) => Some(a.len() as i64),
+                json::Json::Object(o) => Some(o.len() as i64),
+                json::Json::Array(a) => Some(a.len() as i64),
                 _ => Some(0),
             },
             |v| out.append_option(v),
@@ -777,11 +1002,14 @@ impl ScalarUDFImpl for JsonSize {
     }
 }
 
-/// Evaluate a `(json) -> T` function row by row over validated JSON.
+/// Evaluate a `(json) -> T` function row by row. Text that is not JSON is
+/// an error when `strict` (`json_parse`) and NULL otherwise
+/// (`json_array_length`), as in Trino's varchar overloads.
 fn json_map<T>(
     function: &str,
+    strict: bool,
     args: &ScalarFunctionArgs,
-    mut f: impl FnMut(serde_json::Value) -> Option<T>,
+    mut f: impl FnMut(json::Json) -> Option<T>,
     mut append: impl FnMut(Option<T>),
 ) -> Result<()> {
     let rows = args.number_rows;
@@ -791,14 +1019,26 @@ fn json_map<T>(
             append(None);
             continue;
         }
-        append(f(parse_json(function, json.value(i))?));
+        let parsed = if strict {
+            parse_json(json.value(i))?
+        } else {
+            match json::parse(json.value(i)) {
+                Ok(v) => v,
+                Err(_) => {
+                    append(None);
+                    continue;
+                }
+            }
+        };
+        append(f(parsed));
     }
     Ok(())
 }
 
 /// Trino `json_parse(varchar)`: validates the text as JSON. glaux keeps the
-/// JSON type as text, so the output is the input re-serialised compactly;
-/// invalid JSON is an error, as in Trino.
+/// JSON type as text, so the output is Trino's canonical form (sorted keys,
+/// last duplicate key wins, exact integers, Java double text for other
+/// numbers); invalid JSON is an error, as in Trino.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct JsonParse {
     signature: Signature,
@@ -832,12 +1072,17 @@ impl ScalarUDFImpl for JsonParse {
         Ok(DataType::Utf8)
     }
 
+    fn return_field_from_args(&self, _: ReturnFieldArgs) -> Result<arrow::datatypes::FieldRef> {
+        Ok(json_field(self.name()))
+    }
+
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let mut out = StringBuilder::new();
         json_map(
             "json_parse",
+            true,
             &args,
-            |v| Some(v.to_string()),
+            |v| Some(v.canonical()),
             |v| out.append_option(v),
         )?;
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -882,8 +1127,9 @@ impl ScalarUDFImpl for JsonFormat {
         let mut out = StringBuilder::new();
         json_map(
             "json_format",
+            true,
             &args,
-            |v| Some(v.to_string()),
+            |v| Some(v.canonical()),
             |v| out.append_option(v),
         )?;
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -929,8 +1175,12 @@ impl ScalarUDFImpl for JsonArrayLength {
         let mut out = Int64Builder::new();
         json_map(
             "json_array_length",
+            false,
             &args,
-            |v| v.as_array().map(|a| a.len() as i64),
+            |v| match v {
+                json::Json::Array(a) => Some(a.len() as i64),
+                _ => None,
+            },
             |v| out.append_option(v),
         )?;
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
@@ -966,27 +1216,27 @@ mod tests {
     }
 
     #[test]
-    fn months_between_truncates_partial_months() {
-        assert_eq!(
-            months_between(dt("2024-01-31 00:00:00"), dt("2024-02-29 00:00:00")),
-            0
-        );
-        assert_eq!(
-            months_between(dt("2024-01-31 00:00:00"), dt("2024-03-01 00:00:00")),
-            1
-        );
-        assert_eq!(
-            months_between(dt("2024-01-15 00:00:00"), dt("2024-03-15 00:00:00")),
-            2
-        );
-        assert_eq!(
-            months_between(dt("2024-03-15 00:00:00"), dt("2024-01-16 00:00:00")),
-            -1
-        );
-        assert_eq!(
-            months_between(dt("2024-03-15 00:00:00"), dt("2024-01-15 00:00:00")),
-            -2
-        );
+    fn month_and_year_differences_follow_joda() {
+        // date_diff('month', a, b) = joda_months_between(b, a)
+        let months = |a: &str, b: &str| joda_months_between(dt(b), dt(a));
+        assert_eq!(months("2024-01-31 00:00:00", "2024-02-29 00:00:00"), 1);
+        assert_eq!(months("2024-01-30 00:00:00", "2024-02-29 00:00:00"), 1);
+        assert_eq!(months("2024-03-31 00:00:00", "2024-04-30 00:00:00"), 1);
+        assert_eq!(months("2024-02-29 00:00:00", "2024-01-31 00:00:00"), -1);
+        assert_eq!(months("2024-01-31 00:00:00", "2024-03-01 00:00:00"), 1);
+        assert_eq!(months("2024-01-15 00:00:00", "2024-03-15 00:00:00"), 2);
+        assert_eq!(months("2024-01-15 00:00:01", "2024-03-15 00:00:00"), 1);
+        assert_eq!(months("2024-03-15 00:00:00", "2024-01-16 00:00:00"), -1);
+        assert_eq!(months("2024-03-15 00:00:00", "2024-01-15 00:00:00"), -2);
+        assert_eq!(months("2024-01-31 00:00:00", "2024-04-30 00:00:00") / 3, 1);
+        let years = |a: &str, b: &str| joda_years_between(dt(b), dt(a));
+        assert_eq!(years("2023-01-01 00:00:00", "2024-01-01 00:00:00"), 1);
+        assert_eq!(years("2023-01-01 00:00:01", "2024-01-01 00:00:00"), 0);
+        assert_eq!(years("2024-02-29 00:00:00", "2025-02-28 00:00:00"), 1);
+        assert_eq!(years("2024-02-29 00:00:00", "2025-03-01 00:00:00"), 1);
+        assert_eq!(years("2023-03-01 00:00:00", "2024-02-29 00:00:00"), 0);
+        assert_eq!(years("2023-03-01 00:00:00", "2024-03-01 00:00:00"), 1);
+        assert_eq!(years("2024-03-01 00:00:00", "2023-03-01 00:00:00"), -1);
     }
 
     #[test]
