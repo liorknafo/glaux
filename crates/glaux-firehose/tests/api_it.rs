@@ -665,3 +665,28 @@ async fn unknown_actions_and_bad_targets_are_explicit() {
     assert_eq!(code, "UnknownOperationException");
     assert!(message.contains("ListTagsForDeliveryStream"), "{message}");
 }
+
+/// A body over the transport cap is rejected by axum's `DefaultBodyLimit`
+/// before the service sees it; the client must still get an AWS JSON 1.1
+/// error it can parse, not axum's plain-text 413.
+#[tokio::test]
+async fn an_oversized_request_body_is_refused_in_the_aws_shape() {
+    let h = harness().await;
+    create(&h, "s", 1, 300).await;
+
+    // 12 records of 1000 KiB are ~16 MB of base64 on the wire, over the
+    // 8 MiB transport cap.
+    let mut request = h.client.put_record_batch().delivery_stream_name("s");
+    for _ in 0..12 {
+        request = request.records(
+            Record::builder()
+                .data(Blob::new(vec![b'a'; 1000 * 1024]))
+                .build()
+                .unwrap(),
+        );
+    }
+    let err = request.send().await.unwrap_err();
+    let (code, message) = error_message(&err);
+    assert_eq!(code, "ValidationException");
+    assert!(message.contains("transport limit"), "{message}");
+}
