@@ -1240,7 +1240,7 @@ pub(crate) fn values_row_expr(expr: &Expr) -> &Expr {
             | DataType::Utf8View
     );
     let user_cast = matches!(cast.expr.as_ref(), Expr::ScalarFunction(call)
-        if call.func.name() == "trino_round_for_cast");
+        if matches!(call.func.name(), "trino_round_for_cast" | "trino_try_round_for_cast"));
     if coercion_target && !user_cast {
         values_row_expr(&cast.expr)
     } else {

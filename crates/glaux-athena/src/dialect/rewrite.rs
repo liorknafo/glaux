@@ -1799,14 +1799,27 @@ fn rewrite_cast(expr: &mut Expr) -> Result<(), GlauxSqlError> {
         | DataType::Integer(_)
         | DataType::SmallInt(_)
         | DataType::TinyInt(_) => {
-            // Rounds floating/decimal operands half away from zero and
-            // leaves every other type alone; the Arrow cast then sees
-            // integral values only. Applied once even if the same node is
-            // visited again.
-            if !matches!(inner.as_ref(), Expr::Function(f) if f.name.to_string() == "trino_round_for_cast")
+            // Rounds floating/decimal operands half away from zero, checks
+            // a varchar operand against Java's `Long.parseLong` grammar,
+            // and leaves every other type alone; the Arrow cast then sees
+            // only values Trino would accept. Applied once even if the same
+            // node is visited again.
+            let target = match data_type {
+                DataType::BigInt(_) => "bigint",
+                DataType::SmallInt(_) => "smallint",
+                DataType::TinyInt(_) => "tinyint",
+                _ => "integer",
+            };
+            let name = match kind {
+                CastKind::TryCast => "trino_try_round_for_cast",
+                _ => "trino_round_for_cast",
+            };
+            if !matches!(inner.as_ref(), Expr::Function(f)
+                if matches!(f.name.to_string().as_str(),
+                    "trino_round_for_cast" | "trino_try_round_for_cast"))
             {
                 let operand = take(inner);
-                **inner = func("trino_round_for_cast", vec![operand]);
+                **inner = func(name, vec![operand, str_lit(target)]);
             }
             Ok(())
         }
@@ -2551,7 +2564,7 @@ mod tests {
     fn casts_get_trino_semantics() {
         assert_eq!(
             rewrite("SELECT CAST(x AS BIGINT) AS a, TRY_CAST(y AS INTEGER) AS b, CAST(z AS VARCHAR) AS c, CAST(z AS VARCHAR(2)) AS d FROM t").unwrap(),
-            "SELECT CAST(trino_round_for_cast(x) AS BIGINT) AS a, TRY_CAST(trino_round_for_cast(y) AS INTEGER) AS b, trino_varchar(z) AS c, trino_varchar(z, 2) AS d FROM t"
+            "SELECT CAST(trino_round_for_cast(x, 'bigint') AS BIGINT) AS a, TRY_CAST(trino_try_round_for_cast(y, 'integer') AS INTEGER) AS b, trino_varchar(z) AS c, trino_varchar(z, 2) AS d FROM t"
         );
         let err = rewrite("SELECT CAST(x AS VARBINARY) FROM t").unwrap_err();
         assert!(

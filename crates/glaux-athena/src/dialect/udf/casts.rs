@@ -1,14 +1,21 @@
 //! `CAST` helpers the rewriter inserts so Trino's cast semantics survive
 //! DataFusion's Arrow-based casts.
 //!
-//! - `trino_round_for_cast(x)`: Trino rounds `double`/`decimal` → integer
-//!   HALF_UP (`CAST(2.5 AS BIGINT)` is `3`, `CAST(-2.5 AS BIGINT)` is `-3`);
-//!   Arrow truncates. The rewriter wraps the operand of every integer-target
-//!   `CAST` in this function, which rounds floating/decimal values and
-//!   passes everything else through unchanged, so the Arrow cast that
-//!   follows only ever sees integral values. Out-of-range values still fail
-//!   in that cast (`INVALID_CAST_ARGUMENT`) or become `NULL` under
-//!   `TRY_CAST`, as in Trino.
+//! - `trino_round_for_cast(x, target)` / `trino_try_round_for_cast`: Trino
+//!   rounds `double`/`decimal` → integer HALF_UP (`CAST(2.5 AS BIGINT)` is
+//!   `3`, `CAST(-2.5 AS BIGINT)` is `-3`); Arrow truncates. The rewriter
+//!   wraps the operand of every integer-target `CAST` in this function,
+//!   which rounds floating/decimal values and passes everything else
+//!   through unchanged, so the Arrow cast that follows only ever sees
+//!   integral values. Out-of-range values still fail in that cast
+//!   (`INVALID_CAST_ARGUMENT`) or become `NULL` under `TRY_CAST`, as in
+//!   Trino. A *varchar* operand is checked here against Java's
+//!   `Long.parseLong` grammar, which Trino's `castToBigint` /
+//!   `castToInteger` / `castToSmallint` / `castToTinyint` call with the
+//!   text as it stands: surrounding whitespace is a cast failure, where
+//!   Arrow's string parser would trim it and answer with a number Athena
+//!   never returns. (Only `DOUBLE` / `REAL` trim, following
+//!   `Double.parseDouble`; `DECIMAL` and `BOOLEAN` do not either.)
 //! - `trino_varchar(x[, n])` / `trino_try_varchar`: `CAST(x AS
 //!   VARCHAR[(n)])` with Trino's text forms — timestamps as `2024-01-05
 //!   10:30:00.000`, doubles as Java prints them. A bounded target truncates
@@ -40,7 +47,8 @@ use crate::results::{format_options, java_double_text, java_float_text, timestam
 /// The cast UDFs.
 pub fn all() -> Vec<ScalarUDF> {
     vec![
-        ScalarUDF::new_from_impl(TrinoRoundForCast::new()),
+        ScalarUDF::new_from_impl(TrinoRoundForCast::new(false)),
+        ScalarUDF::new_from_impl(TrinoRoundForCast::new(true)),
         ScalarUDF::new_from_impl(TrinoVarchar::new(false)),
         ScalarUDF::new_from_impl(TrinoVarchar::new(true)),
         ScalarUDF::new_from_impl(TrinoBoolean::new(false)),
@@ -206,27 +214,34 @@ impl ScalarUDFImpl for TrinoFloat {
     }
 }
 
-/// `trino_round_for_cast(x)`: rounds floating-point and decimal values
-/// half away from zero (Java's `HALF_UP`) and returns every other type
+/// `trino_round_for_cast(x, target)`: rounds floating-point and decimal
+/// values half away from zero (Java's `HALF_UP`), refuses varchar text
+/// Java's `Long.parseLong` would refuse, and returns every other type
 /// unchanged. See the module docs.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TrinoRoundForCast {
     signature: Signature,
-}
-
-impl Default for TrinoRoundForCast {
-    fn default() -> Self {
-        Self::new()
-    }
+    try_cast: bool,
 }
 
 impl TrinoRoundForCast {
     /// New instance.
-    pub fn new() -> Self {
+    pub fn new(try_cast: bool) -> Self {
         Self {
-            signature: Signature::new(TypeSignature::Any(1), Volatility::Immutable),
+            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
+            try_cast,
         }
     }
+}
+
+/// Java's `Long.parseLong` grammar, which Trino's varchar → integral casts
+/// use: an optional sign and at least one digit, with nothing else — no
+/// surrounding whitespace, no decimal point, no exponent. (Java also reads
+/// non-ASCII digits through `Character.digit`; glaux refuses those texts
+/// loudly rather than accepting a value it cannot then hand to Arrow.)
+pub(crate) fn is_java_long_text(text: &str) -> bool {
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn round_floats<T>(array: &PrimitiveArray<T>) -> PrimitiveArray<T>
@@ -274,9 +289,45 @@ pub fn round_decimal_half_up(value: i128, scale: i8) -> Option<i128> {
     rounded.checked_mul(factor)
 }
 
+impl TrinoRoundForCast {
+    /// Validate a varchar operand the way `Long.parseLong` does, leaving the
+    /// text for the Arrow cast that follows (which checks the range and
+    /// names the target type). `TRY_CAST` turns a refused text into NULL.
+    fn check_text(&self, args: &ScalarFunctionArgs, rows: usize) -> Result<ColumnarValue> {
+        let target = match &args.args[1] {
+            ColumnarValue::Scalar(scalar) => scalar.to_string(),
+            other => other.to_array(1)?.as_string::<i32>().value(0).to_string(),
+        };
+        let strings = string_array("CAST", &args.args[0], rows)?;
+        let mut out = StringBuilder::new();
+        for i in 0..rows {
+            if strings.is_null(i) {
+                out.append_null();
+                continue;
+            }
+            let text = strings.value(i);
+            if is_java_long_text(text) {
+                out.append_value(text);
+            } else if self.try_cast {
+                out.append_null();
+            } else {
+                return Err(data_error(
+                    "INVALID_CAST_ARGUMENT",
+                    format!("Cannot cast '{text}' to {target}"),
+                ));
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
 impl ScalarUDFImpl for TrinoRoundForCast {
     fn name(&self) -> &str {
-        "trino_round_for_cast"
+        if self.try_cast {
+            "trino_try_round_for_cast"
+        } else {
+            "trino_round_for_cast"
+        }
     }
 
     fn signature(&self) -> &Signature {
@@ -293,6 +344,12 @@ impl ScalarUDFImpl for TrinoRoundForCast {
             ColumnarValue::Array(a) => a.clone(),
             scalar @ ColumnarValue::Scalar(_) => scalar.to_array(rows)?,
         };
+        if matches!(
+            input.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) {
+            return self.check_text(&args, rows);
+        }
         let out: ArrayRef = match input.data_type() {
             DataType::Float64 => Arc::new(round_floats(input.as_primitive::<Float64Type>())),
             DataType::Float32 => Arc::new(round_floats(input.as_primitive::<Float32Type>())),

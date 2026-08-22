@@ -712,7 +712,7 @@ mod tests {
         let stmt = translate("SELECT if(x > 1, 'a') AS v, TRY_CAST(s AS BIGINT) FROM t").unwrap();
         assert_eq!(
             stmt.to_string(),
-            "SELECT CASE WHEN x > 1 THEN 'a' END AS v, TRY_CAST(trino_round_for_cast(s) AS BIGINT) AS _col1 FROM t"
+            "SELECT CASE WHEN x > 1 THEN 'a' END AS v, TRY_CAST(trino_try_round_for_cast(s, 'bigint') AS BIGINT) AS _col1 FROM t"
         );
     }
 }
