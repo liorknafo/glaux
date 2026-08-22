@@ -120,7 +120,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "arbitrary(x) → same as x",
         "Aggregate",
         Rewrite,
-        "`first_value(x)`",
+        "`first_value(x) IGNORE NULLS`, keeping the argument's type. Trino's contract is \"an arbitrary *non-null* value of x, if one exists\" — its aggregation state only ever combines non-null values — so the null treatment is not optional: DataFusion's `first_value` respects NULLs, and `arbitrary(amount)` over a group whose first row is NULL answered NULL where Athena answers a value. `arbitrary(x) IGNORE NULLS` / `RESPECT NULLS` is refused: Trino's grammar has no such clause here, and `RESPECT NULLS` would ask for the answer glaux deliberately does not give.",
         ["first_value"]
     ),
     shim!(
@@ -1475,7 +1475,7 @@ pub static CONSTRUCTS: &[Construct] = &[
         name: "VALUES",
         category: "Query shape",
         status: ConstructStatus::Supported,
-        notes: "Inline tables, also as a `FROM` source with column aliases; anonymous columns are `_col0`, `_col1`, … as on Athena. Bare (unparenthesised) row expressions — `VALUES 1, 2`, valid Trino — are wrapped for sqlparser at the token level. The rows must share a type, as on Trino: `(VALUES (1), ('2'))` is `TYPE_MISMATCH: Values rows have mismatched types: row(integer) vs row(varchar(1))` — the literals are named with the types Trino gives them, not the `bigint` / unbounded `varchar` DataFusion planned them as (DataFusion alone coerced it into a bigint column with the rows `1, 2`), and the pairs DataFusion refuses itself carry the same diagnostic instead of its `Inconsistent data type across values list` text. Column types follow Trino: `(VALUES (1), (2))` is `integer`, `(VALUES (1), (1.5))` is `decimal(11,1)`, and a column mixing a double with an exact number is `double` (DataFusion alone would report `decimal(30,15)`).",
+        notes: "Inline tables, also as a `FROM` source with column aliases; anonymous columns are `_col0`, `_col1`, … as on Athena. Bare (unparenthesised) row expressions — `VALUES 1, 2`, valid Trino — are wrapped for sqlparser at the token level. The rows must share a type, as on Trino: `(VALUES (1), ('2'))` is `TYPE_MISMATCH: Values rows have mismatched types: row(integer) vs row(varchar(1))` — the literals are named with the types Trino gives them, not the `bigint` / unbounded `varchar` DataFusion planned them as (DataFusion alone coerced it into a bigint column with the rows `1, 2`), and the pairs DataFusion refuses itself carry the same diagnostic instead of its `Inconsistent data type across values list` text. Column types follow Trino: `(VALUES (1), (2))` is `integer`, `(VALUES (1), (1.5))` is `decimal(11,1)`, and a column mixing a double with an exact number is `double` (DataFusion alone would report `decimal(30,15)`). A typed NULL of a narrow integer type unifies the same way — `(VALUES (CAST(NULL AS INTEGER)), (5))` is `integer`, not `bigint`: DataFusion plans the bare literal as bigint and widens the user's cast to match, and glaux drops that widening cast so the rows unify at the type Trino gives them.",
         corpus_marker: "VALUES",
     },
     Construct {

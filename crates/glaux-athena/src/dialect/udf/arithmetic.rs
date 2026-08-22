@@ -42,7 +42,7 @@ use arrow::error::ArrowError;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::{Column, DFSchema, DataFusionError, Result, ScalarValue};
-use datafusion::logical_expr::expr::{ScalarFunction, WindowFunction};
+use datafusion::logical_expr::expr::{Cast, ScalarFunction, WindowFunction};
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::{
@@ -1443,12 +1443,31 @@ fn narrow_values(rows: &[Vec<Expr>]) -> Vec<Vec<Expr>> {
         ) => true,
         _ => is_double_literal(e),
     };
+    // The planner also widened a *user* cast to a narrow integer type
+    // (`VALUES (CAST(NULL AS INTEGER)), (5)`: the row was planned as
+    // `CAST(CAST(... AS Int32) AS Int64)` because the bare literal was
+    // still `bigint` at planning time). Dropping the outer cast lets the
+    // builder unify `integer` with `integer` again, as Trino does; a
+    // user-written `CAST(x AS BIGINT)` is a `trino_round_for_cast` call
+    // under the cast, never a cast, so it is left alone.
+    let widened_narrow_integer_cast = |cast: &Cast| {
+        cast.field.data_type() == &DataType::Int64
+            && matches!(
+                cast.expr.as_ref(),
+                Expr::Cast(inner)
+                    if matches!(
+                        inner.field.data_type(),
+                        DataType::Int8 | DataType::Int16 | DataType::Int32
+                    )
+            )
+    };
     let strip_planner_cast = |e: Expr| match e {
         Expr::Cast(cast)
-            if matches!(
+            if (matches!(
                 cast.field.data_type(),
                 DataType::Int64 | DataType::Decimal128(..) | DataType::Float64
-            ) && is_numeric_literal(&cast.expr) =>
+            ) && is_numeric_literal(&cast.expr))
+                || widened_narrow_integer_cast(&cast) =>
         {
             *cast.expr
         }
