@@ -411,7 +411,9 @@ async fn put_record_enforces_the_record_limit_and_buffers() {
     assert!(!out.encrypted.unwrap_or(true));
 
     // Exactly 1 MiB filled the 1 MiB buffer: flushed as one batch.
-    h.sink.wait_for(1).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), h.sink.wait_for(1))
+        .await
+        .expect("the size-triggered flush never reached the sink");
     let batches = h.sink.batches();
     assert_eq!(batches[0].reason, FlushReason::Size);
     assert_eq!(batches[0].total_bytes(), 1024 * 1024);
@@ -664,4 +666,52 @@ async fn unknown_actions_and_bad_targets_are_explicit() {
     let (code, message) = error_message(&err);
     assert_eq!(code, "UnknownOperationException");
     assert!(message.contains("ListTagsForDeliveryStream"), "{message}");
+
+    // Neither of these can be produced by the SDK, so they go through
+    // `dispatch` directly: a missing `X-Amz-Target` and one that names
+    // another service must both be refused, not mistaken for an action.
+    let empty = axum::http::HeaderMap::new();
+    let response = glaux_firehose::http::dispatch(&h.service, &empty, b"{}").await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()["x-amzn-errortype"],
+        "UnknownOperationException"
+    );
+
+    let mut wrong = axum::http::HeaderMap::new();
+    wrong.insert(
+        "x-amz-target",
+        "Kinesis_20131202.PutRecord".parse().unwrap(),
+    );
+    let response = glaux_firehose::http::dispatch(&h.service, &wrong, b"{}").await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()["x-amzn-errortype"],
+        "UnknownOperationException"
+    );
+}
+
+/// A body over the transport cap is rejected by axum's `DefaultBodyLimit`
+/// before the service sees it; the client must still get an AWS JSON 1.1
+/// error it can parse, not axum's plain-text 413.
+#[tokio::test]
+async fn an_oversized_request_body_is_refused_in_the_aws_shape() {
+    let h = harness().await;
+    create(&h, "s", 1, 300).await;
+
+    // 12 records of 1000 KiB are ~16 MB of base64 on the wire, over the
+    // 8 MiB transport cap.
+    let mut request = h.client.put_record_batch().delivery_stream_name("s");
+    for _ in 0..12 {
+        request = request.records(
+            Record::builder()
+                .data(Blob::new(vec![b'a'; 1000 * 1024]))
+                .build()
+                .unwrap(),
+        );
+    }
+    let err = request.send().await.unwrap_err();
+    let (code, message) = error_message(&err);
+    assert_eq!(code, "ValidationException");
+    assert!(message.contains("transport limit"), "{message}");
 }

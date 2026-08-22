@@ -350,6 +350,58 @@ mod tests {
         assert_eq!(decode_metadata(&bytes).unwrap(), Vec::<ColumnInfo>::new());
     }
 
+    /// One field of every wire type a real Athena file could carry that
+    /// glaux does not write, with field numbers glaux never assigns.
+    fn unknown_fields() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"\x80\x06\x2a"); // 96, varint 42
+        out.extend_from_slice(b"\x99\x06\x01\x02\x03\x04\x05\x06\x07\x08"); // 99, fixed64
+        out.extend_from_slice(b"\x95\x06\x01\x02\x03\x04"); // 98, fixed32
+        out.extend_from_slice(b"\x8a\x06\x03abc"); // 97, length-delimited
+        out
+    }
+
+    #[test]
+    fn unknown_fields_are_skipped_at_both_levels() {
+        let expected = column("n", "bigint", 19, 0, false);
+        let mut column_bytes = encode_column(&expected);
+        column_bytes.extend_from_slice(&unknown_fields());
+        let mut bytes = Vec::new();
+        put_string(&mut bytes, FIELD_CATALOG, "hive");
+        put_bytes(&mut bytes, FIELD_COLUMNS, &column_bytes);
+        bytes.extend_from_slice(&unknown_fields());
+        assert_eq!(decode_metadata(&bytes).unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn truncated_fixed_width_fields_are_rejected() {
+        // Field 99 as fixed64 and field 98 as fixed32, each with two bytes
+        // of payload where eight and four are due.
+        for tag in [b"\x99\x06".as_slice(), b"\x95\x06".as_slice()] {
+            let mut bytes = encode_metadata(&[]);
+            bytes.extend_from_slice(tag);
+            bytes.extend_from_slice(b"\x00\x00");
+            let err = decode_metadata(&bytes).unwrap_err();
+            assert!(
+                matches!(&err, MetadataError::Malformed { message, .. }
+                    if message.contains("fixed-width field runs past the end")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_wire_types_are_rejected() {
+        let mut bytes = encode_metadata(&[]);
+        bytes.extend_from_slice(b"\x83\x06"); // field 96, wire type 3 (start group)
+        let err = decode_metadata(&bytes).unwrap_err();
+        assert!(
+            matches!(&err, MetadataError::Malformed { message, .. }
+                if message.contains("unsupported wire type 3")),
+            "{err}"
+        );
+    }
+
     #[test]
     fn truncated_files_are_rejected_with_an_offset() {
         let mut bytes = encode_metadata(&[column("n", "bigint", 19, 0, false)]);

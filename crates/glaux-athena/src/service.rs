@@ -21,7 +21,11 @@
 //!
 //! A query that does not reach `SUCCEEDED` leaves no result objects behind:
 //! the two writes run under a guard that deletes whatever was written if
-//! either write fails or the task is aborted between them. Like real Athena,
+//! either write fails or the task is aborted between them. On the failure
+//! path the deletes are awaited before the query is marked `FAILED`, so a
+//! client that reacts to the terminal state never sees a partial object;
+//! cancellation cannot await inside `Drop` and cleans up just after the
+//! query is marked `CANCELLED`. Like real Athena,
 //! `QueryExecution.ResultConfiguration.OutputLocation` reports the full
 //! path of the CSV (`s3://bucket/prefix/<id>.csv`), not the location the
 //! client asked for.
@@ -492,7 +496,9 @@ impl AthenaService {
     /// Write `<id>.csv.metadata` then `<id>.csv`. Metadata goes first so a
     /// reader that sees the CSV can rely on its companion existing. Both
     /// objects are removed again if either write fails or this future is
-    /// dropped (cancellation) part-way through.
+    /// dropped (cancellation) part-way through. A failed write awaits its
+    /// own cleanup, so the objects are gone before the caller marks the
+    /// query `FAILED`.
     async fn write_results(
         &self,
         bucket: &str,
@@ -511,20 +517,31 @@ impl AthenaService {
                 "failed to write query results to s3://{bucket}/{key}: {e}"
             ))
         };
-        self.storage
-            .put_object(
-                bucket,
-                &metadata_key,
-                Bytes::from(encode_metadata(&encoded.columns)),
-            )
-            .await
-            .map_err(|e| write_error(&metadata_key, e))?;
-        self.storage
-            .put_object(bucket, csv_key, Bytes::from(encoded.to_csv()))
-            .await
-            .map_err(|e| write_error(csv_key, e))?;
-        cleanup.armed = false;
-        Ok(())
+        let written = async {
+            self.storage
+                .put_object(
+                    bucket,
+                    &metadata_key,
+                    Bytes::from(encode_metadata(&encoded.columns)),
+                )
+                .await
+                .map_err(|e| write_error(&metadata_key, e))?;
+            self.storage
+                .put_object(bucket, csv_key, Bytes::from(encoded.to_csv()))
+                .await
+                .map_err(|e| write_error(csv_key, e))
+        }
+        .await;
+        match written {
+            Ok(()) => {
+                cleanup.armed = false;
+                Ok(())
+            }
+            Err(e) => {
+                cleanup.run().await;
+                Err(e)
+            }
+        }
     }
 
     /// Move `id` to `RUNNING`; `false` if it was cancelled while queued.
@@ -874,13 +891,27 @@ impl AthenaService {
 }
 
 /// Deletes the result objects of a query that did not complete its writes.
-/// Dropped armed on the error path and when the writing task is aborted;
-/// disarmed once both objects are in place.
+/// Run explicitly on the error path, dropped armed when the writing task is
+/// aborted; disarmed once both objects are in place.
 struct ResultCleanup {
     storage: Arc<dyn StorageBackend>,
     bucket: String,
     keys: Vec<String>,
     armed: bool,
+}
+
+impl ResultCleanup {
+    /// Delete the partial objects and disarm the guard. Used wherever the
+    /// caller can await, so cleanup is complete before it returns.
+    async fn run(&mut self) {
+        self.armed = false;
+        let keys = std::mem::take(&mut self.keys);
+        for key in keys {
+            if let Err(e) = self.storage.delete_object(&self.bucket, &key).await {
+                tracing::warn!(bucket = %self.bucket, key, error = %e, "failed to remove partial result object");
+            }
+        }
+    }
 }
 
 impl Drop for ResultCleanup {
