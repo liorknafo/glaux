@@ -13,9 +13,13 @@ CRATES=(glaux-athena glaux-firehose glaux-catalog glaux-server)
 status=0
 
 for crate in "${CRATES[@]}"; do
-    # --edges normal,build: runtime and build-dependencies count; dev-deps of
-    # transitive crates are never linked so they are excluded by default.
-    tree="$(cargo tree --package "$crate" --edges normal,build --prefix none)"
+    # --edges normal,build: runtime and build-dependencies are what gets linked
+    # into shipped artifacts; dev-dependencies are test-only and never ship.
+    # --all-features / --target all: optional and target-specific dependencies
+    # must not hide a fakecloud crate either.
+    # --locked: resolve exactly what Cargo.lock records.
+    tree="$(cargo tree --package "$crate" --edges normal,build --all-features \
+        --target all --locked --prefix none)"
     offenders="$(grep -E '^fakecloud(-[A-Za-z0-9_-]+)? ' <<<"$tree" || true)"
     if [[ -n "$offenders" ]]; then
         echo "ERROR: $crate transitively depends on fakecloud crates:" >&2

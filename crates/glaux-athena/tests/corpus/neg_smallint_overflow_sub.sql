@@ -1,0 +1,2 @@
+-- error: NUMERIC_VALUE_OUT_OF_RANGE: smallint subtraction overflow: -32768 - 1
+SELECT CAST(-32768 AS SMALLINT) - CAST(1 AS SMALLINT)

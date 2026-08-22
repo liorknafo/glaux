@@ -450,12 +450,33 @@ fn decode_one(schema: &SchemaRef, value: &Value) -> Result<(), String> {
 }
 
 fn decode_batch(schema: &SchemaRef, values: &[Value]) -> Result<RecordBatch, String> {
+    // Feed the decoder JSON *text* rather than handing it `Value`s through
+    // serde: the workspace enables `serde_json/arbitrary_precision` (the Glue
+    // key rewriter needs it to keep high-precision decimals byte-for-byte),
+    // which makes `Value`'s `Serialize` emit a private number marker that
+    // arrow's serde bridge rejects. Text carries the original literal exactly
+    // and is the form Firehose receives anyway.
+    let mut json = Vec::new();
+    for value in values {
+        serde_json::to_writer(&mut json, value)
+            .map_err(|e| format!("failed to re-encode record as JSON: {e}"))?;
+        json.push(b'\n');
+    }
     let mut decoder = ReaderBuilder::new(Arc::clone(schema))
         .with_strict_mode(false)
         .with_coerce_primitive(false)
+        // One flush must yield every row handed in.
+        .with_batch_size(values.len().max(1))
         .build_decoder()
         .map_err(|e| format!("failed to build JSON decoder: {e}"))?;
-    decoder.serialize(values).map_err(|e| format!("{e}"))?;
+    let mut rest = json.as_slice();
+    while !rest.is_empty() {
+        let consumed = decoder.decode(rest).map_err(|e| format!("{e}"))?;
+        if consumed == 0 {
+            return Err("JSON decoder stalled before consuming every record".to_string());
+        }
+        rest = &rest[consumed..];
+    }
     decoder
         .flush()
         .map_err(|e| format!("{e}"))?

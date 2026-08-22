@@ -9,7 +9,7 @@
 //! explicitly naming the property.
 
 use chrono::format::{Parsed, StrftimeItems, parse};
-use chrono::{Days, Months, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Utc};
+use chrono::{Days, Months, NaiveDateTime, NaiveTime, TimeDelta, Utc};
 use std::collections::HashMap;
 
 use crate::error::{CatalogError, Result};
@@ -405,17 +405,30 @@ fn parse_date_bound(
 
 fn parse_datetime(value: &str, chrono_format: &str, has_time: bool) -> ProjResult<NaiveDateTime> {
     let mismatch = |e: chrono::ParseError| format!("does not match format {chrono_format:?}: {e}");
+    // Formats may carry only some components (`yyyy-MM` for monthly and
+    // `yyyy` for yearly projections, `yyyy/MM/dd/HH` for hourly ones);
+    // chrono's `parse_from_str` insists on a complete date and time, so
+    // parse into `Parsed` and default the missing fields (month/day to 1,
+    // time-of-day to 0), exactly as Java's SimpleDateFormat does.
+    let mut parsed = Parsed::new();
+    parse(&mut parsed, value, StrftimeItems::new(chrono_format)).map_err(mismatch)?;
+    if parsed.year().is_none() {
+        return Err(format!(
+            "does not match format {chrono_format:?}: the format carries no year"
+        ));
+    }
+    if parsed.month().is_none() {
+        parsed.set_month(1).map_err(mismatch)?;
+    }
+    if parsed.day().is_none() {
+        parsed.set_day(1).map_err(mismatch)?;
+    }
     if !has_time {
-        return NaiveDate::parse_from_str(value, chrono_format)
+        return parsed
+            .to_naive_date()
             .map(|d| d.and_time(NaiveTime::MIN))
             .map_err(mismatch);
     }
-    // Time-of-day formats may carry only some components (`yyyy/MM/dd/HH`
-    // is the common hourly layout); chrono's `parse_from_str` insists on
-    // minutes, so parse into `Parsed` and default the missing fields to 0,
-    // exactly as Java's SimpleDateFormat does.
-    let mut parsed = Parsed::new();
-    parse(&mut parsed, value, StrftimeItems::new(chrono_format)).map_err(mismatch)?;
     if parsed.hour_div_12().is_none() && parsed.hour_mod_12().is_none() {
         parsed.set_hour(0).map_err(mismatch)?;
     }
@@ -636,6 +649,37 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn monthly_and_yearly_projections_without_day() {
+        let monthly = config(
+            &[
+                ("projection.month.type", "date"),
+                ("projection.month.range", "2023-11,2024-02"),
+                ("projection.month.format", "yyyy-MM"),
+                ("projection.month.interval", "1"),
+                ("projection.month.interval.unit", "MONTHS"),
+            ],
+            &["month"],
+        );
+        let partitions = monthly.enumerate("s3://b/t").unwrap();
+        let values: Vec<&str> = partitions.iter().map(|p| p.values[0].as_str()).collect();
+        assert_eq!(values, vec!["2023-11", "2023-12", "2024-01", "2024-02"]);
+
+        let yearly = config(
+            &[
+                ("projection.year.type", "date"),
+                ("projection.year.range", "2021,2024"),
+                ("projection.year.format", "yyyy"),
+                ("projection.year.interval", "1"),
+                ("projection.year.interval.unit", "YEARS"),
+            ],
+            &["year"],
+        );
+        let partitions = yearly.enumerate("s3://b/t").unwrap();
+        let values: Vec<&str> = partitions.iter().map(|p| p.values[0].as_str()).collect();
+        assert_eq!(values, vec!["2021", "2022", "2023", "2024"]);
     }
 
     #[test]
