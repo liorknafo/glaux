@@ -411,7 +411,9 @@ async fn put_record_enforces_the_record_limit_and_buffers() {
     assert!(!out.encrypted.unwrap_or(true));
 
     // Exactly 1 MiB filled the 1 MiB buffer: flushed as one batch.
-    h.sink.wait_for(1).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), h.sink.wait_for(1))
+        .await
+        .expect("the size-triggered flush never reached the sink");
     let batches = h.sink.batches();
     assert_eq!(batches[0].reason, FlushReason::Size);
     assert_eq!(batches[0].total_bytes(), 1024 * 1024);
@@ -664,6 +666,29 @@ async fn unknown_actions_and_bad_targets_are_explicit() {
     let (code, message) = error_message(&err);
     assert_eq!(code, "UnknownOperationException");
     assert!(message.contains("ListTagsForDeliveryStream"), "{message}");
+
+    // Neither of these can be produced by the SDK, so they go through
+    // `dispatch` directly: a missing `X-Amz-Target` and one that names
+    // another service must both be refused, not mistaken for an action.
+    let empty = axum::http::HeaderMap::new();
+    let response = glaux_firehose::http::dispatch(&h.service, &empty, b"{}").await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()["x-amzn-errortype"],
+        "UnknownOperationException"
+    );
+
+    let mut wrong = axum::http::HeaderMap::new();
+    wrong.insert(
+        "x-amz-target",
+        "Kinesis_20131202.PutRecord".parse().unwrap(),
+    );
+    let response = glaux_firehose::http::dispatch(&h.service, &wrong, b"{}").await;
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.headers()["x-amzn-errortype"],
+        "UnknownOperationException"
+    );
 }
 
 /// A body over the transport cap is rejected by axum's `DefaultBodyLimit`
