@@ -91,6 +91,10 @@ struct Completed {
 /// service needs to page results and cancel work.
 struct QueryRecord {
     execution: QueryExecution,
+    /// The output location the client (or workgroup) asked for, as resolved
+    /// at submission. `execution.result_configuration.output_location` holds
+    /// the CSV path instead, so idempotency compares against this.
+    requested_output_location: String,
     submitted_at: Instant,
     started_at: Option<Instant>,
     results: Option<Arc<EncodedResultSet>>,
@@ -361,20 +365,26 @@ impl AthenaService {
         })?;
         let (bucket, prefix) = parse_output_location(&output_location)?;
 
-        // Idempotency: the same token replays the same id; a different
-        // query under a reused token is a client bug Athena rejects.
+        // Idempotency: the same token replays the same id; a reused token
+        // with different parameters is a client bug Athena rejects.
         if let Some(token) = &input.client_request_token
-            && let Some(existing_id) = state.tokens.get(token)
+            && let Some(existing) = state
+                .tokens
+                .get(token)
+                .and_then(|existing_id| state.queries.get(existing_id))
         {
-            let existing = &state.queries[existing_id];
-            if existing.execution.query == sql {
+            let execution = &existing.execution;
+            let same = execution.query == sql
+                && execution.work_group == workgroup_name
+                && existing.requested_output_location == output_location;
+            if same {
                 return Ok(StartQueryExecutionOutput {
-                    query_execution_id: existing_id.clone(),
+                    query_execution_id: execution.query_execution_id.clone(),
                 });
             }
             return Err(AthenaError::invalid_request(
                 "Idempotent parameters do not match: the ClientRequestToken was already used \
-                 for a different QueryString",
+                 with a different QueryString, WorkGroup, or OutputLocation",
             ));
         }
 
@@ -386,7 +396,7 @@ impl AthenaService {
             query: sql.clone(),
             statement_type: statement_type.to_string(),
             result_configuration: ResultConfiguration {
-                output_location: Some(output_location),
+                output_location: Some(output_location.clone()),
                 encryption_configuration: requested.encryption_configuration,
             },
             query_execution_context: context.clone(),
@@ -408,28 +418,34 @@ impl AthenaService {
             catalog: context.catalog,
             database: context.database,
         };
-        let service = Arc::clone(self);
-        let task_id = id.clone();
         let csv_key = format!("{prefix}{id}.csv");
         execution.result_configuration.output_location = Some(format!("s3://{bucket}/{csv_key}"));
-        let handle = tokio::spawn(async move {
-            service.run_query(task_id, request, bucket, csv_key).await;
-        });
-
+        // Register the record before spawning so the task always finds it,
+        // regardless of when the lock is released relative to its first poll.
         state.queries.insert(
             id.clone(),
             QueryRecord {
                 execution,
+                requested_output_location: output_location,
                 submitted_at: Instant::now(),
                 started_at: None,
                 results: None,
-                abort: Some(handle.abort_handle()),
+                abort: None,
                 client_request_token: input.client_request_token.clone(),
             },
         );
         state.order.push(id.clone());
         if let Some(token) = input.client_request_token {
             state.tokens.insert(token, id.clone());
+        }
+
+        let service = Arc::clone(self);
+        let task_id = id.clone();
+        let handle = tokio::spawn(async move {
+            service.run_query(task_id, request, bucket, csv_key).await;
+        });
+        if let Some(record) = state.queries.get_mut(&id) {
+            record.abort = Some(handle.abort_handle());
         }
         Ok(StartQueryExecutionOutput {
             query_execution_id: id,

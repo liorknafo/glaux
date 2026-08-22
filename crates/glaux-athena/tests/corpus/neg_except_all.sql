@@ -1,0 +1,2 @@
+-- error: EXCEPT ALL
+SELECT x FROM (VALUES (1), (1), (1)) t(x) EXCEPT ALL SELECT x FROM (VALUES (1)) t(x)

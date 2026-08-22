@@ -3,7 +3,8 @@
 //! criteria of LIO-19 describe.
 //!
 //! The fakecloud binary is taken from `PATH` when available, otherwise
-//! downloaded once from GitHub releases into a cached temp location. When
+//! downloaded once from GitHub releases, verified against a pinned SHA-256
+//! digest, and cached under the cargo target directory. When
 //! neither works (e.g. offline CI), the test **skips with a clear message**
 //! rather than failing — but it never fakes a result.
 
@@ -35,6 +36,28 @@ use serde_json::json;
 
 const FAKECLOUD_VERSION: &str = "v0.44.10";
 
+/// SHA-256 digests of the release tarballs, per platform (from the
+/// `*.tar.gz.sha256` assets published alongside `FAKECLOUD_VERSION`).
+/// Bump together with the version.
+const FAKECLOUD_SHA256: &[(&str, &str)] = &[
+    (
+        "darwin-arm64",
+        "c36db4e58de2cdb2446801655805eedaa99007214d3f839382e410d03604de41",
+    ),
+    (
+        "darwin-amd64",
+        "34dfdd36e05711c1470ca032ee2a9d88d4283c5c6813afd272b2b6c5aa7bed8a",
+    ),
+    (
+        "linux-arm64",
+        "386c645e4ca4c380f9d69ea7cb581bfa5a503e88f81f40c40594e0d278fbc09d",
+    ),
+    (
+        "linux-amd64",
+        "90adeb986ae176fa80b39c0d49e88869405040975369941a49a7848e188a1275",
+    ),
+];
+
 /// Kills the fakecloud child process when the test ends (pass or fail).
 struct ProcessGuard(Child);
 
@@ -63,19 +86,55 @@ fn fakecloud_on_path() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Download and extract the fakecloud release into a cached temp dir.
+/// Per-user cache directory for the downloaded release: under the cargo
+/// target directory (never a world-writable shared temp dir), created with
+/// owner-only permissions on Unix.
+fn fakecloud_cache_dir() -> Option<PathBuf> {
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("target")
+        });
+    let cache_dir = target_dir.join(format!("glaux-fakecloud-{FAKECLOUD_VERSION}"));
+    std::fs::create_dir_all(&cache_dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    }
+    Some(cache_dir)
+}
+
+/// Hex-encoded SHA-256 of a file.
+fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Download, verify, and extract the fakecloud release into the cache dir.
 /// Returns `None` (after printing the reason) when the download fails —
-/// typically because the environment is offline.
+/// typically because the environment is offline. A digest mismatch is a
+/// hard failure: a tampered archive must never be executed, and never
+/// silently skipped either.
 fn download_fakecloud() -> Option<PathBuf> {
     let platform = release_platform()?;
-    let cache_dir = std::env::temp_dir().join(format!("glaux-fakecloud-{FAKECLOUD_VERSION}"));
+    let expected_digest = FAKECLOUD_SHA256
+        .iter()
+        .find(|(p, _)| *p == platform)
+        .map(|(_, digest)| *digest)?;
+    let cache_dir = fakecloud_cache_dir()?;
     let binary = cache_dir
         .join(format!("fakecloud-{FAKECLOUD_VERSION}-{platform}"))
         .join("fakecloud");
     if binary.is_file() {
         return Some(binary);
     }
-    std::fs::create_dir_all(&cache_dir).ok()?;
 
     let url = format!(
         "https://github.com/faiscadev/fakecloud/releases/download/{FAKECLOUD_VERSION}/fakecloud-{FAKECLOUD_VERSION}-{platform}.tar.gz"
@@ -98,6 +157,11 @@ fn download_fakecloud() -> Option<PathBuf> {
             return None;
         }
     }
+    let actual_digest = sha256_file(&archive).expect("read downloaded fakecloud archive");
+    assert_eq!(
+        actual_digest, expected_digest,
+        "fakecloud {FAKECLOUD_VERSION} ({platform}) archive digest mismatch; refusing to extract"
+    );
     let tar = Command::new("tar")
         .arg("-xzf")
         .arg(&archive)
@@ -369,7 +433,7 @@ async fn fakecloud_s3_and_glue_end_to_end() {
 
     // ---- Glue: provision fixtures, then exercise the read surface ----
 
-    let glue = NetworkGlueApi::new(&config);
+    let glue = NetworkGlueApi::new(&config).expect("glue client");
     glue.invoke(
         "CreateDatabase",
         json!({ "DatabaseInput": { "Name": "events" } }),

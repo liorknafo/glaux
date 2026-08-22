@@ -20,6 +20,10 @@ use datafusion::logical_expr::{
 };
 
 use super::{data_error, string_array};
+use crate::dialect::error::GlauxSqlError;
+
+/// The zone name glaux gives `timestamp with time zone` values.
+pub(crate) const UTC: &str = "UTC";
 
 /// The ISO-8601 UDFs.
 pub fn all() -> Vec<ScalarUDF> {
@@ -137,7 +141,11 @@ fn parse_offset(function: &str, input: &str, offset: &str) -> Result<i64> {
     }
 }
 
-/// Parse a Trino ISO-8601 timestamp to milliseconds since the epoch (UTC).
+/// Parse a Trino ISO-8601 timestamp to milliseconds since the epoch. Trino
+/// returns a `timestamp with time zone` that keeps the input's offset, which
+/// glaux cannot carry, so only `Z` / `+00:00` / no offset are accepted: a
+/// non-zero offset would have to be either dropped or applied, and both
+/// change what `hour(x)` and `CAST(x AS VARCHAR)` return.
 pub fn parse_iso_timestamp_millis(function: &str, input: &str) -> Result<i64> {
     let (date, rest) = match input.split_once('T') {
         Some((date, rest)) => (date, Some(rest)),
@@ -160,12 +168,25 @@ pub fn parse_iso_timestamp_millis(function: &str, input: &str) -> Result<i64> {
             (time, offset)
         }
     };
+    if offset_seconds != 0 {
+        return Err(datafusion::common::DataFusionError::External(Box::new(
+            GlauxSqlError::unsupported(
+                "timestamp with time zone",
+                format!(
+                    "{function}: {input:?} carries a non-zero zone offset; Trino keeps the offset \
+                     in a `timestamp with time zone`, which glaux cannot return in v0.1 (only \
+                     `Z` / `+00:00` inputs are accepted)"
+                ),
+            ),
+        )));
+    }
     let local = NaiveDateTime::new(date, time);
-    Ok(local.and_utc().timestamp_millis() - offset_seconds * 1000)
+    Ok(local.and_utc().timestamp_millis())
 }
 
-/// `from_iso8601_timestamp(varchar)`: a UTC instant at millisecond
-/// precision (the input's offset is applied, not preserved).
+/// `from_iso8601_timestamp(varchar)`: a `timestamp(3) with time zone` at
+/// UTC (inputs with a non-zero offset are refused; see
+/// [`parse_iso_timestamp_millis`]).
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct FromIso8601Timestamp {
     signature: Signature,
@@ -196,13 +217,13 @@ impl ScalarUDFImpl for FromIso8601Timestamp {
     }
 
     fn return_type(&self, _: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Millisecond, None))
+        Ok(DataType::Timestamp(TimeUnit::Millisecond, Some(UTC.into())))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let rows = args.number_rows;
         let inputs = string_array("from_iso8601_timestamp", &args.args[0], rows)?;
-        let mut out = TimestampMillisecondBuilder::with_capacity(rows);
+        let mut out = TimestampMillisecondBuilder::with_capacity(rows).with_timezone(UTC);
         for i in 0..rows {
             if inputs.is_null(i) {
                 out.append_null();
@@ -280,9 +301,9 @@ mod tests {
     fn accepts_the_iso_layouts_trino_accepts() {
         assert_eq!(ts("2024-01-01T10:00:00Z").unwrap(), 1_704_103_200_000);
         assert_eq!(ts("2024-01-01T10:00:00").unwrap(), 1_704_103_200_000);
-        assert_eq!(ts("2024-01-01T12:00:00+02:00").unwrap(), 1_704_103_200_000);
-        assert_eq!(ts("2024-01-01T08:00:00-0200").unwrap(), 1_704_103_200_000);
-        assert_eq!(ts("2024-01-01T08:00-02").unwrap(), 1_704_103_200_000);
+        assert_eq!(ts("2024-01-01T10:00:00+00:00").unwrap(), 1_704_103_200_000);
+        assert_eq!(ts("2024-01-01T10:00:00-0000").unwrap(), 1_704_103_200_000);
+        assert_eq!(ts("2024-01-01T10:00+00").unwrap(), 1_704_103_200_000);
         assert_eq!(ts("2024-01-01T10:00:00.1234Z").unwrap(), 1_704_103_200_123);
         assert_eq!(ts("2024-01-01T10:00:00.5").unwrap(), 1_704_103_200_500);
         assert_eq!(ts("2024-01-01").unwrap(), 1_704_067_200_000);
@@ -307,6 +328,11 @@ mod tests {
             let err = ts(input).unwrap_err().to_string();
             assert!(err.contains(why), "{input}: {err}");
             assert!(err.contains("from_iso8601_timestamp"), "{err}");
+        }
+        // Non-zero offsets are refused rather than applied: Trino keeps them.
+        for zoned in ["2024-01-01T12:00:00+02:00", "2024-01-01T08:00:00-0200"] {
+            let err = ts(zoned).unwrap_err().to_string();
+            assert!(err.contains("timestamp with time zone"), "{zoned}: {err}");
         }
         let err = parse_iso_date("from_iso8601_date", "2024-1-1")
             .unwrap_err()
