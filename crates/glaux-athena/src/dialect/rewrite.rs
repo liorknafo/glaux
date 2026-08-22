@@ -785,6 +785,24 @@ fn default_call_nulls_last(f: &mut Function) -> Result<(), GlauxSqlError> {
     if let FunctionArguments::List(list) = &mut f.args {
         for clause in &mut list.clauses {
             if let FunctionArgumentClause::OrderBy(items) = clause {
+                // `array_agg(x ORDER BY y) OVER (...)` is valid Trino, but
+                // DataFusion's window executor ignores the aggregate's own
+                // ORDER BY and refuses to plan it ("Aggregate ORDER BY is
+                // not implemented for window functions"), so the construct
+                // is refused by name rather than left to leak DataFusion's
+                // wording as a syntax error.
+                if f.over.is_some() {
+                    return Err(GlauxSqlError::unsupported(
+                        "aggregate ORDER BY inside a window function",
+                        format!(
+                            "`{}(... ORDER BY ...) OVER (...)` is valid Trino, but glaux's \
+                             engine cannot order an aggregate's input inside a window frame. \
+                             Sort in a derived table, or drop the ORDER BY when the aggregate \
+                             does not depend on it",
+                            f.name
+                        ),
+                    ));
+                }
                 default_nulls_last(items)?;
             }
         }
