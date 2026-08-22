@@ -201,12 +201,64 @@ fn resolve_time(parsed: &Parsed) -> Option<NaiveTime> {
     )
 }
 
+/// Which century a two-digit year token belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TwoDigitYear {
+    /// Trino's MySQL-style formatter (`date_parse` / `date_format`) builds
+    /// `%y` as `appendTwoDigitYear(PIVOT_YEAR)` with `PIVOT_YEAR = 2020`:
+    /// the fixed window 1970..=2069, which is exactly what chrono's `%y`
+    /// resolves to on its own.
+    Fixed,
+    /// Joda's `DateTimeFormat` (`parse_datetime` / `format_datetime`)
+    /// builds a two-character `y` / `Y` token as `appendTwoDigitYear(new
+    /// DateTime().getYear() - 30)` (and `xx` as `appendTwoDigitWeekyear(new
+    /// DateTime().getWeekyear() - 30)`): a window that moves with the wall
+    /// clock — in 2026 it is 1946..=2045, so `yy` reads `46` as 1946 where
+    /// chrono would say 2046.
+    JodaMovingPivot,
+}
+
+/// The year Joda's `appendTwoDigitYear(pivot)` parses `two_digit` as: the
+/// value in the 100-year window `[pivot - 50, pivot + 49]` whose last two
+/// digits are `two_digit` (`TwoDigitYear.parseInto`).
+fn pivoted_year(two_digit: i32, pivot: i32) -> i32 {
+    let low = pivot - 50;
+    low + (two_digit - low).rem_euclid(100)
+}
+
+/// Re-resolve a two-digit year / week-year against Joda's moving pivot.
+/// chrono has already read the digits into `year_mod_100` (`%y`) or
+/// `isoyear_mod_100` (`%g`) and would resolve them against its own fixed
+/// 1970..=2069 window, so the full year is pinned here before resolution.
+fn apply_joda_pivot(parsed: &mut Parsed) {
+    let now = chrono::Utc::now();
+    if parsed.year().is_none()
+        && let Some(two_digit) = parsed.year_mod_100()
+    {
+        let year = pivoted_year(two_digit, now.year() - 30);
+        let _ = parsed.set_year(i64::from(year));
+    }
+    if parsed.isoyear().is_none()
+        && let Some(two_digit) = parsed.isoyear_mod_100()
+    {
+        let year = pivoted_year(two_digit, now.iso_week().year() - 30);
+        let _ = parsed.set_isoyear(i64::from(year));
+    }
+}
+
 /// Parse `text` with the chrono `format`, filling every unnamed field from
 /// Joda's epoch defaults. `Ok(None)` means the text does not parse.
-pub fn parse_joda(text: &str, format: &str) -> Result<Option<NaiveDateTime>> {
+pub fn parse_joda(
+    text: &str,
+    format: &str,
+    two_digit_year: TwoDigitYear,
+) -> Result<Option<NaiveDateTime>> {
     let mut parsed = Parsed::new();
     if chrono::format::parse(&mut parsed, text, StrftimeItems::new(format)).is_err() {
         return Ok(None);
+    }
+    if two_digit_year == TwoDigitYear::JodaMovingPivot {
+        apply_joda_pivot(&mut parsed);
     }
     // chrono accepts a leap second (`10:30:60`); Joda raises.
     if parsed.second() == Some(60) {
@@ -282,7 +334,14 @@ impl ScalarUDFImpl for TrinoDateParse {
             } else {
                 functions.value(i)
             };
-            match parse_joda(texts.value(i), formats.value(i))? {
+            // The two format languages pivot two-digit years differently;
+            // only the Joda one (`parse_datetime`) moves with the clock.
+            let two_digit_year = if function == "parse_datetime" {
+                TwoDigitYear::JodaMovingPivot
+            } else {
+                TwoDigitYear::Fixed
+            };
+            match parse_joda(texts.value(i), formats.value(i), two_digit_year)? {
                 Some(ts) => out.append_value(ts.and_utc().timestamp_millis()),
                 None => {
                     return user_err!(
@@ -466,9 +525,22 @@ mod tests {
 
     #[test]
     fn leap_seconds_are_refused_like_joda() {
-        parse_joda("2024-01-05 10:30:59", "%Y-%m-%d %H:%M:%S").unwrap();
-        assert_eq!(parse_joda("garbage", "%Y-%m-%d %H:%M:%S").unwrap(), None);
-        let err = parse_joda("2024-01-05 10:30:60", "%Y-%m-%d %H:%M:%S").unwrap_err();
+        parse_joda(
+            "2024-01-05 10:30:59",
+            "%Y-%m-%d %H:%M:%S",
+            TwoDigitYear::Fixed,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_joda("garbage", "%Y-%m-%d %H:%M:%S", TwoDigitYear::Fixed).unwrap(),
+            None
+        );
+        let err = parse_joda(
+            "2024-01-05 10:30:60",
+            "%Y-%m-%d %H:%M:%S",
+            TwoDigitYear::Fixed,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("secondOfMinute"), "{err}");
     }
 
@@ -501,12 +573,47 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                parse_joda(text, format).unwrap(),
+                parse_joda(text, format, TwoDigitYear::Fixed).unwrap(),
                 Some(expected),
                 "{text} / {format}"
             );
         }
     }
+    #[test]
+    fn two_digit_years_follow_the_pivot_of_their_format_language() {
+        // Joda's window is [now - 80, now + 19] and moves every year, so
+        // the expectation is computed the way `TwoDigitYear.parseInto`
+        // does rather than hard-coded.
+        let low = chrono::Utc::now().year() - 80;
+        for two_digit in 0..100 {
+            let expected = low + (two_digit - low).rem_euclid(100);
+            assert_eq!(pivoted_year(two_digit, low + 50), expected);
+            assert!((low..low + 100).contains(&expected));
+            let text = format!("{two_digit:02}-01-05");
+            assert_eq!(
+                parse_joda(&text, "%y-%m-%d", TwoDigitYear::JodaMovingPivot).unwrap(),
+                Some(ts(expected, 1, 5, 0, 0, 0)),
+                "{text}"
+            );
+            // Trino's MySQL-style formatter pivots on a *fixed* 2020, which
+            // is chrono's own 1970..=2069 window: `date_parse` must not
+            // move with the clock.
+            let fixed = if two_digit < 70 { 2000 } else { 1900 } + two_digit;
+            assert_eq!(
+                parse_joda(&text, "%y-%m-%d", TwoDigitYear::Fixed).unwrap(),
+                Some(ts(fixed, 1, 5, 0, 0, 0)),
+                "{text}"
+            );
+        }
+        // A four-digit year is untouched by either pivot.
+        for treatment in [TwoDigitYear::Fixed, TwoDigitYear::JodaMovingPivot] {
+            assert_eq!(
+                parse_joda("2046-01-05", "%Y-%m-%d", treatment).unwrap(),
+                Some(ts(2046, 1, 5, 0, 0, 0))
+            );
+        }
+    }
+
     #[test]
     fn truncation_follows_trino_units() {
         let t = ts(2024, 2, 14, 8, 30, 45);

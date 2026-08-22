@@ -858,7 +858,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "parse_datetime(varchar, pattern) → timestamp",
         "Date and time",
         Rewrite,
-        "Rust UDF `trino_date_parse` (see `date_parse`, including Joda's epoch defaults for the fields the pattern leaves out: `parse_datetime('2024-01-05 10', 'yyyy-MM-dd HH')` is `10:00:00` and `'yyyy-MM-dd hh a'` reads `10 PM` as `22:00:00`) with the Joda pattern translated, re-tagged as a `timestamp(3) with time zone` at UTC (Athena prints `... UTC`); the pattern must be a literal. `SSS` / `SSSSSS` parse exactly that many fractional digits (Joda accepts fewer). Zone letters (`Z`, `z`) are refused: Trino would keep the parsed offset, which glaux cannot.",
+        "Rust UDF `trino_date_parse` (see `date_parse`, including Joda's epoch defaults for the fields the pattern leaves out: `parse_datetime('2024-01-05 10', 'yyyy-MM-dd HH')` is `10:00:00` and `'yyyy-MM-dd hh a'` reads `10 PM` as `22:00:00`) with the Joda pattern translated, re-tagged as a `timestamp(3) with time zone` at UTC (Athena prints `... UTC`); the pattern must be a literal. `SSS` / `SSSSSS` parse exactly that many fractional digits (Joda accepts fewer). A two-digit year (`yy`, `YY`) or week-year (`xx`) pivots the way Joda's `DateTimeFormat` does — `appendTwoDigitYear(new DateTime().getYear() - 30)`, a window that *moves with the wall clock*: in 2026 it is 1946..2045, so `parse_datetime('69-01-05', 'yy-MM-dd')` is 1969. chrono's `%y` alone would say 2069, and `date_parse`'s `%y` legitimately does: Trino's MySQL-style formatter pivots on a fixed `PIVOT_YEAR = 2020`. Zone letters (`Z`, `z`) are refused: Trino would keep the parsed offset, which glaux cannot.",
         ["trino_date_parse", "arrow_cast"]
     ),
     shim!(
