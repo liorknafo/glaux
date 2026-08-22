@@ -13,6 +13,20 @@
 //! Unicode character tables) reads `$` as "end of text or before a final
 //! newline", where Rust's default is strict; its `\d`, `\w`, `\s`, and
 //! `\b` are Unicode-aware, as Rust's are, and pass through unchanged.
+//!
+//! Joni's `$` is a zero-width assertion: it *matches at* the position
+//! before a final newline without consuming it, so `regexp_extract('ab\n',
+//! 'b$')` is `'b'` and `regexp_replace('ab\n', 'b$', 'x')` is `'ax\n'`.
+//! Rust's `regex` has no look-around, so `$` cannot be translated to a
+//! consuming `(?:\n?\z)` group without eating that newline (which is what
+//! glaux used to do). Instead `$` and `\Z` become `\z` and a text whose
+//! last character is a newline is searched twice — once whole, once with
+//! that newline removed — which is exactly the pair of positions Joni's
+//! `$` can assert at (`Compiled::captures_at`); the leftmost match wins,
+//! as in any leftmost engine. When both readings match at the same
+//! position with different extents the pattern is ambiguous under this
+//! emulation and glaux refuses it rather than guessing which one Joni's
+//! backtracking would have reached first.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,6 +42,7 @@ use regex::Regex;
 
 use super::casts::trino_type_name;
 use super::{data_error, int64_array, string_array, type_mismatch};
+use crate::dialect::error::GlauxSqlError;
 
 /// The regexp UDFs.
 pub fn all() -> Vec<ScalarUDF> {
@@ -72,9 +87,14 @@ fn invalid(function: &str, message: impl Into<String>) -> DataFusionError {
 /// - `\h \H \v \V` are refused: Joni does not read them as
 ///   `java.util.regex`'s whitespace classes (`\v` is a vertical tab, `\h`
 ///   a literal `h`), so neither reading can be trusted;
-/// - `$` outside a class (and `\Z`) matches at the end of the text or
-///   before a final newline, as Joni's does in single-line mode; `\A`, `\z`,
-///   and `^` already agree;
+/// - `$` outside a class (and `\Z`) becomes `\z` and reports that the
+///   pattern is anchored at the end of the text: the caller searches a
+///   text ending in a newline twice, so the assertion holds at both of the
+///   positions Joni's single-line `$` accepts (see the module docs).
+///   `\A`, `\z`, and `^` already agree. A `$` that something else in the
+///   pattern can follow (`(a$)b`, `(a$|b)c`, `b$\n`) is refused: the
+///   two-search emulation only reproduces Joni when the assertion ends the
+///   match;
 /// - the inline flags `u` and `U` are refused: Java's (Unicode case /
 ///   Unicode classes) and Rust's (Unicode mode / lazy quantifiers) differ;
 ///   `m`, `s`, `i`, `x` agree, and an `m` flag leaves `$` alone.
@@ -88,8 +108,14 @@ fn invalid(function: &str, message: impl Into<String>) -> DataFusionError {
 /// Everything else is passed through; Java syntax Rust lacks (look-around,
 /// back-references, atomic groups, `\Q..\E`) fails at compile time as an
 /// invalid pattern, never silently.
-pub fn translate_java_pattern(pattern: &str) -> std::result::Result<String, String> {
+///
+/// Returns the translated pattern and whether it contains a single-line
+/// `$` / `\Z` (which the caller reproduces with a second search; see the
+/// module docs).
+pub fn translate_java_pattern(pattern: &str) -> std::result::Result<(String, bool), String> {
     let multiline = has_multiline_flag(pattern);
+    // A single-line `$` or a `\Z` was translated to `\z`.
+    let mut text_end_anchor = false;
     let mut out = String::with_capacity(pattern.len() + 8);
     let mut chars = pattern.chars().peekable();
     // Bracket-class nesting depth (Java and Rust both allow `[a[b]]`).
@@ -131,7 +157,11 @@ pub fn translate_java_pattern(pattern: &str) -> std::result::Result<String, Stri
                              java.util.regex; write the whitespace characters explicitly"
                         ));
                     }
-                    'Z' if !in_class => out.push_str("(?:\\n?\\z)"),
+                    'Z' if !in_class => {
+                        end_anchor(pattern, "\\Z", &chars)?;
+                        text_end_anchor = true;
+                        out.push_str("\\z");
+                    }
                     'p' | 'P' => {
                         // `\p{Alpha}` etc. are Java's POSIX names (ASCII);
                         // Rust would read some of them as Unicode scripts or
@@ -186,7 +216,11 @@ pub fn translate_java_pattern(pattern: &str) -> std::result::Result<String, Stri
                 depth -= 1;
                 out.push(']');
             }
-            '$' if depth == 0 && !multiline => out.push_str("(?:\\n?\\z)"),
+            '$' if depth == 0 && !multiline => {
+                end_anchor(pattern, "$", &chars)?;
+                text_end_anchor = true;
+                out.push_str("\\z");
+            }
             '(' if depth == 0 && chars.peek() == Some(&'?') => {
                 out.push('(');
                 // Inline flags: `(?flags)` or `(?flags:...)`.
@@ -218,7 +252,97 @@ pub fn translate_java_pattern(pattern: &str) -> std::result::Result<String, Stri
             class_start = false;
         }
     }
-    Ok(out)
+    Ok((out, text_end_anchor))
+}
+
+/// Refuse a single-line `$` / `\Z` that is not the last thing its branch
+/// matches. glaux emulates Joni's zero-width `$` by searching the text with
+/// and without its final newline, which reproduces Joni only when the
+/// assertion ends the match: with something after it (`b$\n`, `(a$)b`,
+/// `(a$|b)c`) the two searches would disagree about which characters the
+/// rest of the pattern sees.
+fn end_anchor(
+    pattern: &str,
+    anchor: &str,
+    rest: &std::iter::Peekable<std::str::Chars<'_>>,
+) -> std::result::Result<(), String> {
+    let rest: String = rest.clone().collect();
+    if nothing_can_follow(&rest) {
+        return Ok(());
+    }
+    Err(format!(
+        "`{anchor}` in pattern {pattern:?} is followed by a part of the pattern that can match \
+         text: Joni asserts `{anchor}` at the end of the text or before a final newline without \
+         consuming it, which glaux's regex engine (no look-around) can only reproduce for an \
+         assertion that ends the match"
+    ))
+}
+
+/// Whether nothing in `rest` — the pattern text after a `$` — can match
+/// characters after it: the end of the pattern, closing parentheses of
+/// unquantified groups, and sibling alternation branches are all fine.
+fn nothing_can_follow(rest: &str) -> bool {
+    let mut rest = rest;
+    loop {
+        match rest.chars().next() {
+            // End of the pattern: nothing follows.
+            None => return true,
+            // Leaving a group: the group must not repeat, and whatever
+            // comes after it does follow the anchor.
+            Some(')') => {
+                let after = &rest[1..];
+                if after.starts_with(['*', '+', '?', '{']) {
+                    return false;
+                }
+                rest = after;
+            }
+            // The branch ends here; the sibling branches are alternatives,
+            // not followers, so skip to the end of the enclosing group.
+            Some('|') => match skip_to_group_end(&rest[1..]) {
+                None => return true,
+                Some(after) => {
+                    if after.starts_with(['*', '+', '?', '{']) {
+                        return false;
+                    }
+                    rest = after;
+                }
+            },
+            // Anything else is a term that can match after the anchor.
+            Some(_) => return false,
+        }
+    }
+}
+
+/// The pattern text after the `)` that closes the group `rest` starts
+/// inside, or `None` when the group is the whole rest of the pattern.
+fn skip_to_group_end(rest: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    let mut class = 0usize;
+    let mut class_start = false;
+    let mut chars = rest.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '[' if class == 0 || !class_start => {
+                class += 1;
+                class_start = true;
+                continue;
+            }
+            ']' if class > 0 && !class_start => class -= 1,
+            '(' if class == 0 => depth += 1,
+            ')' if class == 0 => {
+                if depth == 0 {
+                    return Some(&rest[i + 1..]);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        class_start = false;
+    }
+    None
 }
 
 /// Whether the pattern enables the `m` (MULTILINE) flag anywhere; then `$`
@@ -285,21 +409,109 @@ fn is_unicode_category(name: &str) -> bool {
     )
 }
 
+/// A compiled pattern and how to search with it.
+#[derive(Debug)]
+struct Compiled {
+    regex: Regex,
+    /// The pattern ends a branch with a single-line `$` / `\Z`, so a text
+    /// ending in a newline has to be searched twice (see the module docs).
+    text_end_anchor: bool,
+    /// The Java-syntax pattern, for diagnostics.
+    source: String,
+}
+
+impl Compiled {
+    /// The text with its final newline removed, when the pattern's `$` can
+    /// assert there.
+    fn stripped<'t>(&self, text: &'t str) -> Option<&'t str> {
+        if self.text_end_anchor {
+            text.strip_suffix('\n')
+        } else {
+            None
+        }
+    }
+
+    /// Whether the pattern matches anywhere in `text`, as Joni reads it.
+    fn is_match(&self, text: &str) -> bool {
+        self.regex.is_match(text)
+            || self
+                .stripped(text)
+                .is_some_and(|short| self.regex.is_match(short))
+    }
+
+    /// The leftmost match at or after `start`, as Joni would find it: the
+    /// leftmost of the two readings of a single-line `$`. Two readings that
+    /// match at the same position with different extents are refused rather
+    /// than guessed (see the module docs).
+    fn captures_at<'t>(
+        &self,
+        function: &str,
+        text: &'t str,
+        start: usize,
+    ) -> Result<Option<regex::Captures<'t>>> {
+        let whole = self.regex.captures_at(text, start);
+        let Some(short) = self
+            .stripped(text)
+            .filter(|short| start <= short.len())
+            .and_then(|short| self.regex.captures_at(short, start))
+        else {
+            return Ok(whole);
+        };
+        let Some(whole) = whole else {
+            return Ok(Some(short));
+        };
+        let (w, s) = (
+            whole.get(0).expect("group 0 always matches"),
+            short.get(0).expect("group 0 always matches"),
+        );
+        if w.start() != s.start() {
+            // Leftmost wins, as in any leftmost-first engine; only one
+            // reading can match at that position (the other search would
+            // have found it there too).
+            return Ok(Some(if w.start() < s.start() { whole } else { short }));
+        }
+        let spans = |caps: &regex::Captures<'_>| {
+            caps.iter()
+                .map(|m| m.map(|m| (m.start(), m.end())))
+                .collect::<Vec<_>>()
+        };
+        if spans(&whole) == spans(&short) {
+            return Ok(Some(whole));
+        }
+        Err(ambiguous_final_newline(function, &self.source))
+    }
+}
+
+/// Both readings of a single-line `$` match at the same position with
+/// different extents: which one Joni returns depends on the order its
+/// backtracking tries them, which glaux cannot reproduce.
+fn ambiguous_final_newline(function: &str, pattern: &str) -> DataFusionError {
+    DataFusionError::External(Box::new(GlauxSqlError::unsupported(
+        "`$` against text ending in a newline",
+        format!(
+            "{function}: pattern {pattern:?} can match this text both up to and before its \
+             final newline, and Trino's regex engine (Joni) asserts `$` at either position; \
+             glaux refuses rather than return the wrong one of the two. Anchor the pattern \
+             with `\\z`, or match `(?m)$` per line"
+        ),
+    )))
+}
+
 /// Compile `pattern` (Java syntax, translated), caching by text (patterns
 /// are usually constant).
 fn compile<'a>(
     function: &str,
-    cache: &'a mut HashMap<String, Regex>,
+    cache: &'a mut HashMap<String, Compiled>,
     pattern: &str,
-) -> Result<&'a Regex> {
+) -> Result<&'a Compiled> {
     if !cache.contains_key(pattern) {
-        let translated = translate_java_pattern(pattern).map_err(|e| {
+        let (translated, text_end_anchor) = translate_java_pattern(pattern).map_err(|e| {
             invalid(
                 function,
                 format!("regular expression {pattern:?} is not supported: {e}"),
             )
         })?;
-        let compiled = Regex::new(&translated).map_err(|e| {
+        let regex = Regex::new(&translated).map_err(|e| {
             invalid(
                 function,
                 format!(
@@ -309,7 +521,14 @@ fn compile<'a>(
                 ),
             )
         })?;
-        cache.insert(pattern.to_string(), compiled);
+        cache.insert(
+            pattern.to_string(),
+            Compiled {
+                regex,
+                text_end_anchor,
+                source: pattern.to_string(),
+            },
+        );
     }
     Ok(&cache[pattern])
 }
@@ -430,13 +649,15 @@ fn parse_replacement(regex: &Regex, replacement: &str) -> Result<Vec<Piece>> {
 /// zero-width, so the empty match right after a non-empty one is still
 /// emitted — `'XX'`, and `"abc".replaceAll("b*", "X")` is `"XaXXcX"` in
 /// Java for the same reason. The search also has to run once *at* the end
-/// of the text, which is where the final empty match comes from.
-fn replace_all(regex: &Regex, text: &str, pieces: &[Piece]) -> String {
+/// of the text, which is where the final empty match comes from. A text
+/// ending in a newline is searched twice when the pattern's `$` can assert
+/// before it; the tail after the last match carries that newline through.
+fn replace_all(function: &str, regex: &Compiled, text: &str, pieces: &[Piece]) -> Result<String> {
     let mut out = String::with_capacity(text.len());
     let mut last_end = 0;
     let mut next_start = 0;
     while next_start <= text.len() {
-        let Some(caps) = regex.captures_at(text, next_start) else {
+        let Some(caps) = regex.captures_at(function, text, next_start)? else {
             break;
         };
         let matched = caps.get(0).expect("group 0 always matches");
@@ -464,7 +685,7 @@ fn replace_all(regex: &Regex, text: &str, pieces: &[Piece]) -> String {
         };
     }
     out.push_str(&text[last_end..]);
-    out
+    Ok(out)
 }
 
 /// See the module docs.
@@ -561,8 +782,8 @@ impl ScalarUDFImpl for TrinoRegexp {
                     }
                     let regex = compile(function, &mut cache, patterns.value(i))?;
                     let replacement = replacements.as_ref().map_or("", |r| r.value(i));
-                    let pieces = parse_replacement(regex, replacement)?;
-                    out.append_value(replace_all(regex, texts.value(i), &pieces));
+                    let pieces = parse_replacement(&regex.regex, replacement)?;
+                    out.append_value(replace_all(function, regex, texts.value(i), &pieces)?);
                 }
                 Ok(ColumnarValue::Array(Arc::new(out.finish())))
             }
@@ -580,7 +801,7 @@ impl ScalarUDFImpl for TrinoRegexp {
                     }
                     let regex = compile(function, &mut cache, patterns.value(i))?;
                     let group = groups.as_ref().map_or(0, |g| g.value(i));
-                    let available = regex.captures_len() as i64 - 1;
+                    let available = regex.regex.captures_len() as i64 - 1;
                     if group < 0 {
                         return Err(invalid(function, "Group cannot be negative"));
                     }
@@ -590,7 +811,7 @@ impl ScalarUDFImpl for TrinoRegexp {
                             format!("Pattern has {available} groups. Cannot access group {group}"),
                         ));
                     }
-                    match regex.captures(texts.value(i)) {
+                    match regex.captures_at(function, texts.value(i), 0)? {
                         Some(caps) => {
                             out.append_option(caps.get(group as usize).map(|m| m.as_str()))
                         }
@@ -632,8 +853,19 @@ mod tests {
                 Piece::Group(1)
             ]
         );
+        let compiled = Compiled {
+            regex: re.clone(),
+            text_end_anchor: false,
+            source: "(?<x>b)(c)?".to_string(),
+        };
         assert_eq!(
-            replace_all(&re, "abc", &parse_replacement(&re, "[$2$1]").unwrap()),
+            replace_all(
+                "regexp_replace",
+                &compiled,
+                "abc",
+                &parse_replacement(&re, "[$2$1]").unwrap()
+            )
+            .unwrap(),
             "a[cb]"
         );
         for (replacement, needle) in [
@@ -659,12 +891,12 @@ mod tests {
 
     #[test]
     fn java_classes_stay_unicode_and_dollar_allows_a_final_newline() {
-        let t = |p: &str| translate_java_pattern(p).unwrap();
+        let t = |p: &str| translate_java_pattern(p).unwrap().0;
         assert_eq!(t(r"\d+"), r"\d+");
         assert_eq!(t(r"[\d_]"), r"[\d_]");
         assert_eq!(t(r"[^\w]"), r"[^\w]");
         assert_eq!(t(r"\bx\b"), r"\bx\b");
-        assert_eq!(t(r"b$"), r"b(?:\n?\z)");
+        assert_eq!(t(r"b$"), r"b\z");
         assert_eq!(t(r"[$]"), "[$]");
         assert_eq!(t(r"\$"), r"\$");
         assert_eq!(t(r"(?m)b$"), "(?m)b$");
@@ -679,12 +911,41 @@ mod tests {
             r"a\",
             r"\h",
             r"[\v]",
+            // A `$` something else can match after.
+            r"b$\n",
+            r"(a$)b",
+            r"(a$|b)c",
+            r"(a$)*",
+            r"a\Zb",
         ] {
             assert!(translate_java_pattern(bad).is_err(), "{bad}");
         }
-        let re = Regex::new(&t(r"b$")).unwrap();
-        assert!(re.is_match("ab\n"));
-        assert!(!re.is_match("ab\n\n"));
+        // A `$` that ends its branch is fine, however it is nested.
+        for good in [r"^a$|^b$", r"(?:ab$)", r"a(b$|c$)", r"x(?:y$)", r"\Az\Z"] {
+            translate_java_pattern(good).unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+        // `$` is an assertion: it holds before a final newline without
+        // consuming it, so the match is `b`, not `b\n`.
+        let mut cache = HashMap::new();
+        let dollar = compile("regexp_extract", &mut cache, "b$").unwrap();
+        assert!(dollar.is_match("ab\n"));
+        assert!(dollar.is_match("ab"));
+        assert!(!dollar.is_match("ab\n\n"));
+        let matched = dollar
+            .captures_at("regexp_extract", "ab\n", 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched.get(0).unwrap().as_str(), "b");
+        assert_eq!(
+            replace_all(
+                "regexp_replace",
+                dollar,
+                "ab\n",
+                &[Piece::Literal("x".into())]
+            )
+            .unwrap(),
+            "ax\n"
+        );
         // Joni with Unicode tables: Arabic-Indic digits, accented letters,
         // and NBSP are digits, word characters, and whitespace.
         assert!(Regex::new(&t(r"\d")).unwrap().is_match("٣"));

@@ -1,4 +1,4 @@
--- Joni regex semantics: \d \w \s \b use Unicode tables (Trino builds Joni with Syntax.Java and UTF-8 encoding tables), $ also matches before a final newline.
+-- Joni regex semantics: \d \w \s \b use Unicode tables (Trino builds Joni with Syntax.Java and UTF-8 encoding tables); $ asserts at the end of the text or before a final newline without consuming it.
 SELECT regexp_like('٣', '\d') AS arabic_digit,
        regexp_extract('x٣', '\d') AS extract_arabic,
        regexp_replace('x٣', '\d', '') AS replace_arabic,
@@ -8,7 +8,7 @@ SELECT regexp_like('٣', '\d') AS arabic_digit,
        regexp_like(chr(9), '\s') AS tab_space,
        regexp_replace('aé b', '\b', '|') AS unicode_boundary,
        regexp_like('ab' || chr(10), 'b$') AS dollar_before_final_newline,
-       regexp_replace('ab' || chr(10), 'b$', 'x') || '|' AS replace_before_final_newline,
+       replace(regexp_replace('ab' || chr(10), 'b$', 'x'), chr(10), '<NL>') AS replace_before_final_newline,
        regexp_like('ab' || chr(10) || chr(10), 'b$') AS dollar_not_two_newlines,
        regexp_like('a$', '[$]') AS dollar_in_class,
        regexp_extract('a1b22', '\d+') AS digits,
