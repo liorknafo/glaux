@@ -1,11 +1,12 @@
 //! `glaux-server` — the standalone glaux binary.
 //!
-//! Target architecture (wired up in the stories after LIO-18): serve the
-//! Athena and Firehose APIs over HTTP against externally configured S3 and
-//! Glue endpoints (fakecloud over HTTP, MinIO, or real AWS). Endpoints are
-//! configuration, never assumptions. At this scaffolding stage nothing is
-//! wired and the binary refuses to start.
+//! Serves the Athena and Firehose APIs over HTTP against externally
+//! configured S3 and Glue endpoints (fakecloud over HTTP, MinIO, or real
+//! AWS). Endpoints are configuration, never assumptions. See the crate
+//! docs in `lib.rs` for the full story.
 
+use clap::Parser;
+use glaux_server::cli::Cli;
 use tracing_subscriber::EnvFilter;
 
 /// Initialize `tracing` for the binary: `RUST_LOG`-controlled filtering
@@ -19,16 +20,15 @@ fn init_tracing() {
         .init();
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
     init_tracing();
-
-    // Scaffolding stage (LIO-18): the HTTP server and service wiring land in
-    // subsequent stories. Per the "never silently wrong" rule, refuse to
-    // start rather than accept requests we cannot serve faithfully.
-    tracing::error!(
-        "glaux-server is not yet implemented: this build contains only workspace scaffolding \
-         (LIO-18). The Athena and Firehose services land in subsequent stories. Refusing to \
-         start rather than serve an endpoint that could return fake data."
-    );
-    std::process::exit(1);
+    if let Err(err) = glaux_server::run(cli).await {
+        // Both to the log (structured) and to plain stderr (so the message
+        // is readable even with RUST_LOG=off).
+        tracing::error!(error = %err, "glaux-server exiting");
+        eprintln!("glaux-server: {err}");
+        std::process::exit(1);
+    }
 }

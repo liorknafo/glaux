@@ -1,0 +1,52 @@
+# crates.io publishing of the Apache-2.0 crates, in dependency order:
+#
+#   glaux-catalog → glaux-athena, glaux-firehose → glaux-server
+#
+# Manual dispatch only, and a dry run by default: flip `dry_run` to false to
+# publish for real (requires the CARGO_REGISTRY_TOKEN repository secret).
+# The AGPL `glaux` binary is distributed as release tarballs and images, not
+# on crates.io; `glaux-fidelity` is `publish = false`.
+name: Publish crates
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (verify packaging, publish nothing)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: cargo publish (${{ inputs.dry_run && 'dry run' || 'LIVE' }})
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Apache/AGPL dependency boundary
+        run: ci/check-no-fakecloud-deps.sh
+      - name: Refuse to publish anything but a tagged version
+        if: ${{ !inputs.dry_run }}
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "glaux-catalog") | .version')"
+          if ! git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null; then
+            echo "no tag v${version} on origin: tag the release before publishing" >&2
+            exit 1
+          fi
+      # Cargo ≥ 1.90 publishes several workspace packages in one invocation,
+      # ordering them by their dependency graph and (for the live run)
+      # waiting for each to become available before publishing its dependents.
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish --locked \
+            -p glaux-catalog -p glaux-athena -p glaux-firehose -p glaux-server \
+            ${{ inputs.dry_run && '--dry-run' || '' }}

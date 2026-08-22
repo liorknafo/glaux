@@ -1,0 +1,43 @@
+# glaux-server + fakecloud: the local data plane paired with a local
+# control plane. fakecloud provides S3 and Glue (and 100+ other services);
+# glaux-server provides real Athena execution and real Firehose delivery
+# on top of them.
+#
+#   docker compose -f examples/docker-compose.yml up --build
+#
+# Then point the AWS CLI at the right port per service (see examples/README.md):
+#   S3 / Glue  -> http://localhost:4566  (fakecloud)
+#   Athena / Firehose -> http://localhost:4570  (glaux-server)
+
+services:
+  fakecloud:
+    image: ghcr.io/faiscadev/fakecloud:latest
+    command: ["--addr", "0.0.0.0:4566"]
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4566/_fakecloud/health || wget -qO- http://127.0.0.1:4566/_fakecloud/health || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  glaux-server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      fakecloud:
+        condition: service_healthy
+    ports:
+      - "4570:4570"
+    environment:
+      GLAUX_LISTEN: 0.0.0.0:4570
+      GLAUX_S3_ENDPOINT: http://fakecloud:4566
+      GLAUX_GLUE_ENDPOINT: http://fakecloud:4566
+      GLAUX_REGION: us-east-1
+      # glaux-server probes Glue and S3 at startup and refuses to run if
+      # either is unreachable. The Athena OutputLocation bucket is listed as
+      # part of that probe, so create it first (examples/README.md) or leave
+      # GLAUX_ATHENA_OUTPUT_LOCATION unset and pass OutputLocation per query.
+      # GLAUX_ATHENA_OUTPUT_LOCATION: s3://athena-results/
+      RUST_LOG: info

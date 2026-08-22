@@ -1,0 +1,200 @@
+# Release automation, triggered by pushing a `v*` tag (e.g. `git tag v0.1.0 &&
+# git push origin v0.1.0`). Nothing here runs on ordinary pushes.
+#
+#   build          release binaries for macOS/Linux × arm64/amd64 (glaux + glaux-server)
+#   pipeline-gate  the flagship pipeline (examples/flagship-pipeline.sh) against the
+#                  freshly built linux-amd64 `glaux` binary — the release is blocked if
+#                  EventBridge → SQS → Firehose → Parquet → Athena does not round-trip
+#   docker         multi-arch images ghcr.io/<owner>/glaux and ghcr.io/<owner>/glaux-server
+#                  from the prebuilt binaries (Dockerfile.release)
+#   github-release the GitHub release with tarballs + SHA-256 checksums
+#
+# crates.io publishing is a separate, manually dispatched workflow (publish.yml).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - platform: darwin-amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - platform: darwin-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.platform }}
+      - name: Check the tag matches the workspace version
+        shell: bash
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "glaux") | .version')"
+          if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match workspace version ${version}" >&2
+            exit 1
+          fi
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} -p glaux -p glaux-server
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="glaux-${GITHUB_REF_NAME}-${{ matrix.platform }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/glaux" "target/${{ matrix.target }}/release/glaux-server" "dist/${name}/"
+          cp crates/glaux/LICENSE "dist/${name}/LICENSE-glaux-AGPL-3.0"
+          cp crates/glaux-server/LICENSE "dist/${name}/LICENSE-glaux-server-Apache-2.0"
+          cp README.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          # Smoke: the binaries run on the platform that built them.
+          "dist/${name}/glaux" --version
+          "dist/${name}/glaux-server" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.platform }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.platform }}
+          path: dist/glaux-${{ github.ref_name }}-${{ matrix.platform }}/glaux*
+          if-no-files-found: error
+
+  pipeline-gate:
+    name: flagship pipeline against the release binary
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-amd64
+          path: bin
+      - name: Run EventBridge → SQS → Firehose → Parquet → Athena
+        env:
+          GLAUX_BIN: ${{ github.workspace }}/bin/glaux
+        run: |
+          chmod +x bin/glaux
+          aws --version && jq --version
+          examples/flagship-pipeline.sh
+
+  docker:
+    name: docker images (linux/amd64, linux/arm64)
+    needs: [build, pipeline-gate]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-linux-*
+          path: dist
+      - name: Lay out dist/linux-<arch>/<bin>
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            mkdir -p "dist/linux-${arch}"
+            mv "dist/bin-linux-${arch}"/glaux "dist/bin-linux-${arch}"/glaux-server "dist/linux-${arch}/"
+          done
+          find dist -type f | xargs ls -l
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image names
+        id: names
+        run: |
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "owner=${owner}" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Push ghcr.io/${{ steps.names.outputs.owner }}/glaux (AGPL-3.0, all-in-one)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            BIN=glaux
+            PORT=4566
+            HEALTH=/_glaux/health
+          tags: |
+            ghcr.io/${{ steps.names.outputs.owner }}/glaux:${{ steps.names.outputs.version }}
+            ghcr.io/${{ steps.names.outputs.owner }}/glaux:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.names.outputs.version }}
+            org.opencontainers.image.licenses=AGPL-3.0-only
+      - name: Push ghcr.io/${{ steps.names.outputs.owner }}/glaux-server (Apache-2.0)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            BIN=glaux-server
+            PORT=4570
+            HEALTH=/health
+          tags: |
+            ghcr.io/${{ steps.names.outputs.owner }}/glaux-server:${{ steps.names.outputs.version }}
+            ghcr.io/${{ steps.names.outputs.owner }}/glaux-server:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.names.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+  github-release:
+    name: GitHub release
+    needs: [build, pipeline-gate, docker]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          # Only the tarball+checksum artifacts; the bin-* artifacts feed the
+          # pipeline gate and the docker job and must not land in the release.
+          pattern: tarball-*
+          path: artifacts
+          merge-multiple: true
+      - name: Combined checksums
+        run: |
+          cd artifacts && cat *.sha256 > SHA256SUMS && rm *.sha256 && ls -l
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
