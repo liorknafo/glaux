@@ -60,6 +60,7 @@ uuid = { version = "1", features = ["v4"] }
 parquet = "59.2"
 tempfile = "3"
 aws-sdk-athena = "1"
+csv = "1"
 sha2 = "0.10"
 hex = "0.4"
 

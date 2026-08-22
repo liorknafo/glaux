@@ -5,9 +5,10 @@
 //! through the Trino dialect layer ([`TrinoEngine`]), as they do in the
 //! binaries.
 
+mod common;
+
 use std::fmt;
 use std::net::SocketAddr;
-use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -16,7 +17,6 @@ use arrow::array::{
     BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_athena::Client;
 use aws_sdk_athena::config::Region;
@@ -25,128 +25,17 @@ use aws_sdk_athena::operation::start_query_execution::StartQueryExecutionError;
 use aws_sdk_athena::types::{
     QueryExecutionContext, QueryExecutionState, ResultConfiguration, WorkGroupConfiguration,
 };
-use bytes::Bytes;
+use common::MemoryStorage;
 use datafusion::catalog::MemTable;
 use datafusion::catalog::streaming::StreamingTable;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
-use futures::TryStreamExt;
 use glaux_athena::http::router;
 use glaux_athena::{AthenaService, AthenaServiceConfig, TrinoEngine};
-use glaux_catalog::{CatalogError, ObjectSummary, StorageBackend};
-use object_store::memory::InMemory;
-use object_store::path::Path as ObjectPath;
-use object_store::{GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt as _, PutPayload};
+use glaux_catalog::StorageBackend;
 use parquet::arrow::ArrowWriter;
-
-// ---------------------------------------------------------------------------
-// In-memory StorageBackend (captures the result CSVs)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-struct MemoryStorage {
-    store: InMemory,
-}
-
-fn storage_error(op: &'static str, key: &str) -> impl FnOnce(object_store::Error) -> CatalogError {
-    let key = key.to_string();
-    move |source| CatalogError::Storage {
-        operation: op,
-        bucket: "results".to_string(),
-        key,
-        source: Box::new(source),
-    }
-}
-
-#[async_trait]
-impl StorageBackend for MemoryStorage {
-    async fn get_object(&self, _bucket: &str, key: &str) -> glaux_catalog::Result<Bytes> {
-        self.store
-            .get(&ObjectPath::from(key))
-            .await
-            .map_err(storage_error("get", key))?
-            .bytes()
-            .await
-            .map_err(storage_error("get", key))
-    }
-
-    async fn get_object_range(
-        &self,
-        _bucket: &str,
-        key: &str,
-        range: Range<u64>,
-    ) -> glaux_catalog::Result<Bytes> {
-        self.store
-            .get_range(&ObjectPath::from(key), range)
-            .await
-            .map_err(storage_error("get_range", key))
-    }
-
-    async fn get_object_suffix(
-        &self,
-        _bucket: &str,
-        key: &str,
-        length: u64,
-    ) -> glaux_catalog::Result<Bytes> {
-        let options = GetOptions {
-            range: Some(object_store::GetRange::Suffix(length)),
-            ..Default::default()
-        };
-        self.store
-            .get_opts(&ObjectPath::from(key), options)
-            .await
-            .map_err(storage_error("get_suffix", key))?
-            .bytes()
-            .await
-            .map_err(storage_error("get_suffix", key))
-    }
-
-    async fn put_object(&self, bucket: &str, key: &str, data: Bytes) -> glaux_catalog::Result<()> {
-        if bucket == "missing-bucket" {
-            return Err(CatalogError::Storage {
-                operation: "put",
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                source: Box::new(object_store::Error::NotFound {
-                    path: key.to_string(),
-                    source: "bucket does not exist".into(),
-                }),
-            });
-        }
-        self.store
-            .put(&ObjectPath::from(key), PutPayload::from(data))
-            .await
-            .map_err(storage_error("put", key))?;
-        Ok(())
-    }
-
-    async fn list_objects(
-        &self,
-        _bucket: &str,
-        prefix: &str,
-    ) -> glaux_catalog::Result<Vec<ObjectSummary>> {
-        let prefix_path = (!prefix.is_empty()).then(|| ObjectPath::from(prefix));
-        let metas: Vec<ObjectMeta> = self
-            .store
-            .list(prefix_path.as_ref())
-            .try_collect()
-            .await
-            .map_err(storage_error("list", prefix))?;
-        Ok(metas
-            .into_iter()
-            .map(|m| ObjectSummary {
-                key: m.location.to_string(),
-                size: m.size,
-            })
-            .collect())
-    }
-
-    fn object_store(&self, _bucket: &str) -> glaux_catalog::Result<Arc<dyn ObjectStore>> {
-        unreachable!("tests do not read table data through the storage backend")
-    }
-}
 
 // ---------------------------------------------------------------------------
 // A never-ending, slow table whose stream reports when it is dropped, so
@@ -283,9 +172,7 @@ async fn start() -> Harness {
     .await
     .unwrap();
 
-    let storage = Arc::new(MemoryStorage {
-        store: InMemory::new(),
-    });
+    let storage = Arc::new(MemoryStorage::new());
     let service = Arc::new(AthenaService::new(
         AthenaServiceConfig::default(),
         Arc::new(TrinoEngine::new(ctx, "datafusion")),
@@ -460,9 +347,11 @@ async fn start_poll_and_page_results_through_the_aws_sdk() {
     assert!(status.completion_date_time().is_some());
     assert_eq!(qe.statement_type().map(|s| s.as_str()), Some("DML"));
     assert_eq!(qe.work_group(), Some("primary"));
+    // Like AWS, the reported OutputLocation is the CSV itself, not the
+    // prefix the client asked for.
     assert_eq!(
         qe.result_configuration().and_then(|r| r.output_location()),
-        Some(OUTPUT)
+        Some(format!("{OUTPUT}{id}.csv").as_str())
     );
     let stats = qe.statistics().unwrap();
     assert!(stats.engine_execution_time_in_millis().is_some());
@@ -534,6 +423,21 @@ async fn start_poll_and_page_results_through_the_aws_sdk() {
         "\"3\",,\"3.25\",\"true\",\"1970-01-01 00:00:00.000\""
     );
     assert_eq!(lines.len(), 6);
+
+    // ... with its protobuf metadata companion describing the same columns.
+    let metadata = h
+        .storage
+        .get_object("results", &format!("athena/{id}.csv.metadata"))
+        .await
+        .expect("metadata written");
+    let decoded = glaux_athena::decode_metadata(&metadata).unwrap();
+    assert_eq!(
+        decoded
+            .iter()
+            .map(|c| (c.name.clone(), c.type_name.clone()))
+            .collect::<Vec<_>>(),
+        columns
+    );
 }
 
 #[tokio::test]
@@ -788,6 +692,107 @@ async fn result_write_failure_fails_the_query() {
         "{status:?}"
     );
     assert_eq!(status.athena_error().unwrap().error_category(), Some(1));
+}
+
+#[tokio::test]
+async fn failed_result_writes_leave_no_partial_objects() {
+    let h = start().await;
+    // `no-csv` accepts the metadata object but refuses the CSV: the query
+    // must fail and the already-written metadata must be removed again.
+    let id = h
+        .client
+        .start_query_execution()
+        .query_string("SELECT 1 AS n")
+        .result_configuration(
+            ResultConfiguration::builder()
+                .output_location("s3://no-csv/out/")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap()
+        .query_execution_id
+        .unwrap();
+    let qe = wait_terminal(&h, &id).await;
+    let status = qe.status().unwrap();
+    assert_eq!(status.state(), Some(&QueryExecutionState::Failed));
+    assert!(
+        status
+            .state_change_reason()
+            .unwrap()
+            .contains(&format!("s3://no-csv/out/{id}.csv")),
+        "{status:?}"
+    );
+    // The deletes are awaited on the failure path, so nothing is left by
+    // the time the client can observe `FAILED` -- no polling needed.
+    let leftovers = h.storage.list_objects("no-csv", "out/").await.unwrap();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    // A query that fails on the engine never writes anything at all.
+    let id = start_query(&h, "SELECT 1 / 0").await;
+    let qe = wait_terminal(&h, &id).await;
+    assert_eq!(
+        qe.status().unwrap().state(),
+        Some(&QueryExecutionState::Failed)
+    );
+    let leftovers: Vec<String> = h
+        .storage
+        .list_objects("results", "athena")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.key)
+        .filter(|k| k.contains(&id))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[tokio::test]
+async fn cancelling_between_the_two_result_writes_leaves_no_partial_objects() {
+    let h = start().await;
+    // `hang-csv` accepts the metadata object and then parks forever on the
+    // CSV, so the query is cancelled with one result object already written.
+    let id = h
+        .client
+        .start_query_execution()
+        .query_string("SELECT 1 AS n")
+        .result_configuration(
+            ResultConfiguration::builder()
+                .output_location("s3://hang-csv/out/")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap()
+        .query_execution_id
+        .unwrap();
+
+    // Wait until the companion is in place, i.e. the task is parked inside
+    // the CSV write with the cleanup guard armed.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let written = h.storage.list_objects("hang-csv", "out/").await.unwrap();
+        if written.iter().any(|o| o.key.ends_with(".csv.metadata")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "metadata was never written");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    h.client
+        .stop_query_execution()
+        .query_execution_id(&id)
+        .send()
+        .await
+        .expect("StopQueryExecution");
+
+    let qe = wait_terminal(&h, &id).await;
+    assert_eq!(
+        qe.status().unwrap().state(),
+        Some(&QueryExecutionState::Cancelled)
+    );
+    // `Drop` cannot await, so the deletes run on a spawned task.
+    h.storage.wait_until_empty("hang-csv", "out/").await;
 }
 
 #[tokio::test]
@@ -1086,9 +1091,11 @@ async fn validation_branches_return_explicit_errors() {
         Some(&QueryExecutionState::Succeeded),
         "{qe:?}"
     );
+    // Enforcement replaces the client's prefix with the workgroup's; the
+    // reported location is the CSV under it, as on AWS.
     assert_eq!(
         qe.result_configuration().and_then(|r| r.output_location()),
-        Some("s3://results/enforced/")
+        Some(format!("s3://results/enforced/{id}.csv").as_str())
     );
     h.storage
         .get_object("results", &format!("enforced/{id}.csv"))
@@ -1256,7 +1263,7 @@ async fn workgroups_supply_output_locations_and_missing_ones_are_rejected() {
     assert_eq!(qe.work_group(), Some("analytics"));
     assert_eq!(
         qe.result_configuration().and_then(|r| r.output_location()),
-        Some("s3://results/wg/")
+        Some(format!("s3://results/wg/{id}.csv").as_str())
     );
     assert_eq!(
         qe.query_execution_context().and_then(|c| c.database()),

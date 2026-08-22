@@ -50,6 +50,11 @@ pub trait StorageBackend: Send + Sync {
     /// Write an object, replacing any existing object at the key.
     async fn put_object(&self, bucket: &str, key: &str, data: Bytes) -> Result<()>;
 
+    /// Delete an object. Deleting a key that does not exist is a success,
+    /// matching S3's `DeleteObject` semantics, so callers can use it to
+    /// clean up partially written result sets without checking first.
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<()>;
+
     /// List objects under a key prefix (recursive, no delimiter).
     async fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectSummary>>;
 
@@ -221,6 +226,15 @@ impl StorageBackend for NetworkStorageBackend {
             .await
             .map_err(storage_error("put", bucket, key))?;
         Ok(())
+    }
+
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
+        let store = self.store_for(bucket)?;
+        let path = ObjectPath::from(key);
+        match store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(source) => Err(storage_error("delete", bucket, key)(source)),
+        }
     }
 
     async fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectSummary>> {
