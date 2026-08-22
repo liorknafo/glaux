@@ -22,11 +22,20 @@ use object_store::{GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt as _, Put
 ///
 /// - `missing-bucket`: every put fails (the bucket does not exist).
 /// - `no-csv`: puts of keys ending in `.csv` fail, after the `.csv.metadata`
-///   companion has already been accepted.
+///   companion has already been accepted. Its deletes are deliberately slow,
+///   so a cleanup that is not awaited would still be in flight when the
+///   client observes the terminal state.
+/// - `hang-csv`: puts of keys ending in `.csv` never complete, parking the
+///   writing task between the two result writes so a cancellation can land
+///   there.
 #[derive(Debug)]
 pub struct MemoryStorage {
     store: Arc<InMemory>,
 }
+
+/// How long a delete against `no-csv` takes. Long enough that a fire-and-
+/// forget cleanup would lose the race against a client polling every 10ms.
+const SLOW_DELETE: Duration = Duration::from_millis(200);
 
 fn path(bucket: &str, key: &str) -> ObjectPath {
     ObjectPath::from(format!("{bucket}/{key}"))
@@ -122,6 +131,11 @@ impl StorageBackend for MemoryStorage {
     }
 
     async fn put_object(&self, bucket: &str, key: &str, data: Bytes) -> glaux_catalog::Result<()> {
+        if bucket == "hang-csv" && key.ends_with(".csv") {
+            // Never resolves: the caller stays parked here until its task is
+            // aborted, which is exactly the window the cleanup guard covers.
+            std::future::pending::<()>().await;
+        }
         let refused = match bucket {
             "missing-bucket" => Some("bucket does not exist"),
             "no-csv" if key.ends_with(".csv") => Some("injected failure writing the CSV"),
@@ -146,6 +160,9 @@ impl StorageBackend for MemoryStorage {
     }
 
     async fn delete_object(&self, bucket: &str, key: &str) -> glaux_catalog::Result<()> {
+        if bucket == "no-csv" {
+            tokio::time::sleep(SLOW_DELETE).await;
+        }
         match self.store.delete(&path(bucket, key)).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(e) => Err(storage_error("delete", bucket, key)(e)),
