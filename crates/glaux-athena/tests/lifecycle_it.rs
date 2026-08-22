@@ -723,7 +723,10 @@ async fn failed_result_writes_leave_no_partial_objects() {
             .contains(&format!("s3://no-csv/out/{id}.csv")),
         "{status:?}"
     );
-    h.storage.wait_until_empty("no-csv", "out/").await;
+    // The deletes are awaited on the failure path, so nothing is left by
+    // the time the client can observe `FAILED` -- no polling needed.
+    let leftovers = h.storage.list_objects("no-csv", "out/").await.unwrap();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 
     // A query that fails on the engine never writes anything at all.
     let id = start_query(&h, "SELECT 1 / 0").await;
@@ -742,6 +745,54 @@ async fn failed_result_writes_leave_no_partial_objects() {
         .filter(|k| k.contains(&id))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[tokio::test]
+async fn cancelling_between_the_two_result_writes_leaves_no_partial_objects() {
+    let h = start().await;
+    // `hang-csv` accepts the metadata object and then parks forever on the
+    // CSV, so the query is cancelled with one result object already written.
+    let id = h
+        .client
+        .start_query_execution()
+        .query_string("SELECT 1 AS n")
+        .result_configuration(
+            ResultConfiguration::builder()
+                .output_location("s3://hang-csv/out/")
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap()
+        .query_execution_id
+        .unwrap();
+
+    // Wait until the companion is in place, i.e. the task is parked inside
+    // the CSV write with the cleanup guard armed.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let written = h.storage.list_objects("hang-csv", "out/").await.unwrap();
+        if written.iter().any(|o| o.key.ends_with(".csv.metadata")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "metadata was never written");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    h.client
+        .stop_query_execution()
+        .query_execution_id(&id)
+        .send()
+        .await
+        .expect("StopQueryExecution");
+
+    let qe = wait_terminal(&h, &id).await;
+    assert_eq!(
+        qe.status().unwrap().state(),
+        Some(&QueryExecutionState::Cancelled)
+    );
+    // `Drop` cannot await, so the deletes run on a spawned task.
+    h.storage.wait_until_empty("hang-csv", "out/").await;
 }
 
 #[tokio::test]

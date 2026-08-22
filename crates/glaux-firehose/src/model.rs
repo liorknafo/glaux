@@ -276,6 +276,13 @@ pub struct ExtendedS3DestinationConfiguration {
     /// implemented, so it could not be honoured).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s3_backup_configuration: Option<Value>,
+    /// `S3BackupUpdate`, the `UpdateDestination` spelling of the same
+    /// member (rejected for the same reason). Present on the shared struct
+    /// because `ExtendedS3DestinationUpdate` aliases it; without the field
+    /// serde would drop the member and glaux would silently ignore a
+    /// backup destination the caller asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub s3_backup_update: Option<Value>,
     /// Record format conversion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_format_conversion_configuration: Option<DataFormatConversionConfiguration>,
