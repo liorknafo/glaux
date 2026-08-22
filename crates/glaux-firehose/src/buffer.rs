@@ -40,7 +40,7 @@
 
 use std::pin::pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -84,7 +84,9 @@ pub struct StreamBuffer {
     sink: Arc<dyn DeliverySink>,
     inner: Mutex<Inner>,
     /// Woken whenever `deadline` changes so the timer task re-reads it.
-    wake: Notify,
+    /// Held behind an `Arc` so the timer task can park on it without
+    /// keeping the buffer itself alive (see [`StreamBuffer::run_timer`]).
+    wake: Arc<Notify>,
     timer: Mutex<Option<JoinHandle<()>>>,
     /// Delivery tasks currently running.
     in_flight: AtomicUsize,
@@ -170,12 +172,19 @@ impl StreamBuffer {
                 deadline: None,
                 closed: false,
             }),
-            wake: Notify::new(),
+            wake: Arc::new(Notify::new()),
             timer: Mutex::new(None),
             in_flight: AtomicUsize::new(0),
             idle: Notify::new(),
         });
-        let task = tokio::spawn(Arc::clone(&buffer).run_timer());
+        // The timer holds only a `Weak`: a strong reference would make the
+        // buffer immortal (the task never ends until `close`), so dropping
+        // a service without awaiting `shutdown` would leak every buffer,
+        // its pending records, and its task.
+        let task = tokio::spawn(Self::run_timer(
+            Arc::downgrade(&buffer),
+            Arc::clone(&buffer.wake),
+        ));
         *buffer.timer.lock().unwrap() = Some(task);
         buffer
     }
@@ -435,29 +444,38 @@ impl StreamBuffer {
         self.wake.notify_one();
     }
 
-    async fn run_timer(self: Arc<Self>) {
+    /// The interval timer. It upgrades the `Weak` only while it has work to
+    /// do and drops the strong reference before parking, so the buffer is
+    /// freed as soon as its owner lets go even if `close` was never called.
+    async fn run_timer(weak: Weak<Self>, wake: Arc<Notify>) {
         loop {
             let deadline = {
-                let inner = self.inner.lock().unwrap();
+                let Some(this) = weak.upgrade() else {
+                    return;
+                };
+                let inner = this.inner.lock().unwrap();
                 if inner.closed {
                     return;
                 }
                 inner.deadline
             };
             match deadline {
-                None => self.wake.notified().await,
+                None => wake.notified().await,
                 Some(deadline) => {
                     tokio::select! {
                         _ = tokio::time::sleep_until(deadline) => {
-                            if let Err(err) = self.flush(FlushReason::Interval).await {
+                            let Some(this) = weak.upgrade() else {
+                                return;
+                            };
+                            if let Err(err) = this.flush(FlushReason::Interval).await {
                                 tracing::error!(
-                                    stream = %self.stream_name,
+                                    stream = %this.stream_name,
                                     error = %err,
                                     "interval flush failed; records retained for retry"
                                 );
                             }
                         }
-                        _ = self.wake.notified() => {}
+                        _ = wake.notified() => {}
                     }
                 }
             }
@@ -566,6 +584,25 @@ mod tests {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_buffer_without_closing_it_frees_it() {
+        let sink = Arc::new(RecordingSink::new());
+        let b = buffer(&sink, 128, 60);
+        b.push(Bytes::from_static(b"one")).await.unwrap();
+        settle().await;
+
+        let weak = Arc::downgrade(&b);
+        drop(b);
+        // The timer task must not keep the buffer (and its records) alive:
+        // a service dropped without `shutdown` would otherwise leak every
+        // stream it ever created.
+        assert!(
+            weak.upgrade().is_none(),
+            "the interval timer is still holding the buffer alive"
+        );
+        settle().await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -691,6 +728,8 @@ mod tests {
                 .interval_in_seconds,
             Some(30)
         );
+        // The new version reaches the sink: S3 object names embed it.
+        assert_eq!(sink.batches()[0].stream_version, "2");
     }
 
     #[tokio::test(start_paused = true)]

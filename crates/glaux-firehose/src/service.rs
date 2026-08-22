@@ -28,6 +28,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::buffer::StreamBuffer;
+use crate::convert;
 use crate::error::FirehoseError;
 use crate::model::*;
 use crate::prefix::{PrefixError, validate_prefix};
@@ -244,33 +245,26 @@ fn validate_conversion(
         .as_ref()
         .and_then(|c| c.deserializer.as_ref())
         .and_then(Value::as_object);
-    match deserializer {
-        Some(map) if map.contains_key("OpenXJsonSerDe") => {}
-        Some(map) if map.contains_key("HiveJsonSerDe") => {
-            let formats = map["HiveJsonSerDe"]
-                .get("TimestampFormats")
-                .and_then(Value::as_array)
-                .is_some_and(|f| !f.is_empty());
-            if formats {
-                return Err(FirehoseError::invalid_argument(
-                    "InputFormatConfiguration.Deserializer.HiveJsonSerDe.TimestampFormats is not \
-                     implemented by glaux: timestamps must be epoch numbers or ISO-8601 strings",
-                ));
-            }
-        }
-        Some(map) => {
-            let names: Vec<_> = map.keys().cloned().collect();
-            return Err(FirehoseError::invalid_argument(format!(
-                "unsupported InputFormatConfiguration.Deserializer {names:?}: glaux supports \
-                 OpenXJsonSerDe and HiveJsonSerDe"
-            )));
-        }
-        None => {
-            return Err(FirehoseError::invalid_argument(
-                "DataFormatConversionConfiguration.InputFormatConfiguration.Deserializer is \
-                 required when conversion is enabled",
-            ));
-        }
+    let Some(map) = deserializer else {
+        return Err(FirehoseError::invalid_argument(
+            "DataFormatConversionConfiguration.InputFormatConfiguration.Deserializer is \
+             required when conversion is enabled",
+        ));
+    };
+    // Exactly one SerDe, with an options object: a map naming both would
+    // otherwise skip the HiveJsonSerDe checks below.
+    let (name, options) =
+        convert::select_deserializer(map).map_err(FirehoseError::invalid_argument)?;
+    if name == convert::HIVE_JSON_SERDE
+        && options
+            .get("TimestampFormats")
+            .and_then(Value::as_array)
+            .is_some_and(|f| !f.is_empty())
+    {
+        return Err(FirehoseError::invalid_argument(
+            "InputFormatConfiguration.Deserializer.HiveJsonSerDe.TimestampFormats is not \
+             implemented by glaux: timestamps must be epoch numbers or ISO-8601 strings",
+        ));
     }
     let serializer = conversion
         .output_format_configuration
@@ -453,10 +447,10 @@ fn resolve_destination(
             )));
         }
     }
-    if config.s3_backup_configuration.is_some() {
+    if config.s3_backup_configuration.is_some() || config.s3_backup_update.is_some() {
         return Err(FirehoseError::invalid_argument(
-            "S3BackupConfiguration is not supported by glaux v0.1: source-record backup is not \
-             implemented, so the backup destination cannot be honoured",
+            "S3BackupConfiguration/S3BackupUpdate is not supported by glaux v0.1: source-record \
+             backup is not implemented, so the backup destination cannot be honoured",
         ));
     }
 
@@ -1072,6 +1066,11 @@ impl FirehoseService {
     /// this, streams refuse new records. Returns one entry per stream whose
     /// flush failed (its records stay in memory; nothing is dropped
     /// silently).
+    ///
+    /// Every stream is closed first and the flushes then run concurrently:
+    /// serialising them would make shutdown cost one sink round-trip per
+    /// stream, and `max_streams` allows 5000 of them, so a shutdown grace
+    /// period could expire before the last buffer was written.
     pub async fn shutdown(&self) -> Vec<(String, SinkError)> {
         let buffers: Vec<Arc<StreamBuffer>> = self
             .streams
@@ -1080,13 +1079,35 @@ impl FirehoseService {
             .values()
             .map(|e| Arc::clone(&e.buffer))
             .collect();
-        let mut failures = Vec::new();
+        // Close every timer up front so no buffer keeps scheduling work
+        // while the others are still flushing.
+        for buffer in &buffers {
+            buffer.close();
+        }
+        let mut tasks = tokio::task::JoinSet::new();
         for buffer in buffers {
-            if let Err(err) = buffer.close_and_flush(FlushReason::Shutdown).await {
+            tasks.spawn(async move {
+                let result = buffer.close_and_flush(FlushReason::Shutdown).await;
+                (buffer, result)
+            });
+        }
+        let mut failures = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            let (buffer, result) = match joined {
+                Ok(joined) => joined,
+                Err(join) => {
+                    // A flush task can only end abnormally if the runtime
+                    // itself is going away; nothing is silently dropped.
+                    tracing::error!(error = %join, "shutdown flush task ended abnormally");
+                    continue;
+                }
+            };
+            if let Err(err) = result {
                 tracing::error!(stream = buffer.stream_name(), error = %err, "shutdown flush failed");
                 failures.push((buffer.stream_name().to_string(), err));
             }
         }
+        failures.sort_by(|a, b| a.0.cmp(&b.0));
         failures
     }
 }
@@ -1215,6 +1236,35 @@ mod tests {
         let err = create(&service, bad).await.unwrap_err();
         assert_eq!(err.code(), "SerializationException");
         assert!(err.message().contains("LZ4"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_or_malformed_deserializers_are_refused() {
+        let (service, _sink) = service();
+
+        // Both SerDes named: accepting one by precedence would skip the
+        // other's validation, so the whole configuration is refused.
+        let mut both = conversion(64, "UNCOMPRESSED", "ParquetSerDe");
+        both["ExtendedS3DestinationConfiguration"]["DataFormatConversionConfiguration"]["InputFormatConfiguration"]
+            ["Deserializer"] =
+            json!({"OpenXJsonSerDe": {}, "HiveJsonSerDe": {"TimestampFormats": ["yyyy"]}});
+        let err = create(&service, both).await.unwrap_err();
+        assert_eq!(err.code(), "InvalidArgumentException");
+        assert!(err.message().contains("exactly one"), "{err}");
+
+        // A member that is not an options object is refused rather than
+        // treated as an empty one.
+        let mut scalar = conversion(64, "UNCOMPRESSED", "ParquetSerDe");
+        scalar["ExtendedS3DestinationConfiguration"]["DataFormatConversionConfiguration"]["InputFormatConfiguration"]
+            ["Deserializer"] = json!({"OpenXJsonSerDe": "yes"});
+        let err = create(&service, scalar).await.unwrap_err();
+        assert!(err.message().contains("must be an object"), "{err}");
+
+        // An explicitly null member is what some SDKs send for "unset".
+        let mut null_member = conversion(64, "UNCOMPRESSED", "ParquetSerDe");
+        null_member["ExtendedS3DestinationConfiguration"]["DataFormatConversionConfiguration"]["InputFormatConfiguration"]
+            ["Deserializer"] = json!({"HiveJsonSerDe": {}, "OpenXJsonSerDe": null});
+        create(&service, null_member).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -1351,5 +1401,63 @@ mod tests {
         let err = create(&service, body).await.unwrap_err();
         assert_eq!(err.code(), "InvalidArgumentException");
         assert!(err.message().contains("S3BackupConfiguration"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_every_stream() {
+        let (service, sink) = service();
+        let data = base64::engine::general_purpose::STANDARD.encode(b"payload");
+        for i in 0..8 {
+            let name = format!("s{i}");
+            create(&service, plain(&name)).await.unwrap();
+            service
+                .handle(
+                    "PutRecord",
+                    json!({"DeliveryStreamName": name, "Record": {"Data": data}})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(service.shutdown().await.is_empty());
+        let mut flushed: Vec<String> = sink
+            .batches()
+            .iter()
+            .map(|b| b.stream_name.clone())
+            .collect();
+        flushed.sort();
+        assert_eq!(
+            flushed,
+            (0..8).map(|i| format!("s{i}")).collect::<Vec<_>>(),
+            "every stream must be flushed exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_backup_update_is_rejected_by_name() {
+        let (service, _sink) = service();
+        create(&service, plain("bk")).await.unwrap();
+        let err = service
+            .handle(
+                "UpdateDestination",
+                json!({
+                    "DeliveryStreamName": "bk",
+                    "CurrentDeliveryStreamVersionId": "1",
+                    "DestinationId": "destinationId-000000000001",
+                    "ExtendedS3DestinationUpdate": {
+                        "S3BackupUpdate": {
+                            "RoleARN": "arn:aws:iam::000000000000:role/firehose",
+                            "BucketARN": "arn:aws:s3:::backup"
+                        }
+                    }
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "InvalidArgumentException");
+        assert!(err.message().contains("S3BackupUpdate"), "{err}");
     }
 }
