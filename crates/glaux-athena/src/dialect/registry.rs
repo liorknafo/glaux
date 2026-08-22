@@ -1197,7 +1197,7 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "arrays_overlap(a, b) → boolean",
         "Array",
         Rewrite,
-        "Rust UDF `trino_arrays_overlap`: NULL (not false) when no element matches but either array has a NULL element, as in Trino. Element types must be comparable.",
+        "Rust UDF `trino_arrays_overlap`: NULL (not false) when no element matches but either array has a NULL element, as in Trino. An *empty* array short-circuits to false first, as Trino's `ArraysOverlapFunction` tests `leftPositionCount == 0 || rightPositionCount == 0` before it looks at NULL elements, so `arrays_overlap(ARRAY[], ARRAY[NULL])` is false while `arrays_overlap(ARRAY[NULL], ARRAY[NULL])` is NULL. Element types must be comparable.",
         ["trino_arrays_overlap"]
     ),
     shim!(

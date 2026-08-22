@@ -525,6 +525,13 @@ impl ScalarUDFImpl for TrinoArraysOverlap {
                 out.append_null();
                 continue;
             }
+            // Trino's `ArraysOverlapFunction` answers `false` for an empty
+            // array *before* it looks at NULL elements, so an empty array
+            // against `ARRAY[NULL]` is `false`, not `NULL`.
+            if left.value_length(i) == 0 || right.value_length(i) == 0 {
+                out.append_value(false);
+                continue;
+            }
             let (a, a_null) = row_scalars(&left, i)?;
             let (b, b_null) = row_scalars(&right, i)?;
             let a: HashSet<ScalarValue> = a.into_iter().collect();
