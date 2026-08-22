@@ -188,6 +188,51 @@ pub fn orders() -> (Arc<Schema>, RecordBatch) {
     (schema, batch)
 }
 
+/// `countries`: code, name, continent, population (bigint),
+/// gdp_per_capita (double). Joins to `customers.country`; `GB` and `JP`
+/// have no customers so anti-joins have something to find.
+pub fn countries() -> (Arc<Schema>, RecordBatch) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("code", DataType::Utf8, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("continent", DataType::Utf8, true),
+        Field::new("population", DataType::Int64, true),
+        Field::new("gdp_per_capita", DataType::Float64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(vec!["US", "DE", "FR", "GB", "JP"])),
+            Arc::new(StringArray::from(vec![
+                "United States",
+                "Germany",
+                "France",
+                "United Kingdom",
+                "Japan",
+            ])),
+            Arc::new(StringArray::from(vec![
+                "North America",
+                "Europe",
+                "Europe",
+                "Europe",
+                "Asia",
+            ])),
+            Arc::new(Int64Array::from(vec![
+                334_900_000,
+                84_500_000,
+                68_200_000,
+                67_700_000,
+                124_500_000,
+            ])),
+            Arc::new(Float64Array::from(vec![
+                81695.19, 52745.76, 44460.82, 48866.63, 33834.39,
+            ])),
+        ],
+    )
+    .unwrap();
+    (schema, batch)
+}
+
 /// `events`: id, at (timestamp with nanosecond precision, as a Glue
 /// `timestamp` column read from Parquet micros/nanos arrives).
 pub fn events() -> (Arc<Schema>, RecordBatch) {
@@ -210,4 +255,18 @@ pub fn events() -> (Arc<Schema>, RecordBatch) {
     )
     .unwrap();
     (schema, batch)
+}
+
+/// Every corpus fixture table by name: `(name, schema, batch)`.
+pub fn all_tables() -> Vec<(&'static str, Arc<Schema>, RecordBatch)> {
+    let mut out = Vec::new();
+    for (name, (schema, batch)) in [
+        ("customers", customers()),
+        ("orders", orders()),
+        ("countries", countries()),
+        ("events", events()),
+    ] {
+        out.push((name, schema, batch));
+    }
+    out
 }

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::MemoryStorage;
-use common::fixtures::{customers, events, orders};
+use common::fixtures::all_tables;
 use datafusion::catalog::MemTable;
 use datafusion::prelude::SessionContext;
 use glaux_athena::model::ColumnInfo;
@@ -32,11 +32,7 @@ struct Harness {
 
 fn harness() -> Harness {
     let ctx = SessionContext::new();
-    for (name, (schema, batch)) in [
-        ("customers", customers()),
-        ("orders", orders()),
-        ("events", events()),
-    ] {
+    for (name, schema, batch) in all_tables() {
         ctx.register_table(
             name,
             Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),

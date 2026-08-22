@@ -24,6 +24,10 @@ EventBridge → SQS → your service → Firehose → Parquet in S3 → Athena S
 
 The engine crates (`glaux-athena`, `glaux-firehose`, `glaux-catalog`) are Apache-2.0 and have no fakecloud dependency.
 
+## Fidelity
+
+`crates/glaux-fidelity` is the differential suite: the SQL corpus (`crates/glaux-athena/tests/corpus`) runs against glaux over Parquet/NDJSON/CSV fixtures and is diffed against recorded snapshots on every CI run (`cargo run -p glaux-fidelity -- replay`). `cargo run -p glaux-fidelity -- record --profile <aws-profile>` re-records the snapshots against real AWS Athena in a scratch bucket/database that is torn down afterwards; snapshots that have not been recorded against AWS yet are marked `UNVERIFIED` in their header and in [`docs/sql-coverage.md`](docs/sql-coverage.md).
+
 ## Status
 
 Pre-implementation. The v0.1 design spec lives in [`docs/specs/2026-08-15-glaux-v0.1-design.md`](docs/specs/2026-08-15-glaux-v0.1-design.md). Feasibility spikes (ranged S3 reads against fakecloud, embedding custom services on fakecloud's dispatcher) passed on 2026-08-15.

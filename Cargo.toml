@@ -5,6 +5,7 @@ members = [
     "crates/glaux-firehose",
     "crates/glaux-catalog",
     "crates/glaux-server",
+    "crates/glaux-fidelity",
     "crates/glaux",
 ]
 
@@ -63,6 +64,9 @@ parquet = "59.2"
 # Test-only helpers (referenced from crate dev-dependencies)
 tempfile = "3"
 aws-sdk-athena = "1"
+aws-sdk-s3 = "1"
+aws-sdk-glue = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-firehose = "1"
 csv = "1"
 sha2 = "0.10"
