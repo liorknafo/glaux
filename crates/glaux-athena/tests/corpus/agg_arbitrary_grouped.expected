@@ -1,0 +1,9 @@
+types: varchar, double, boolean
++-----------+------------+----------+
+| status    | any_amount | any_rush |
++-----------+------------+----------+
+| cancelled | 15.0       |          |
+| pending   | 80.25      | true     |
+| shipped   | 120.5      | true     |
+|           | 10.0       |          |
++-----------+------------+----------+
