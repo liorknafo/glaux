@@ -395,10 +395,10 @@ fn resolve_destination(
             )));
         }
     }
-    if config.s3_backup_configuration.is_some() {
+    if config.s3_backup_configuration.is_some() || config.s3_backup_update.is_some() {
         return Err(FirehoseError::invalid_argument(
-            "S3BackupConfiguration is not supported by glaux v0.1: source-record backup is not \
-             implemented, so the backup destination cannot be honoured",
+            "S3BackupConfiguration/S3BackupUpdate is not supported by glaux v0.1: source-record \
+             backup is not implemented, so the backup destination cannot be honoured",
         ));
     }
 
@@ -1291,5 +1291,32 @@ mod tests {
         let err = create(&service, body).await.unwrap_err();
         assert_eq!(err.code(), "InvalidArgumentException");
         assert!(err.message().contains("S3BackupConfiguration"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn s3_backup_update_is_rejected_by_name() {
+        let (service, _sink) = service();
+        create(&service, plain("bk")).await.unwrap();
+        let err = service
+            .handle(
+                "UpdateDestination",
+                json!({
+                    "DeliveryStreamName": "bk",
+                    "CurrentDeliveryStreamVersionId": "1",
+                    "DestinationId": "destinationId-000000000001",
+                    "ExtendedS3DestinationUpdate": {
+                        "S3BackupUpdate": {
+                            "RoleARN": "arn:aws:iam::000000000000:role/firehose",
+                            "BucketARN": "arn:aws:s3:::backup"
+                        }
+                    }
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "InvalidArgumentException");
+        assert!(err.message().contains("S3BackupUpdate"), "{err}");
     }
 }
