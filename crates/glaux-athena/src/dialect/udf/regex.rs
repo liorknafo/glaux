@@ -198,6 +198,23 @@ pub fn translate_java_pattern(pattern: &str) -> std::result::Result<(String, boo
                 class_start = false;
             }
             '[' => {
+                // A `[` *inside* a class opens a nested class in both
+                // syntaxes — except that Rust's `regex` reads
+                // `[[:alpha:]]` as a POSIX bracket expression, which
+                // Trino's engine does not have (see `posix_class_name`).
+                if depth > 0
+                    && let Some(name) = posix_class_name(&chars.clone().collect::<String>())
+                {
+                    return Err(format!(
+                        "POSIX bracket expression `[:{name}:]` in pattern {pattern:?}: Trino \
+                         runs Joni with Java syntax, whose operator set has no POSIX bracket \
+                         expressions, so `[[:{name}:]]` there is a character class over the \
+                         characters that spell it (`regexp_like('ABC', '[[:alpha:]]+')` is \
+                         false on Trino) — while glaux's regex engine reads it as the POSIX \
+                         class it looks like. Write the characters out (`[A-Za-z]`) rather \
+                         than have glaux pick one of the two meanings"
+                    ));
+                }
                 depth += 1;
                 out.push('[');
                 if chars.peek() == Some(&'^') {
@@ -253,6 +270,20 @@ pub fn translate_java_pattern(pattern: &str) -> std::result::Result<(String, boo
         }
     }
     Ok((out, text_end_anchor))
+}
+
+/// The POSIX class name `rest` starts with (`alpha` for the text after the
+/// second `[` of `[[:alpha:]]`, `^alpha` for a negated one), if Rust's
+/// `regex` would read a POSIX bracket expression there.
+///
+/// Trino runs Joni with `Syntax.JAVA`, whose operator flags do not include
+/// `OP_POSIX_BRACKET`, so `[:alpha:]` is not a class name there at all —
+/// the two engines cannot agree, and glaux refuses instead of picking one.
+fn posix_class_name(rest: &str) -> Option<&str> {
+    let rest = rest.strip_prefix(':')?;
+    let name = &rest[..rest.find(":]")?];
+    let bare = name.strip_prefix('^').unwrap_or(name);
+    (!bare.is_empty() && bare.chars().all(|c| c.is_ascii_alphabetic())).then_some(name)
 }
 
 /// Refuse a single-line `$` / `\Z` that is not the last thing its branch
@@ -842,6 +873,26 @@ mod tests {
             translate_java_pattern(pattern).unwrap_or_else(|e| panic!("{pattern}: {e}"));
         }
     }
+    #[test]
+    fn posix_bracket_expressions_are_refused_by_name() {
+        for pattern in [
+            "[[:alpha:]]+",
+            "[[:digit:]]",
+            "[a-z[:space:]]",
+            "[[:^alpha:]]",
+            "x[[:alnum:]]*y",
+        ] {
+            let err = translate_java_pattern(pattern).unwrap_err();
+            assert!(err.contains("POSIX bracket expression"), "{pattern}: {err}");
+        }
+        // Not a POSIX bracket expression: an ordinary nested class, a
+        // colon in a class, and a top-level `[:alpha:]` (a class over the
+        // characters that spell it in *both* engines).
+        for pattern in ["[a[bc]]", "[a:b]", "[:alpha:]", "[a[:b]]", "[[]]"] {
+            translate_java_pattern(pattern).unwrap_or_else(|e| panic!("{pattern}: {e}"));
+        }
+    }
+
     #[test]
     fn replacement_references_are_validated_against_the_pattern() {
         let re = Regex::new("(?<x>b)(c)?").unwrap();
