@@ -82,17 +82,30 @@ pub fn mysql_to_chrono(
             'T' => "%H:%M:%S",
             'W' => "%A", // weekday name
             'a' => "%a", // abbreviated weekday name
-            'w' => "%w", // day of week 0=Sunday
             'v' => "%V", // week 01-53, Monday-first (ISO)
             'x' => "%G", // the week-year %v belongs to (Joda's `xxxx`)
             '%' => "%%",
+            // Trino's `createDateTimeFormatter` maps every specifier it
+            // supports onto a Joda field and *throws* for these six —
+            // `%D` (day with an English suffix), the Sunday-first week
+            // fields `%U` / `%V` / `%X`, `%u`, and `%w` (day of week as a
+            // number) — so a format using one fails on Athena rather than
+            // producing text. `%w` in particular is one chrono has, which
+            // is exactly how an emulator ends up answering a query Athena
+            // refuses.
+            'D' | 'U' | 'u' | 'V' | 'w' | 'X' => {
+                return Err(GlauxSqlError::invalid_arguments(
+                    function,
+                    format!("%{spec} not supported in date format string"),
+                ));
+            }
             other => {
                 return Err(GlauxSqlError::invalid_arguments(
                     function,
                     format!(
                         "format specifier %{other} in {format:?} is not supported by glaux \
                          (supported: %Y %y %m %c %M %b %d %e %j %H %k %h %I %l %i %s %S %f %p \
-                         %r %T %W %a %w %v %x %%)"
+                         %r %T %W %a %v %x %%)"
                     ),
                 ));
             }
@@ -299,6 +312,28 @@ mod tests {
         assert!(err.to_string().contains("date_parse"), "{err}");
         let err = mysql_to_chrono("date_parse", "%Y-%", Direction::Parse).unwrap_err();
         assert!(err.to_string().contains("dangling"), "{err}");
+    }
+
+    #[test]
+    fn the_specifiers_trino_throws_for_are_refused_in_trinos_words() {
+        for spec in ['D', 'U', 'u', 'V', 'w', 'X'] {
+            for direction in [Direction::Parse, Direction::Format] {
+                let format = format!("%Y %{spec}");
+                let err = mysql_to_chrono("date_format", &format, direction).unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "INVALID_FUNCTION_ARGUMENT: date_format: %{spec} not supported in date \
+                         format string"
+                    )
+                );
+            }
+        }
+        // The neighbours Trino *does* map still work.
+        assert_eq!(
+            mysql_to_chrono("date_format", "%W %a %v %x", Direction::Format).unwrap(),
+            "%A %a %V %G"
+        );
     }
 
     #[test]
