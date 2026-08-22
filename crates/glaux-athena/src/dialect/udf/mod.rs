@@ -94,9 +94,27 @@ macro_rules! user_err {
 pub(crate) use user_err;
 
 use datafusion::logical_expr::{
-    AggregateUDF, ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
-    TypeSignature, Volatility,
+    AggregateUDF, ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, TypeSignature, Volatility,
 };
+
+/// Field metadata key marking a column that carries Trino's `JSON` type.
+/// glaux represents a JSON value as the varchar holding its text, so the
+/// values are Trino's; the marker is what lets the Athena result metadata
+/// report the column as `json` rather than `varchar`, as Athena does.
+pub const TRINO_TYPE_METADATA: &str = "glaux.trino_type";
+
+/// The `Utf8` field a JSON-returning UDF reports, carrying that marker.
+fn json_field(name: &str) -> arrow::datatypes::FieldRef {
+    Arc::new(
+        arrow::datatypes::Field::new(name, DataType::Utf8, true).with_metadata(
+            std::collections::HashMap::from([(
+                TRINO_TYPE_METADATA.to_string(),
+                "json".to_string(),
+            )]),
+        ),
+    )
+}
 
 /// All scalar UDFs the Trino layer registers.
 pub fn all() -> Vec<ScalarUDF> {
@@ -917,6 +935,10 @@ impl ScalarUDFImpl for JsonExtract {
         Ok(DataType::Utf8)
     }
 
+    fn return_field_from_args(&self, _: ReturnFieldArgs) -> Result<arrow::datatypes::FieldRef> {
+        Ok(json_field(self.name()))
+    }
+
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let mut out = StringBuilder::new();
         json_path_map(
@@ -1048,6 +1070,10 @@ impl ScalarUDFImpl for JsonParse {
 
     fn return_type(&self, _: &[DataType]) -> Result<DataType> {
         Ok(DataType::Utf8)
+    }
+
+    fn return_field_from_args(&self, _: ReturnFieldArgs) -> Result<arrow::datatypes::FieldRef> {
+        Ok(json_field(self.name()))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {

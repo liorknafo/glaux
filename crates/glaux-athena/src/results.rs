@@ -18,6 +18,7 @@ use arrow::datatypes::{DataType, Float32Type, Float64Type, Int64Type, SchemaRef,
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 
+use crate::dialect::udf::TRINO_TYPE_METADATA;
 use crate::dialect::udf::timestamps::to_millis_rounded;
 use crate::model::{ColumnInfo, Datum, Row};
 
@@ -274,6 +275,14 @@ pub fn column_infos(schema: &SchemaRef) -> Result<Vec<ColumnInfo>, ResultError> 
         .iter()
         .map(|field| {
             let (type_name, precision, scale) = athena_type(field.name(), field.data_type())?;
+            // A JSON-typed expression: glaux carries Trino's `JSON` as the
+            // varchar holding its text, and the UDFs that produce one mark
+            // the field so the reported type is Athena's `json` rather than
+            // the `varchar` the values are stored as.
+            let (type_name, precision) = match field.metadata().get(TRINO_TYPE_METADATA) {
+                Some(trino_type) if trino_type == "json" => ("json".to_string(), 0),
+                _ => (type_name, precision),
+            };
             Ok(ColumnInfo {
                 catalog_name: "hive".to_string(),
                 schema_name: String::new(),

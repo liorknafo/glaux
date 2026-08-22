@@ -1,4 +1,4 @@
-types: varchar, varchar, bigint, bigint, varchar, bigint, varchar
+types: varchar, json, bigint, bigint, varchar, bigint, varchar
 +--------+---------+--------------+------+-------+--------------+-------------+
 | scalar | extract | array_length | size | valid | valid_length | from_column |
 +--------+---------+--------------+------+-------+--------------+-------------+
