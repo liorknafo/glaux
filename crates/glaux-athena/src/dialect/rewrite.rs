@@ -2378,6 +2378,22 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
         "ceiling" | "ceil" => return simple_rename("trino_ceil", &[1]),
         "floor" => return simple_rename("trino_floor", &[1]),
         "round" => return simple_rename("trino_round", &[1, 2]),
+        // Trino's `MathFunctions.log2` is literally `Math.log(num) /
+        // Math.log(2)`, not a base-2 logarithm routine, and the two differ
+        // by an ULP for inputs such as 3 and 100. DataFusion's `log2` is
+        // Rust's `f64::log2` intrinsic, so route the call through
+        // `log(2, x)` — DataFusion's two-argument `log` is `ln(x) /
+        // ln(base)`, the same expression Trino evaluates.
+        "log2" => {
+            arity(name, &args, &[1])?;
+            func(
+                "log",
+                vec![
+                    cast_to(num_lit(2), double()),
+                    cast_to(args.into_iter().next().unwrap(), double()),
+                ],
+            )
+        }
         // Trino: power(x, p) → double, whatever the argument types;
         // DataFusion keeps integer arguments integral.
         "pow" | "power" => {

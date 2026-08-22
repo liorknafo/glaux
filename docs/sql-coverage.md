@@ -4,7 +4,7 @@
 
 glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusion. This table is generated from the shim registry that drives the translator, so it is exactly what the engine accepts: anything not listed is refused with an error naming the construct — never silently approximated.
 
-**Functions:** 134 supported (48 passthrough, 76 rewritten, 10 Rust UDFs), 29 refused by name.
+**Functions:** 134 supported (47 passthrough, 77 rewritten, 10 Rust UDFs), 29 refused by name.
 
 ## SQL constructs
 
@@ -201,7 +201,7 @@ glaux executes Athena (Trino-dialect) SQL by translating it onto Apache DataFusi
 | `ln` | `ln(x) → double` | passthrough | DataFusion `ln` |
 | `log` | `log(base, x) → double` | passthrough | DataFusion `log(base, x)` (same argument order). Trino has only the two-argument form: `log(x)` is refused (DataFusion would run it as `log10`); use `log10`, `log2`, or `ln`. |
 | `log10` | `log10(x) → double` | passthrough | DataFusion `log10` |
-| `log2` | `log2(x) → double` | passthrough | DataFusion `log2` |
+| `log2` | `log2(x) → double` | rewrite | `log(CAST(2 AS DOUBLE), CAST(x AS DOUBLE))`. Trino's `log2` is not a base-2 logarithm routine: `MathFunctions.log2` evaluates `Math.log(num) / Math.log(2)`, which differs from a correctly rounded base-2 log by an ULP for some inputs (`log2(3e0)` is `1.5849625007211563`, `log2(1e2)` is `6.643856189774725`). DataFusion's `log2` is Rust's `f64::log2` intrinsic and answers `1.584962500721156` / `6.643856189774724`, so the call goes through DataFusion's two-argument `log`, which is `ln(x) / ln(base)` — the expression Trino evaluates. |
 | `mod` | `mod(n, m)` | rewrite | `n % m` |
 | `nan` | `nan() → double` | rewrite | `trino_double('NaN')` — glaux's `CAST(varchar AS DOUBLE)`, which follows Java's `Double.parseDouble`. There is no NaN literal to fold onto, and DataFusion has no such function; `0e0 / 0e0` is the same value. |
 | `pi` | `pi() → double` | passthrough | DataFusion `pi` |

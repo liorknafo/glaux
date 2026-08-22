@@ -1026,9 +1026,9 @@ pub static FUNCTIONS: &[FunctionShim] = &[
         "log2",
         "log2(x) → double",
         "Math",
-        Passthrough,
-        "DataFusion `log2`",
-        ["log2"]
+        Rewrite,
+        "`log(CAST(2 AS DOUBLE), CAST(x AS DOUBLE))`. Trino's `log2` is not a base-2 logarithm routine: `MathFunctions.log2` evaluates `Math.log(num) / Math.log(2)`, which differs from a correctly rounded base-2 log by an ULP for some inputs (`log2(3e0)` is `1.5849625007211563`, `log2(1e2)` is `6.643856189774725`). DataFusion's `log2` is Rust's `f64::log2` intrinsic and answers `1.584962500721156` / `6.643856189774724`, so the call goes through DataFusion's two-argument `log`, which is `ln(x) / ln(base)` — the expression Trino evaluates.",
+        ["log"]
     ),
     shim!("mod", "mod(n, m)", "Math", Rewrite, "`n % m`", []),
     shim!(
