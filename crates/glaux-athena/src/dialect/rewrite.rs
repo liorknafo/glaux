@@ -26,9 +26,9 @@ use sqlparser::ast::{
     AccessExpr, BinaryOperator, CaseWhen, CastKind, CeilFloorKind, CharacterLength, DataType,
     DateTimeField, Distinct, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr, Ident,
-    JoinConstraint, JoinOperator, NamedWindowExpr, ObjectName, ObjectNamePart, OrderByExpr,
-    OrderByKind, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
-    Subscript, TableAlias, TableFactor, TableWithJoins, TimezoneInfo, TrimWhereField,
+    JoinConstraint, JoinOperator, NamedWindowExpr, NullTreatment, ObjectName, ObjectNamePart,
+    OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier,
+    Statement, Subscript, TableAlias, TableFactor, TableWithJoins, TimezoneInfo, TrimWhereField,
     UnaryOperator, Value, Visit, VisitMut, Visitor, VisitorMut, WindowType,
 };
 
@@ -2142,8 +2142,26 @@ fn rewrite_call(name: &str, f: &mut Function) -> Result<Option<Expr>, GlauxSqlEr
             rename(f, "trino_approx_percentile");
             return Ok(None);
         }
+        // Trino's contract is "an arbitrary *non-null* value of x, if one
+        // exists" (`ArbitraryAggregationFunction` only combines non-null
+        // states), so a leading NULL must not win: DataFusion's
+        // `first_value` respects NULLs unless the call says otherwise.
         "arbitrary" => {
+            if let Some(treatment) = f.null_treatment {
+                return Err(GlauxSqlError::invalid_arguments(
+                    name,
+                    format!(
+                        "Trino has no {} clause on arbitrary: it always returns a non-null \
+                         value when the group has one",
+                        match treatment {
+                            NullTreatment::IgnoreNulls => "IGNORE NULLS",
+                            NullTreatment::RespectNulls => "RESPECT NULLS",
+                        }
+                    ),
+                ));
+            }
             rename(f, "first_value");
+            f.null_treatment = Some(NullTreatment::IgnoreNulls);
             return Ok(None);
         }
         "every" => {
@@ -2536,8 +2554,26 @@ mod tests {
                 "SELECT arbitrary(x) AS a, every(b) AS e, approx_percentile(v, 0.9) AS p FROM t"
             )
             .unwrap(),
-            "SELECT first_value(x) AS a, bool_and(b) AS e, trino_approx_percentile(v, 0.9) AS p FROM t"
+            "SELECT first_value(x) IGNORE NULLS AS a, bool_and(b) AS e, trino_approx_percentile(v, 0.9) AS p FROM t"
         );
+    }
+
+    #[test]
+    fn arbitrary_skips_nulls_and_refuses_a_null_treatment_clause() {
+        // Trino returns a non-null value when the group has one, so the
+        // rewrite has to say IGNORE NULLS — including over a window and
+        // through FILTER / DISTINCT.
+        assert_eq!(
+            rewrite("SELECT arbitrary(DISTINCT x) FILTER (WHERE y) OVER (PARTITION BY z) FROM t")
+                .unwrap(),
+            "SELECT first_value(DISTINCT x) FILTER (WHERE y) IGNORE NULLS OVER (PARTITION BY z) \
+             AS _col0 FROM t"
+        );
+        for clause in ["IGNORE NULLS", "RESPECT NULLS"] {
+            let err = rewrite(&format!("SELECT arbitrary(x) {clause} FROM t")).unwrap_err();
+            assert!(err.to_string().contains(clause), "{err}");
+            assert!(err.to_string().contains("arbitrary"), "{err}");
+        }
     }
 
     #[test]
