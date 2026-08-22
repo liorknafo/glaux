@@ -79,7 +79,17 @@ impl S3DeliverySink {
             .map_err(|e| SinkError::new(format!("Prefix: {e}")))?;
 
         if !destination.conversion_enabled() {
-            let (body, suffix) = encode_raw(&batch.records, destination.compression_format)?;
+            // Compressing (or even concatenating) up to a 128 MB flush is
+            // CPU-bound and synchronous; on a Tokio worker it would stall
+            // every other stream's flush timer scheduled there.
+            let records = batch.records.clone();
+            let compression = destination.compression_format;
+            let (body, suffix) =
+                tokio::task::spawn_blocking(move || encode_raw(&records, compression))
+                    .await
+                    .map_err(|e| {
+                        SinkError::new(format!("S3 delivery encode task failed: {e}"))
+                    })??;
             let key = format!("{data_prefix}{name}{}", file_suffix(destination, suffix));
             self.put(&bucket, &key, body).await?;
             return Ok(DeliveryReport {
@@ -99,12 +109,20 @@ impl S3DeliverySink {
             .as_ref()
             .ok_or_else(|| SinkError::new("SchemaConfiguration is missing from the destination"))?;
         let table = self.resolve_table(schema).await?;
-        let converted = convert::convert(&batch.records, &table, config).map_err(|e| {
-            SinkError::new(format!(
-                "record format conversion for stream {} failed: {e}",
-                batch.stream_name
-            ))
-        })?;
+        // JSON decode plus Parquet encode: likewise CPU-bound, and heavier
+        // than gzip. Keep it off the async worker.
+        let records = batch.records.clone();
+        let config = config.clone();
+        let converted =
+            tokio::task::spawn_blocking(move || convert::convert(&records, &table, &config))
+                .await
+                .map_err(|e| SinkError::new(format!("S3 delivery conversion task failed: {e}")))?
+                .map_err(|e| {
+                    SinkError::new(format!(
+                        "record format conversion for stream {} failed: {e}",
+                        batch.stream_name
+                    ))
+                })?;
 
         let mut report = DeliveryReport {
             data_key: None,

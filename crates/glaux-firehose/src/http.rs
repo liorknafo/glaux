@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -76,7 +77,14 @@ pub async fn dispatch(service: &FirehoseService, headers: &HeaderMap, body: &[u8
     match service.handle(&action, body).await {
         Ok(value) => json_response(StatusCode::OK, &value),
         Err(err) => {
-            tracing::debug!(action, error = %err, "firehose request failed");
+            // 5xx means glaux itself failed or the sink is unavailable —
+            // that must be visible at default log levels, unlike the 4xx
+            // refusals that are a normal part of the API contract.
+            if err.http_status() >= 500 {
+                tracing::warn!(action, error = %err, "firehose request failed");
+            } else {
+                tracing::debug!(action, error = %err, "firehose request failed");
+            }
             error_response(&err)
         }
     }
@@ -85,9 +93,31 @@ pub async fn dispatch(service: &FirehoseService, headers: &HeaderMap, body: &[u8
 async fn root(
     State(service): State<Arc<FirehoseService>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    dispatch(&service, &headers, &body).await
+    match body {
+        Ok(body) => dispatch(&service, &headers, &body).await,
+        Err(rejection) => error_response(&body_rejection_error(&rejection)),
+    }
+}
+
+/// Translate axum's body rejection into an AWS-shaped error.
+///
+/// `DefaultBodyLimit` rejects the `Bytes` extractor before [`dispatch`] is
+/// reached, so without this the client would get axum's plain-text `413`,
+/// which no AWS JSON 1.1 SDK can parse into an error type.
+fn body_rejection_error(rejection: &BytesRejection) -> FirehoseError {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        FirehoseError::validation(format!(
+            "request body exceeds the {MAX_BODY_BYTES} byte transport limit: a PutRecordBatch \
+             request carrying the maximum 4 MB of records is about 5.4 MB once base64-encoded"
+        ))
+    } else {
+        FirehoseError::validation(format!(
+            "request body could not be read: {}",
+            rejection.body_text()
+        ))
+    }
 }
 
 /// Request body cap for the router. A full 4 MiB `PutRecordBatch` is about

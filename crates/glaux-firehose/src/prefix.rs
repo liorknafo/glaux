@@ -176,11 +176,19 @@ fn evaluate_expression(
 /// Firehose's `!{firehose:random-string}`: 11 lowercase alphanumerics.
 fn random_string() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let bytes = uuid::Uuid::new_v4().into_bytes();
-    bytes
-        .iter()
-        .take(11)
-        .map(|b| ALPHABET[usize::from(*b) % ALPHABET.len()] as char)
+    // Consume the UUID as one 128-bit integer rather than one byte per
+    // character: bytes 6 and 8 of a v4 UUID carry the fixed version and
+    // variant nibbles, and `% 36` over a single 0..=255 byte is biased
+    // towards the first four letters. Base-36 digits of the whole value are
+    // uniform to well past 11 characters (36^11 < 2^57).
+    let mut n = u128::from_be_bytes(uuid::Uuid::new_v4().into_bytes());
+    let base = ALPHABET.len() as u128;
+    (0..11)
+        .map(|_| {
+            let c = ALPHABET[(n % base) as usize] as char;
+            n /= base;
+            c
+        })
         .collect()
 }
 

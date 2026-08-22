@@ -28,7 +28,7 @@ use glaux_catalog::{GlueColumn, GlueTable, hive_type_to_arrow};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::model::{DataFormatConversionConfiguration, SchemaConfiguration};
 
@@ -104,6 +104,68 @@ pub struct Converted {
     pub failed: Vec<FailedRecord>,
 }
 
+/// The two `Deserializer` members glaux implements.
+pub(crate) const OPENX_JSON_SERDE: &str = "OpenXJsonSerDe";
+pub(crate) const HIVE_JSON_SERDE: &str = "HiveJsonSerDe";
+
+/// Pick the single SerDe named by an `InputFormatConfiguration.Deserializer`.
+///
+/// Firehose's `Deserializer` names exactly one SerDe. A map naming both, or
+/// naming a member whose value is not an options object, is ambiguous: rather
+/// than resolving it by an arbitrary precedence rule — which would silently
+/// skip the other member's validation — glaux rejects it. Explicit `null`
+/// members are ignored, since some SDKs serialise the unset member that way.
+pub(crate) fn select_deserializer(
+    deserializer: &Map<String, Value>,
+) -> Result<(&'static str, &Map<String, Value>), String> {
+    let present: Vec<&str> = deserializer
+        .iter()
+        .filter(|(_, value)| !value.is_null())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let supported: Vec<&str> = present
+        .iter()
+        .copied()
+        .filter(|name| *name == OPENX_JSON_SERDE || *name == HIVE_JSON_SERDE)
+        .collect();
+    let name = match supported.as_slice() {
+        [OPENX_JSON_SERDE] => OPENX_JSON_SERDE,
+        [HIVE_JSON_SERDE] => HIVE_JSON_SERDE,
+        [] => {
+            return Err(format!(
+                "unsupported InputFormatConfiguration.Deserializer {present:?}: glaux supports \
+                 OpenXJsonSerDe and HiveJsonSerDe"
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "InputFormatConfiguration.Deserializer names {supported:?}: exactly one \
+                 deserializer must be given"
+            ));
+        }
+    };
+    if present.len() > supported.len() {
+        let extra: Vec<&str> = present
+            .iter()
+            .copied()
+            .filter(|n| !supported.contains(n))
+            .collect();
+        return Err(format!(
+            "unsupported InputFormatConfiguration.Deserializer members {extra:?}: glaux supports \
+             OpenXJsonSerDe and HiveJsonSerDe"
+        ));
+    }
+    deserializer[name]
+        .as_object()
+        .map(|options| (name, options))
+        .ok_or_else(|| {
+            format!(
+                "InputFormatConfiguration.Deserializer.{name} must be an object, got {}",
+                json_kind(&deserializer[name])
+            )
+        })
+}
+
 /// The JSON deserializer options in effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InputOptions {
@@ -126,16 +188,17 @@ impl InputOptions {
                         .to_string(),
                 )
             })?;
-        if let Some(openx) = deserializer.get("OpenXJsonSerDe") {
-            let case_insensitive = openx
+        let (name, options) = select_deserializer(deserializer).map_err(ConversionError)?;
+        if name == OPENX_JSON_SERDE {
+            let case_insensitive = options
                 .get("CaseInsensitive")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            let dots_to_underscores = openx
+            let dots_to_underscores = options
                 .get("ConvertDotsInJsonKeysToUnderscores")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let column_mappings = openx
+            let column_mappings = options
                 .get("ColumnToJsonKeyMappings")
                 .and_then(Value::as_object)
                 .map(|m| {
@@ -160,30 +223,51 @@ impl InputOptions {
                 column_mappings,
             });
         }
-        if let Some(hive) = deserializer.get("HiveJsonSerDe") {
-            let formats = hive
-                .get("TimestampFormats")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0);
-            if formats > 0 {
-                return Err(ConversionError(
-                    "HiveJsonSerDe.TimestampFormats is not implemented by glaux: timestamps \
-                     must be epoch numbers or ISO-8601 / `yyyy-MM-dd HH:mm:ss` strings"
-                        .to_string(),
-                ));
-            }
-            return Ok(Self {
-                case_insensitive: true,
-                dots_to_underscores: false,
-                column_mappings: Vec::new(),
-            });
+        let formats = options
+            .get("TimestampFormats")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        if formats > 0 {
+            return Err(ConversionError(
+                "HiveJsonSerDe.TimestampFormats is not implemented by glaux: timestamps \
+                 must be epoch numbers or ISO-8601 / `yyyy-MM-dd HH:mm:ss` strings"
+                    .to_string(),
+            ));
         }
-        let names: Vec<_> = deserializer.keys().cloned().collect();
-        Err(ConversionError(format!(
-            "unsupported InputFormatConfiguration.Deserializer {names:?}: glaux supports \
-             OpenXJsonSerDe and HiveJsonSerDe"
-        )))
+        Ok(Self {
+            case_insensitive: true,
+            dots_to_underscores: false,
+            column_mappings: Vec::new(),
+        })
+    }
+
+    /// Point every `ColumnToJsonKeyMappings` target at the Arrow field it
+    /// names.
+    ///
+    /// [`Self::normalize`] inserts the mapped value under the *column* name,
+    /// and the JSON decoder matches that name against the Arrow field, whose
+    /// spelling comes from the Glue column. Under `CaseInsensitive` the record
+    /// keys have already been lower-cased, so a mapping whose column is spelt
+    /// with a different case than the Glue column would insert a key no field
+    /// matches — and, with strict mode off, the column would decode as null
+    /// with no error. Resolve the spelling against the schema once, up front.
+    fn resolve_columns(&mut self, schema: &SchemaRef) {
+        if !self.case_insensitive {
+            return;
+        }
+        for (column, _) in &mut self.column_mappings {
+            if schema.column_with_name(column).is_some() {
+                continue;
+            }
+            let mut matches = schema
+                .fields()
+                .iter()
+                .filter(|f| f.name().eq_ignore_ascii_case(column));
+            if let (Some(field), None) = (matches.next(), matches.next()) {
+                *column = field.name().clone();
+            }
+        }
     }
 
     /// Apply key normalisation to one parsed record.
@@ -370,38 +454,53 @@ pub fn convert(
     config: &DataFormatConversionConfiguration,
 ) -> Result<Converted, ConversionError> {
     let schema = table_schema(table)?;
-    let input = InputOptions::from_config(config)?;
+    let mut input = InputOptions::from_config(config)?;
+    input.resolve_columns(&schema);
     let output = OutputOptions::from_config(config)?;
 
-    let mut good: Vec<Value> = Vec::with_capacity(records.len());
-    let mut failed = Vec::new();
-    for raw in records {
-        match parse_record(raw, &input) {
-            Ok(value) => match decode_one(&schema, &value) {
-                Ok(()) => good.push(value),
-                Err(message) => failed.push(FailedRecord {
-                    raw: raw.clone(),
-                    error_code: "DataFormatConversion.InvalidSchemaMapping",
-                    error_message: message,
-                }),
-            },
-            Err(message) => failed.push(FailedRecord {
+    let mut parsed: Vec<Result<Value, FailedRecord>> = records
+        .iter()
+        .map(|raw| {
+            parse_record(raw, &input).map_err(|error_message| FailedRecord {
                 raw: raw.clone(),
                 error_code: "DataFormatConversion.ParseError",
-                error_message: message,
-            }),
-        }
-    }
+                error_message,
+            })
+        })
+        .collect();
 
-    if good.is_empty() {
+    // Decode every parseable record through one decoder. The per-record pass
+    // — which exists only to name the record a coercion failure belongs to —
+    // runs as a fallback, so an all-good flush builds one decoder and
+    // re-encodes each record once instead of twice.
+    let batch = match decode_parsed(&schema, &parsed) {
+        Ok(batch) => batch,
+        Err(_) => {
+            for (raw, entry) in records.iter().zip(parsed.iter_mut()) {
+                let failure = match entry {
+                    Ok(value) => decode_one(&schema, value).err(),
+                    Err(_) => None,
+                };
+                if let Some(error_message) = failure {
+                    *entry = Err(FailedRecord {
+                        raw: raw.clone(),
+                        error_code: "DataFormatConversion.InvalidSchemaMapping",
+                        error_message,
+                    });
+                }
+            }
+            decode_parsed(&schema, &parsed).map_err(ConversionError)?
+        }
+    };
+
+    let Some(batch) = batch else {
         return Ok(Converted {
             parquet: None,
             converted_records: 0,
-            failed,
+            failed: parsed.into_iter().filter_map(Result::err).collect(),
         });
-    }
-
-    let batch = decode_batch(&schema, &good).map_err(ConversionError)?;
+    };
+    let converted_records = batch.num_rows();
     let mut out = Vec::new();
     let mut writer = ArrowWriter::try_new(&mut out, Arc::clone(&schema), Some(output.properties))
         .map_err(|e| ConversionError(format!("failed to open Parquet writer: {e}")))?;
@@ -411,9 +510,25 @@ pub fn convert(
         .map_err(|e| ConversionError(format!("failed to write Parquet: {e}")))?;
     Ok(Converted {
         parquet: Some(Bytes::from(out)),
-        converted_records: good.len(),
-        failed,
+        converted_records,
+        failed: parsed.into_iter().filter_map(Result::err).collect(),
     })
+}
+
+/// Decode every record that parsed, through one decoder. `None` when none
+/// did.
+fn decode_parsed(
+    schema: &SchemaRef,
+    parsed: &[Result<Value, FailedRecord>],
+) -> Result<Option<RecordBatch>, String> {
+    let good: Vec<&Value> = parsed
+        .iter()
+        .filter_map(|entry| entry.as_ref().ok())
+        .collect();
+    if good.is_empty() {
+        return Ok(None);
+    }
+    decode_batch(schema, &good).map(Some)
 }
 
 /// Parse one record as a single JSON object and apply key normalisation.
@@ -446,10 +561,10 @@ fn json_kind(value: &Value) -> &'static str {
 
 /// Decode one record on its own so a coercion failure is attributed to it.
 fn decode_one(schema: &SchemaRef, value: &Value) -> Result<(), String> {
-    decode_batch(schema, std::slice::from_ref(value)).map(drop)
+    decode_batch(schema, &[value]).map(drop)
 }
 
-fn decode_batch(schema: &SchemaRef, values: &[Value]) -> Result<RecordBatch, String> {
+fn decode_batch(schema: &SchemaRef, values: &[&Value]) -> Result<RecordBatch, String> {
     // Feed the decoder JSON *text* rather than handing it `Value`s through
     // serde: the workspace enables `serde_json/arbitrary_precision` (the Glue
     // key rewriter needs it to keep high-precision decimals byte-for-byte),
@@ -621,6 +736,69 @@ mod tests {
         let batch = &read_back(out.parquet.as_ref().unwrap())[0];
         assert_eq!(batch.column(0).as_primitive::<Int64Type>().value(0), 7);
         assert_eq!(batch.column(1).as_string::<i32>().value(0), "lior");
+    }
+
+    #[test]
+    fn column_mappings_resolve_against_the_schema_case_insensitively() {
+        // `CaseInsensitive` lower-cases the record keys, so a mapping whose
+        // column is spelt differently from the Glue column has to be resolved
+        // against the schema; inserting it verbatim would leave the column
+        // null with no error.
+        let table = table(vec![column("id", "bigint")]);
+        let cfg = config(
+            json!({"OpenXJsonSerDe": {
+                "CaseInsensitive": true,
+                "ColumnToJsonKeyMappings": {"ID": "OrderId"},
+            }}),
+            json!({"ParquetSerDe": {}}),
+        );
+        let out = convert(&[Bytes::from_static(br#"{"OrderId": 7}"#)], &table, &cfg).unwrap();
+        assert_eq!(out.converted_records, 1);
+        let batch = &read_back(out.parquet.as_ref().unwrap())[0];
+        let ids = batch.column(0).as_primitive::<Int64Type>();
+        assert!(!ids.is_null(0), "mapped column decoded as null");
+        assert_eq!(ids.value(0), 7);
+    }
+
+    #[test]
+    fn ambiguous_or_malformed_deserializers_are_refused() {
+        let orders = table(vec![column("id", "bigint")]);
+
+        // Naming both SerDes would otherwise resolve by an arbitrary
+        // precedence and skip the other one's validation.
+        let err = convert(
+            &[],
+            &orders,
+            &config(
+                json!({"OpenXJsonSerDe": {}, "HiveJsonSerDe": {"TimestampFormats": ["yyyy"]}}),
+                json!({"ParquetSerDe": {}}),
+            ),
+        )
+        .unwrap_err();
+        assert!(err.0.contains("exactly one"), "{err}");
+
+        let err = convert(
+            &[],
+            &orders,
+            &config(
+                json!({"OpenXJsonSerDe": "yes"}),
+                json!({"ParquetSerDe": {}}),
+            ),
+        )
+        .unwrap_err();
+        assert!(err.0.contains("must be an object"), "{err}");
+
+        // An explicitly null member is what some SDKs send for "unset".
+        let out = convert(
+            &[Bytes::from_static(br#"{"id": 1}"#)],
+            &orders,
+            &config(
+                json!({"OpenXJsonSerDe": {}, "HiveJsonSerDe": null}),
+                json!({"ParquetSerDe": {}}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(out.converted_records, 1);
     }
 
     #[test]
