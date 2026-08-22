@@ -282,7 +282,10 @@ pub fn trino_split_part(s: &str, delimiter: &str, index: i64) -> Result<Option<S
     if index < 1 {
         return Err(data_error(
             "INVALID_FUNCTION_ARGUMENT",
-            format!("split_part: index must be greater than zero, got {index}"),
+            // Trino's `StringFunctions.splitPart`:
+            // `checkCondition(index > 0, INVALID_FUNCTION_ARGUMENT, "Index
+            // must be greater than zero")`.
+            "split_part: Index must be greater than zero",
         ));
     }
     let index = index as usize;
@@ -616,8 +619,14 @@ mod tests {
         assert_eq!(trino_split_part("abc", ",", 2).unwrap(), None);
         assert_eq!(trino_split_part("abc", "", 2).unwrap(), Some("b".into()));
         assert_eq!(trino_split_part("abc", "", 4).unwrap(), None);
-        let err = trino_split_part("abc", ",", 0).unwrap_err().to_string();
-        assert!(err.contains("greater than zero"), "{err}");
+        // Trino's wording, with no trailing "got 0".
+        for index in [0, -1] {
+            let err = trino_split_part("abc", ",", index).unwrap_err().to_string();
+            assert!(
+                err.ends_with("split_part: Index must be greater than zero"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
