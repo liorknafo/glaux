@@ -286,7 +286,7 @@ Functions not in this table are refused with `FUNCTION_NOT_FOUND`, even when Dat
 
 Every corpus query runs against glaux's Athena service over the fixture tables stored as Parquet (`customers`), NDJSON (`orders`) and delimited text (`countries`), and is diffed against a recorded snapshot (`crates/glaux-fidelity/tests/snapshots/`). Rows are compared positionally under a top-level `ORDER BY` and as a multiset otherwise; floating-point columns within a relative 1e-9; timestamps as instants. Negative cases must fail naming the construct the corpus expects.
 
-**391 cases** (124 queries, 267 error cases): 391 match their snapshot. Snapshot provenance: **0 verified against real Athena**, 391 UNVERIFIED (self-recorded from glaux; re-record with `cargo run -p glaux-fidelity -- record`).
+**404 cases** (130 queries, 274 error cases): 404 match their snapshot. Snapshot provenance: **0 verified against real Athena**, 404 UNVERIFIED (self-recorded from glaux; re-record with `cargo run -p glaux-fidelity -- record`).
 
 > **UNVERIFIED** snapshots pin glaux's current behaviour so regressions are caught, but they do not yet prove agreement with AWS Athena. Treat the `match` column for those rows as "stable", not "verified".
 
@@ -295,6 +295,9 @@ Every corpus query runs against glaux's Athena service over the fixture tables s
 | agg_approx_and_stats | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | agg_approx_percentile_grouped | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | agg_approx_percentile_overloads | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_arbitrary_grouped | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_arbitrary_non_null | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| agg_arbitrary_window | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | agg_array_agg_ordered | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | agg_decimal_sum_avg | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | agg_decimal_window | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
@@ -350,6 +353,7 @@ Every corpus query runs against glaux's Athena service over the fixture tables s
 | dt_parse_partial_fields | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | dt_timestamp_literals | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | dt_timestamp_precision | query, ordered | events (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| dt_two_digit_year_pivot | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | dt_zoned_values | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | exists_double_correlated | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | expr_case_cast_predicates | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
@@ -391,6 +395,7 @@ Every corpus query runs against glaux's Athena service over the fixture tables s
 | neg_approx_percentile_array | error case (`approx_percentile`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_approx_percentile_decimal | error case (`approx_percentile`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_approx_percentile_out_of_range | error case (`Percentile must be between 0 and 1`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_arbitrary_null_treatment | error case (`INVALID_FUNCTION_ARGUMENT: arbitrary`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_array_angle_bracket_type | error case (`ARRAY<...> type syntax`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_array_lt_null_elements | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_array_order_by_null_elements | error case (`ARRAY comparison not supported for arrays with null elements`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
@@ -401,7 +406,8 @@ Every corpus query runs against glaux's Athena service over the fixture tables s
 | neg_bigint_min_minus_one | error case (`NUMERIC_VALUE_OUT_OF_RANGE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_bigint_overflow_add | error case (`NUMERIC_VALUE_OUT_OF_RANGE: bigint addition overflow: 9223372036854775807 + 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_bigint_overflow_mul | error case (`NUMERIC_VALUE_OUT_OF_RANGE: bigint multiplication overflow: 10000000000 * 10000000000`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
-| neg_bigint_overflow_sum | error case (`NUMERIC_VALUE_OUT_OF_RANGE`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_overflow_sum | error case (`NUMERIC_VALUE_OUT_OF_RANGE: bigint addition overflow: 9223372036854775807 + 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_bigint_overflow_sum_distinct | error case (`NUMERIC_VALUE_OUT_OF_RANGE: bigint addition overflow`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_bitwise_and_operator | error case (`operator &`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_bitwise_or_operator | error case (`operator |`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_bitwise_xor_operator | error case (`operator ^`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
@@ -445,6 +451,7 @@ Every corpus query runs against glaux's Athena service over the fixture tables s
 | neg_date_add_fractional | error case (`value must be an integer`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_date_add_subday_on_date | error case (`cannot be added to a DATE`) | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_date_add_unknown_unit | error case (`fortnight`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_format_day_of_week_number | error case (`INVALID_FUNCTION_ARGUMENT: date_format: %w not supported in date format string`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_date_minus_date | error case (`date subtraction`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_date_minus_second | error case (`Cannot add hour, minutes or seconds to a date`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_date_parse_bad_input | error case (`garbage`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
@@ -453,6 +460,7 @@ Every corpus query runs against glaux's Athena service over the fixture tables s
 | neg_date_parse_out_of_range | error case (`INVALID_FUNCTION_ARGUMENT: date_parse`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_date_parse_second_60 | error case (`Value 60 for secondOfMinute must be in the range [0,59]`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_date_parse_unknown_specifier | error case (`%Q`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_date_parse_week_of_year_sunday | error case (`INVALID_FUNCTION_ARGUMENT: date_parse: %U not supported in date format string`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_date_parse_weekday_only | error case (`INVALID_FUNCTION_ARGUMENT: date_parse`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_date_plus_25_hours | error case (`Cannot add hour, minutes or seconds to a date`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_date_plus_hour | error case (`Cannot add hour, minutes or seconds to a date`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
@@ -557,6 +565,9 @@ Every corpus query runs against glaux's Athena service over the fixture tables s
 | neg_regexp_horizontal_space | error case (`\h is read differently`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_regexp_invalid_pattern | error case (`invalid regular expression`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_regexp_lookaround | error case (`invalid regular expression`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_posix_bracket | error case (`POSIX bracket expression `[:alpha:]``) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_posix_bracket_extract | error case (`POSIX bracket expression `[:digit:]``) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_regexp_posix_bracket_replace | error case (`INVALID_FUNCTION_ARGUMENT: regexp_replace`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_regexp_possessive | error case (`possessive quantifier`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_regexp_possessive_brace | error case (`possessive quantifier`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_regexp_replace_illegal_group | error case (`Illegal group reference`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
@@ -575,7 +586,7 @@ Every corpus query runs against glaux's Athena service over the fixture tables s
 | neg_smallint_overflow_sub | error case (`NUMERIC_VALUE_OUT_OF_RANGE: smallint subtraction overflow: -32768 - 1`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_spaceship_operator | error case (`operator <=>`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_split_empty_delimiter | error case (`The delimiter may not be the empty string`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
-| neg_split_part_zero | error case (`greater than zero`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| neg_split_part_zero | error case (`INVALID_FUNCTION_ARGUMENT: split_part: Index must be greater than zero`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_split_three_args | error case (`3-argument`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_string_literal_alias | error case (`a string literal cannot be used as an alias`) | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | neg_strpos_three_args | error case (`3-argument`) | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
@@ -632,6 +643,7 @@ Every corpus query runs against glaux's Athena service over the fixture tables s
 | regex_dollar_final_newline | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | regex_functions | query, ordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | regex_java_classes | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| regex_nested_classes | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | regex_replace_empty_matches | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | regex_replace_empty_matches_column | query, unordered | orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | result_metadata_json_type | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
@@ -650,6 +662,7 @@ Every corpus query runs against glaux's Athena service over the fixture tables s
 | sem_output_names | query, unordered | customers (Parquet) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | sem_set_operation_integer | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | sem_set_operation_types | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
+| sem_values_typed_null_integer | query, unordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | sem_values_types | query, ordered | — | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | shape_cte_chain | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
 | shape_group_by_having | query, ordered | customers (Parquet), orders (JSON) | match | UNVERIFIED (glaux self-recorded 2026-08-22) |
