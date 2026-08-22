@@ -589,12 +589,16 @@ fn runtime_message(message: &str) -> String {
             trino_type_tokens(arrow_type)
         );
     }
-    // Arrow names the array type in its integer-kernel overflows
-    // ("Int64Array overflow on abs(...)"); Trino names the SQL type.
-    if let Some((array_type, rest)) = text.split_once("Array overflow on ") {
+    // DataFusion's checked `abs` names the Arrow array type it overflowed
+    // ("Int64Array overflow on abs(-9223372036854775808)"); Trino 411's
+    // MathFunctions.abs names the value and the SQL type instead
+    // ("Value -9223372036854775808 is out of range for abs(bigint)").
+    if let Some((array_type, rest)) = text.split_once("Array overflow on abs(")
+        && let Some(value) = rest.strip_suffix(')')
+    {
         let name = trino_type_tokens(array_type);
         if name != array_type {
-            return format!("{name} overflow on {rest}");
+            return format!("Value {value} is out of range for abs({name})");
         }
     }
     text.to_string()
