@@ -83,6 +83,14 @@ pub enum CatalogError {
         message: String,
     },
 
+    /// The Glue HTTP client could not be constructed.
+    #[error("failed to build Glue HTTP client: {source}")]
+    GlueClient {
+        /// Underlying HTTP client builder error.
+        #[source]
+        source: reqwest::Error,
+    },
+
     /// The Glue request could not be sent or the response body not read.
     #[error("Glue request {action} to {endpoint} failed: {source}")]
     GlueTransport {

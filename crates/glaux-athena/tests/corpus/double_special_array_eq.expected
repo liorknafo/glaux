@@ -1,0 +1,6 @@
+types: boolean, boolean, boolean
++--------+---------+---------+
+| eq_nan | neq_nan | eq_zero |
++--------+---------+---------+
+| false  | true    | true    |
++--------+---------+---------+

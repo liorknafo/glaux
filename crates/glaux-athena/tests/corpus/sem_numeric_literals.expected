@@ -1,4 +1,4 @@
-types: decimal(2,1), decimal(2,1), decimal(6,2), double, double, decimal(23,1), bigint, bigint, bigint, bigint, decimal(3,2), boolean, bigint, bigint
+types: decimal(2,1), decimal(2,1), decimal(6,2), double, double, decimal(12,1), integer, integer, integer, bigint, decimal(3,2), boolean, bigint, bigint
 +-----+-----------+---------+-------+----------+---------------+---------+---------+---------+---------------------+---------+------------+---------------------+---------------------+
 | one | exact_sum | dec_sum | sci   | sci_frac | dec_times_int | int_div | int_mod | int_mul | near_max            | neg_dec | dec_vs_int | checked_sum         | checked_difference  |
 +-----+-----------+---------+-------+----------+---------------+---------+---------+---------+---------------------+---------+------------+---------------------+---------------------+

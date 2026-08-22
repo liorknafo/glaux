@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::util::pretty::pretty_format_batches;
-use common::fixtures::{customers, orders};
+use common::fixtures::{customers, events, orders};
 use datafusion::catalog::MemTable;
 use datafusion::prelude::SessionContext;
 use glaux_athena::{EngineError, QueryEngine, QueryRequest, TrinoEngine, encode_result_set};
@@ -35,7 +35,11 @@ fn corpus_dir() -> PathBuf {
 
 fn engine() -> TrinoEngine {
     let ctx = SessionContext::new();
-    for (name, (schema, batch)) in [("customers", customers()), ("orders", orders())] {
+    for (name, (schema, batch)) in [
+        ("customers", customers()),
+        ("orders", orders()),
+        ("events", events()),
+    ] {
         ctx.register_table(
             name,
             Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),

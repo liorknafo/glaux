@@ -1,0 +1,6 @@
+types: boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean, varchar, varchar
++------+-------+-------------+------------+-------------+--------------+---------+----------+----------------+----------+-------------+----------+------------+-------------+
+| t    | zero  | upper_false | mixed_true | try_on_null | try_yes_null | int_one | int_zero | double_nonzero | dec_zero | dec_nonzero | identity | round_trip | column_text |
++------+-------+-------------+------------+-------------+--------------+---------+----------+----------------+----------+-------------+----------+------------+-------------+
+| true | false | false       | true       |             |              | true    | false    | true           | false    | true        | true     | true       | true        |
++------+-------+-------------+------------+-------------+--------------+---------+----------+----------------+----------+-------------+----------+------------+-------------+

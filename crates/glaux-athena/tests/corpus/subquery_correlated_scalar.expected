@@ -1,0 +1,13 @@
+types: bigint, varchar, array, varchar, varchar, varchar, bigint
++-----+-------+--------------+----------+--------------+----------------+---+
+| id  | cname | ctags        | ccountry | used_in_expr | no_outer_match | n |
++-----+-------+--------------+----------+--------------+----------------+---+
+| 101 | Alice | [vip, early] | US       | Alice!       |                | 1 |
+| 102 | Alice | [vip, early] | US       | Alice!       |                | 1 |
+| 103 | Bob   | [trial]      | DE       | Bob!         |                | 1 |
+| 104 | Carol | []           | US       | Carol!       |                | 1 |
+| 105 | Carol | []           | US       | Carol!       |                | 1 |
+| 106 | Carol | []           | US       | Carol!       |                | 1 |
+| 107 |       |              |          |              |                | 0 |
+| 108 |       |              |          |              |                | 0 |
++-----+-------+--------------+----------+--------------+----------------+---+
