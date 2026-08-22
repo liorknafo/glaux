@@ -28,6 +28,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::buffer::StreamBuffer;
+use crate::convert;
 use crate::error::FirehoseError;
 use crate::model::*;
 use crate::prefix::{PrefixError, validate_prefix};
@@ -244,33 +245,26 @@ fn validate_conversion(
         .as_ref()
         .and_then(|c| c.deserializer.as_ref())
         .and_then(Value::as_object);
-    match deserializer {
-        Some(map) if map.contains_key("OpenXJsonSerDe") => {}
-        Some(map) if map.contains_key("HiveJsonSerDe") => {
-            let formats = map["HiveJsonSerDe"]
-                .get("TimestampFormats")
-                .and_then(Value::as_array)
-                .is_some_and(|f| !f.is_empty());
-            if formats {
-                return Err(FirehoseError::invalid_argument(
-                    "InputFormatConfiguration.Deserializer.HiveJsonSerDe.TimestampFormats is not \
-                     implemented by glaux: timestamps must be epoch numbers or ISO-8601 strings",
-                ));
-            }
-        }
-        Some(map) => {
-            let names: Vec<_> = map.keys().cloned().collect();
-            return Err(FirehoseError::invalid_argument(format!(
-                "unsupported InputFormatConfiguration.Deserializer {names:?}: glaux supports \
-                 OpenXJsonSerDe and HiveJsonSerDe"
-            )));
-        }
-        None => {
-            return Err(FirehoseError::invalid_argument(
-                "DataFormatConversionConfiguration.InputFormatConfiguration.Deserializer is \
-                 required when conversion is enabled",
-            ));
-        }
+    let Some(map) = deserializer else {
+        return Err(FirehoseError::invalid_argument(
+            "DataFormatConversionConfiguration.InputFormatConfiguration.Deserializer is \
+             required when conversion is enabled",
+        ));
+    };
+    // Exactly one SerDe, with an options object: a map naming both would
+    // otherwise skip the HiveJsonSerDe checks below.
+    let (name, options) =
+        convert::select_deserializer(map).map_err(FirehoseError::invalid_argument)?;
+    if name == convert::HIVE_JSON_SERDE
+        && options
+            .get("TimestampFormats")
+            .and_then(Value::as_array)
+            .is_some_and(|f| !f.is_empty())
+    {
+        return Err(FirehoseError::invalid_argument(
+            "InputFormatConfiguration.Deserializer.HiveJsonSerDe.TimestampFormats is not \
+             implemented by glaux: timestamps must be epoch numbers or ISO-8601 strings",
+        ));
     }
     let serializer = conversion
         .output_format_configuration
@@ -1215,6 +1209,35 @@ mod tests {
         let err = create(&service, bad).await.unwrap_err();
         assert_eq!(err.code(), "SerializationException");
         assert!(err.message().contains("LZ4"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_or_malformed_deserializers_are_refused() {
+        let (service, _sink) = service();
+
+        // Both SerDes named: accepting one by precedence would skip the
+        // other's validation, so the whole configuration is refused.
+        let mut both = conversion(64, "UNCOMPRESSED", "ParquetSerDe");
+        both["ExtendedS3DestinationConfiguration"]["DataFormatConversionConfiguration"]["InputFormatConfiguration"]
+            ["Deserializer"] =
+            json!({"OpenXJsonSerDe": {}, "HiveJsonSerDe": {"TimestampFormats": ["yyyy"]}});
+        let err = create(&service, both).await.unwrap_err();
+        assert_eq!(err.code(), "InvalidArgumentException");
+        assert!(err.message().contains("exactly one"), "{err}");
+
+        // A member that is not an options object is refused rather than
+        // treated as an empty one.
+        let mut scalar = conversion(64, "UNCOMPRESSED", "ParquetSerDe");
+        scalar["ExtendedS3DestinationConfiguration"]["DataFormatConversionConfiguration"]["InputFormatConfiguration"]
+            ["Deserializer"] = json!({"OpenXJsonSerDe": "yes"});
+        let err = create(&service, scalar).await.unwrap_err();
+        assert!(err.message().contains("must be an object"), "{err}");
+
+        // An explicitly null member is what some SDKs send for "unset".
+        let mut null_member = conversion(64, "UNCOMPRESSED", "ParquetSerDe");
+        null_member["ExtendedS3DestinationConfiguration"]["DataFormatConversionConfiguration"]["InputFormatConfiguration"]
+            ["Deserializer"] = json!({"HiveJsonSerDe": {}, "OpenXJsonSerDe": null});
+        create(&service, null_member).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
