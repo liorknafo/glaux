@@ -8,9 +8,10 @@
 //!   SUCCEEDED | FAILED | CANCELLED` on tokio tasks; cancellation aborts the
 //!   engine mid-flight. Results are also written as CSV to the
 //!   `OutputLocation`, as real Athena does.
-//! - [`QueryEngine`] — the execution seam. [`DataFusionEngine`] is the v0.1
-//!   passthrough (DataFusion's own dialect); the Trino-dialect translation
-//!   layer slots in behind the same trait.
+//! - [`QueryEngine`] — the execution seam. [`TrinoEngine`] is the engine
+//!   Athena clients should get: Trino-dialect parse → shim rewrite →
+//!   DataFusion plan (see [`dialect`]). [`DataFusionEngine`] underneath it
+//!   speaks DataFusion's own dialect.
 //! - [`http::router`] / [`http::dispatch`] — the AWS JSON 1.1 transport, as
 //!   a complete axum router or a request → response function.
 //!
@@ -22,6 +23,7 @@
 //! unwritable result locations all fail explicitly. This crate never
 //! synthesizes query results.
 
+pub mod dialect;
 pub mod engine;
 pub mod error;
 pub mod http;
@@ -29,6 +31,7 @@ pub mod model;
 pub mod results;
 pub mod service;
 
+pub use dialect::{GlauxSqlError, TrinoEngine};
 pub use engine::{DataFusionEngine, EngineError, QueryEngine, QueryOutput, QueryRequest};
 pub use error::AthenaError;
 pub use model::QueryState;

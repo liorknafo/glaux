@@ -1,0 +1,2 @@
+-- error: CAST(... AS VARBINARY)
+SELECT CAST('abc' AS VARBINARY)

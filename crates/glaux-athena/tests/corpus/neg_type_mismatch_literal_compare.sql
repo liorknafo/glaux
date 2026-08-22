@@ -1,0 +1,2 @@
+-- error: TYPE_MISMATCH
+SELECT '1' = 1

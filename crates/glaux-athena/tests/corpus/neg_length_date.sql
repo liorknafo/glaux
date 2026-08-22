@@ -1,0 +1,2 @@
+-- error: TYPE_MISMATCH
+SELECT length(DATE '2024-01-01')

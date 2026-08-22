@@ -14,16 +14,122 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray};
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Float32Type, Float64Type, Int64Type, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 
+use crate::dialect::udf::TRINO_TYPE_METADATA;
+use crate::dialect::udf::timestamps::to_millis_rounded;
 use crate::model::{ColumnInfo, Datum, Row};
 
 /// Athena's timestamp text form: `2024-01-31 12:34:56.789`.
-const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
+pub const TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
 /// Athena's date text form.
-const DATE_FORMAT: &str = "%Y-%m-%d";
+pub const DATE_FORMAT: &str = "%Y-%m-%d";
+/// Athena's time text form: `12:34:56.789`.
+pub const TIME_FORMAT: &str = "%H:%M:%S%.3f";
+
+/// Render a timestamp value (in `unit`) the way Athena prints a
+/// `timestamp(3)`: rounded half up to the millisecond, and for a zoned
+/// timestamp followed by the zone (`UTC` for the UTC offset).
+pub fn timestamp_text(value: i64, unit: TimeUnit, tz: Option<&str>) -> String {
+    let millis = to_millis_rounded(value, unit);
+    let text = match chrono::DateTime::from_timestamp_millis(millis) {
+        Some(t) => t.naive_utc().format(TIMESTAMP_FORMAT).to_string(),
+        None => format!("{millis} ms"),
+    };
+    match tz {
+        None => text,
+        Some("UTC" | "+00:00" | "+0000" | "Z" | "Etc/UTC") => format!("{text} UTC"),
+        Some(tz) => format!("{text} {tz}"),
+    }
+}
+
+/// Render a `double` the way Trino (Java's `Double.toString`) does:
+/// plain decimal with at least one fractional digit for magnitudes in
+/// `[1e-3, 1e7)`, otherwise `d.dddE±n` scientific notation; the digits are
+/// the shortest that round-trip. `NaN`, `Infinity`, `-Infinity` as in Java.
+pub fn java_double_text(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    // Rust's `{:e}` prints the shortest round-trip digits: "1.5e0", "1e20".
+    java_style(
+        &format!("{value:e}"),
+        value == 0.0 && value.is_sign_negative(),
+    )
+}
+
+/// Render a `real` the way Trino (Java's `Float.toString`) does.
+pub fn java_float_text(value: f32) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
+    }
+    java_style(
+        &format!("{value:e}"),
+        value == 0.0 && value.is_sign_negative(),
+    )
+}
+
+/// Turn Rust's `[-]d[.ddd]e[-]n` into Java's `Double.toString` layout.
+fn java_style(sci: &str, negative_zero: bool) -> String {
+    if negative_zero {
+        return "-0.0".to_string();
+    }
+    let (negative, sci) = match sci.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, sci),
+    };
+    let (mantissa, exponent) = sci.split_once('e').expect("{:e} always has an exponent");
+    let exponent: i32 = exponent.parse().expect("{:e} exponent is an integer");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let digits = digits.trim_end_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    if (-3..7).contains(&exponent) {
+        // Plain notation: place the decimal point `exponent` digits in.
+        if exponent < 0 {
+            out.push_str("0.");
+            for _ in 0..(-exponent - 1) {
+                out.push('0');
+            }
+            out.push_str(digits);
+        } else {
+            let int_len = exponent as usize + 1;
+            if digits.len() <= int_len {
+                out.push_str(digits);
+                for _ in digits.len()..int_len {
+                    out.push('0');
+                }
+                out.push_str(".0");
+            } else {
+                out.push_str(&digits[..int_len]);
+                out.push('.');
+                out.push_str(&digits[int_len..]);
+            }
+        }
+    } else {
+        out.push_str(&digits[..1]);
+        out.push('.');
+        if digits.len() > 1 {
+            out.push_str(&digits[1..]);
+        } else {
+            out.push('0');
+        }
+        out.push('E');
+        out.push_str(&exponent.to_string());
+    }
+    out
+}
 
 /// Errors converting query output into Athena's result encoding.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -169,6 +275,14 @@ pub fn column_infos(schema: &SchemaRef) -> Result<Vec<ColumnInfo>, ResultError> 
         .iter()
         .map(|field| {
             let (type_name, precision, scale) = athena_type(field.name(), field.data_type())?;
+            // A JSON-typed expression: glaux carries Trino's `JSON` as the
+            // varchar holding its text, and the UDFs that produce one mark
+            // the field so the reported type is Athena's `json` rather than
+            // the `varchar` the values are stored as.
+            let (type_name, precision) = match field.metadata().get(TRINO_TYPE_METADATA) {
+                Some(trino_type) if trino_type == "json" => ("json".to_string(), 0),
+                _ => (type_name, precision),
+            };
             Ok(ColumnInfo {
                 catalog_name: "hive".to_string(),
                 schema_name: String::new(),
@@ -188,13 +302,16 @@ pub fn column_infos(schema: &SchemaRef) -> Result<Vec<ColumnInfo>, ResultError> 
         .collect()
 }
 
-fn format_options() -> FormatOptions<'static> {
+/// Arrow formatting options that produce Athena's text forms for
+/// temporal values (shared with the dialect layer's `CAST(... AS VARCHAR)`).
+pub fn format_options() -> FormatOptions<'static> {
     FormatOptions::new()
         .with_display_error(false)
         .with_null("null")
         .with_timestamp_format(Some(TIMESTAMP_FORMAT))
         .with_timestamp_tz_format(Some(TIMESTAMP_FORMAT))
         .with_date_format(Some(DATE_FORMAT))
+        .with_time_format(Some(TIME_FORMAT))
         .with_datetime_format(Some(TIMESTAMP_FORMAT))
 }
 
@@ -205,7 +322,7 @@ fn format_value(
     array: &ArrayRef,
     index: usize,
 ) -> Result<Option<String>, ResultError> {
-    if array.is_null(index) {
+    if array.is_null(index) || array.data_type() == &DataType::Null {
         return Ok(None);
     }
     let format_error = |message: String| ResultError::Format {
@@ -252,6 +369,17 @@ fn format_value(
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect();
             format!("{{{}}}", parts.join(", "))
+        }
+        DataType::Float64 => java_double_text(array.as_primitive::<Float64Type>().value(index)),
+        DataType::Float32 => java_float_text(array.as_primitive::<Float32Type>().value(index)),
+        DataType::Timestamp(unit, tz) => {
+            let value = arrow::compute::cast(array, &DataType::Int64)
+                .map_err(|e| format_error(e.to_string()))?;
+            timestamp_text(
+                value.as_primitive::<Int64Type>().value(index),
+                *unit,
+                tz.as_deref(),
+            )
         }
         DataType::Binary
         | DataType::LargeBinary
@@ -484,6 +612,55 @@ mod tests {
                 column: "big".into(),
                 data_type: "UInt64".into(),
             }
+        );
+    }
+
+    #[test]
+    fn doubles_print_like_java() {
+        for (value, text) in [
+            (1.5, "1.5"),
+            (2.0, "2.0"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (100.0, "100.0"),
+            (1234567.0, "1234567.0"),
+            (1e7, "1.0E7"),
+            (12345678.9, "1.23456789E7"),
+            (1e20, "1.0E20"),
+            (0.001, "0.001"),
+            (0.0001, "1.0E-4"),
+            (-2.5e-5, "-2.5E-5"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+            (123.456, "123.456"),
+            (-7.0, "-7.0"),
+        ] {
+            assert_eq!(java_double_text(value), text, "{value}");
+        }
+        assert_eq!(java_float_text(1.5), "1.5");
+        assert_eq!(java_float_text(1e10), "1.0E10");
+        assert_eq!(java_float_text(0.1), "0.1");
+    }
+
+    #[test]
+    fn timestamps_round_to_millis_and_name_their_zone() {
+        assert_eq!(
+            timestamp_text(1_704_450_600_999_600_000, TimeUnit::Nanosecond, None),
+            "2024-01-05 10:30:01.000"
+        );
+        assert_eq!(
+            timestamp_text(1_704_450_600_123, TimeUnit::Millisecond, Some("+00:00")),
+            "2024-01-05 10:30:00.123 UTC"
+        );
+        assert_eq!(
+            timestamp_text(1_704_450_600, TimeUnit::Second, Some("UTC")),
+            "2024-01-05 10:30:00.000 UTC"
+        );
+        assert_eq!(
+            timestamp_text(253_402_300_800_000, TimeUnit::Millisecond, None),
+            "+10000-01-01 00:00:00.000"
         );
     }
 
