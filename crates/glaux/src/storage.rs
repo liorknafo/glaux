@@ -31,9 +31,8 @@ use glaux_catalog::{CatalogError, ObjectSummary, StorageBackend};
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use object_store::path::Path as ObjectPath;
 use object_store::{
-    Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
-    MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult,
+    Attributes, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 
 /// Metadata of one S3 object, copied out from under the state lock.
@@ -387,6 +386,16 @@ fn not_implemented(operation: &str) -> object_store::Error {
     }
 }
 
+/// object_store paths never carry a trailing slash, but S3 prefixes used as
+/// "directories" do: restore it so `events` does not match `events_archive/`.
+/// The empty path is the bucket root, whose S3 prefix is `""`, not `"/"`.
+fn dir_prefix(prefix: Option<&ObjectPath>) -> String {
+    match prefix.map(ObjectPath::as_ref) {
+        Some(p) if !p.is_empty() => format!("{p}/"),
+        _ => String::new(),
+    }
+}
+
 fn meta(key: &str, info: &ObjectInfo) -> ObjectMeta {
     ObjectMeta {
         location: ObjectPath::from(key),
@@ -444,11 +453,13 @@ impl ObjectStore for InProcessObjectStore {
         {
             return Err(not_implemented("get_opts with preconditions or versions"));
         }
-        let range = match options.range {
+        // `as_range` applies object_store's semantics: a bounded end past the
+        // object is truncated, a start past it is an error.
+        let range = match &options.range {
             None => 0..info.size,
-            Some(GetRange::Bounded(r)) => r,
-            Some(GetRange::Offset(start)) => start..info.size,
-            Some(GetRange::Suffix(len)) => info.size.saturating_sub(len)..info.size,
+            Some(r) => r
+                .as_range(info.size)
+                .map_err(|e| generic(format!("s3://{}/{key}: {e}", self.bucket)))?,
         };
         let bytes = if options.head {
             Bytes::new()
@@ -488,12 +499,7 @@ impl ObjectStore for InProcessObjectStore {
         &self,
         prefix: Option<&ObjectPath>,
     ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-        // object_store paths never carry a trailing slash, but S3 prefixes
-        // used as "directories" do: restore it so `events` does not match
-        // `events_archive/...`.
-        let prefix = prefix
-            .map(|p| format!("{}/", p.as_ref()))
-            .unwrap_or_default();
+        let prefix = dir_prefix(prefix);
         match self.storage.list_prefix(&self.bucket, &prefix) {
             Ok(entries) => stream::iter(
                 entries
@@ -510,9 +516,7 @@ impl ObjectStore for InProcessObjectStore {
         &self,
         prefix: Option<&ObjectPath>,
     ) -> object_store::Result<ListResult> {
-        let prefix = prefix
-            .map(|p| format!("{}/", p.as_ref()))
-            .unwrap_or_default();
+        let prefix = dir_prefix(prefix);
         let mut objects = Vec::new();
         let mut common_prefixes = Vec::new();
         for (key, info) in self.storage.list_prefix(&self.bucket, &prefix)? {

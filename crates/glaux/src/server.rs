@@ -70,14 +70,14 @@ impl Default for ServeOptions {
 
 impl ServeOptions {
     /// The URL clients reach this server at, for fakecloud's URL-generating
-    /// services. A wildcard bind is reported as `localhost`.
+    /// services. A wildcard bind is reported as `localhost`; an IPv6 host is
+    /// bracketed (`SocketAddr`'s display form).
     pub fn endpoint_url(&self) -> String {
-        let host = if self.addr.ip().is_unspecified() {
-            "localhost".to_string()
+        if self.addr.ip().is_unspecified() {
+            format!("http://localhost:{}", self.addr.port())
         } else {
-            self.addr.ip().to_string()
-        };
-        format!("http://{host}:{}", self.addr.port())
+            format!("http://{}", self.addr)
+        }
     }
 }
 

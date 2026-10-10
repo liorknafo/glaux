@@ -71,6 +71,7 @@ struct Harness {
     client: reqwest::Client,
     log: Log,
     glaux_registry: Arc<fakecloud_core::registry::ServiceRegistry>,
+    storage: Arc<glaux::InProcessStorage>,
 }
 
 impl Harness {
@@ -87,6 +88,7 @@ impl Harness {
         let glaux = Glaux::build(&config, &ServeOptions { addr }).expect("build glaux");
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let registry = Arc::clone(&glaux.registry);
+        let storage = Arc::clone(&glaux.storage);
         let router = glaux
             .router
             .layer(middleware::from_fn_with_state(Arc::clone(&log), record));
@@ -103,6 +105,7 @@ impl Harness {
             client: reqwest::Client::new(),
             log,
             glaux_registry: registry,
+            storage,
         }
     }
 
@@ -176,10 +179,8 @@ impl Harness {
     async fn s3_list_keys(&self, bucket: &str, prefix: &str) -> Vec<String> {
         let text = self
             .client
-            .get(format!(
-                "{}/{bucket}?list-type=2&prefix={prefix}",
-                self.base
-            ))
+            .get(format!("{}/{bucket}", self.base))
+            .query(&[("list-type", "2"), ("prefix", prefix)])
             .header("authorization", Self::sigv4("s3"))
             .send()
             .await
@@ -521,17 +522,13 @@ async fn unsupported_sql_fails_loudly_naming_the_construct() {
 async fn registry_serves_fakecloud_services_with_glaux_athena_and_firehose_in_their_slots() {
     let h = Harness::start().await;
 
+    // Exactly the documented set: nothing missing, nothing extra.
     let mut names: Vec<&str> = h.glaux_registry.service_names();
     names.sort();
-    for expected in EMBEDDED_FAKECLOUD_SERVICES
-        .iter()
-        .chain(["athena", "firehose"].iter())
-    {
-        assert!(
-            names.contains(expected),
-            "{expected} missing from {names:?}"
-        );
-    }
+    let mut expected: Vec<&str> = EMBEDDED_FAKECLOUD_SERVICES.to_vec();
+    expected.extend(["athena", "firehose"]);
+    expected.sort();
+    assert_eq!(names, expected);
 
     // The `athena` slot is glaux's implementation: it advertises exactly
     // glaux's action set (fakecloud's stub advertises a different one).
@@ -573,6 +570,57 @@ async fn registry_serves_fakecloud_services_with_glaux_athena_and_firehose_in_th
         queue["QueueUrl"].as_str().unwrap().ends_with("/pipeline"),
         "{queue}"
     );
+}
+
+#[tokio::test]
+async fn object_store_truncates_ranges_and_lists_the_bucket_root() {
+    use futures::TryStreamExt;
+    use glaux_catalog::StorageBackend;
+    use object_store::path::Path;
+    use object_store::{GetOptions, GetRange, ObjectStore};
+
+    let h = Harness::start().await;
+    h.s3_create_bucket("ranges").await;
+    h.s3_put("ranges", "dir/obj", b"0123456789".to_vec()).await;
+    let store = h.storage.object_store("ranges").unwrap();
+    let get = |range: GetRange| {
+        let store = Arc::clone(&store);
+        async move {
+            let options = GetOptions {
+                range: Some(range),
+                ..GetOptions::default()
+            };
+            store.get_opts(&Path::from("dir/obj"), options).await
+        }
+    };
+
+    // A bounded end past the object is truncated, per `GetRange::Bounded`.
+    let got = get(GetRange::Bounded(5..100)).await.unwrap();
+    assert_eq!(got.range, 5..10);
+    assert_eq!(got.bytes().await.unwrap(), "56789");
+    // A start past the object stays an error.
+    assert!(get(GetRange::Bounded(20..30)).await.is_err());
+
+    // The empty path is the bucket root, not the S3 prefix "/".
+    let root = Path::from("");
+    let listed: Vec<_> = store.list(Some(&root)).try_collect().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    let level = store.list_with_delimiter(Some(&root)).await.unwrap();
+    assert_eq!(level.common_prefixes, vec![Path::from("dir")]);
+}
+
+#[test]
+fn endpoint_url_brackets_ipv6_hosts() {
+    let url = |addr: &str| {
+        ServeOptions {
+            addr: addr.parse().unwrap(),
+        }
+        .endpoint_url()
+    };
+    assert_eq!(url("[::1]:4566"), "http://[::1]:4566");
+    assert_eq!(url("127.0.0.1:1"), "http://127.0.0.1:1");
+    assert_eq!(url("0.0.0.0:4566"), "http://localhost:4566");
+    assert_eq!(url("[::]:4566"), "http://localhost:4566");
 }
 
 #[test]
