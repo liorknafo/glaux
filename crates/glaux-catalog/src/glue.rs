@@ -174,10 +174,12 @@ pub struct NetworkGlueApi {
     client: reqwest::Client,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct GlueErrorBody {
     #[serde(rename = "__type", default)]
     error_type: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
     #[serde(rename = "message", alias = "Message", default)]
     message: Option<String>,
 }
@@ -287,6 +289,11 @@ impl NetworkGlueApi {
             })?;
 
         let status = response.status();
+        let error_type = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let bytes = response
             .bytes()
             .await
@@ -297,7 +304,11 @@ impl NetworkGlueApi {
             })?;
 
         if !status.is_success() {
-            return Err(Self::error_from_response(status, &bytes));
+            return Err(Self::error_from_response(
+                status,
+                error_type.as_deref(),
+                &bytes,
+            ));
         }
 
         serde_json::from_slice(&bytes).map_err(|e| CatalogError::GlueResponseParse {
@@ -346,26 +357,31 @@ impl NetworkGlueApi {
         Ok(())
     }
 
-    fn error_from_response(status: http::StatusCode, bytes: &[u8]) -> CatalogError {
-        let parsed: Option<GlueErrorBody> = serde_json::from_slice(bytes).ok();
-        let (code, message) = match parsed {
-            Some(body) => {
-                // The type may be namespaced: `com.amazonaws.glue#Exception`.
-                let code = body
-                    .error_type
-                    .map(|t| t.rsplit('#').next().unwrap_or_default().to_string())
-                    .filter(|t| !t.is_empty())
-                    .unwrap_or_else(|| format!("HTTP {status}"));
-                let message = body
-                    .message
-                    .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
-                (code, message)
-            }
-            None => (
-                format!("HTTP {status}"),
-                String::from_utf8_lossy(bytes).into_owned(),
-            ),
-        };
+    /// Map a non-2xx response to a [`CatalogError`]. The error type comes
+    /// from the `X-Amzn-Errortype` header, else body `code`, else body
+    /// `__type`, sanitized per AWS JSON 1.1: cut at the first `:`, then keep
+    /// what follows the first `#` (`com.amazonaws.glue#Exception:uri`).
+    fn error_from_response(
+        status: http::StatusCode,
+        error_type_header: Option<&str>,
+        bytes: &[u8],
+    ) -> CatalogError {
+        let body: GlueErrorBody = serde_json::from_slice(bytes).unwrap_or_default();
+        let code = error_type_header
+            .map(str::to_string)
+            .or(body.error_type)
+            .or(body.code)
+            .map(|raw| {
+                let raw = raw.split(':').next().unwrap_or_default();
+                raw.split_once('#')
+                    .map_or(raw, |(_, name)| name)
+                    .to_string()
+            })
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        let message = body
+            .message
+            .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned());
         if code == "EntityNotFoundException" {
             CatalogError::GlueEntityNotFound { message }
         } else {
@@ -483,5 +499,45 @@ impl GlueApi for NetworkGlueApi {
         }
         self.invoke_paginated("GetPartitions", payload, "Partitions")
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn code_of(header: Option<&str>, body: &str) -> String {
+        match NetworkGlueApi::error_from_response(
+            http::StatusCode::BAD_REQUEST,
+            header,
+            body.as_bytes(),
+        ) {
+            CatalogError::GlueEntityNotFound { .. } => "EntityNotFoundException".to_string(),
+            CatalogError::GlueApi { code, .. } => code,
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn error_type_is_sanitized_from_header_code_or_type() {
+        assert_eq!(
+            code_of(
+                None,
+                r#"{"__type":"com.amazonaws.glue#EntityNotFoundException:http://internal.amazon.com/"}"#
+            ),
+            "EntityNotFoundException"
+        );
+        assert_eq!(
+            code_of(None, r#"{"code":"InvalidInputException:http://x"}"#),
+            "InvalidInputException"
+        );
+        assert_eq!(
+            code_of(
+                Some("AccessDeniedException:http://x"),
+                r#"{"__type":"Other"}"#
+            ),
+            "AccessDeniedException"
+        );
+        assert_eq!(code_of(None, "not json"), "HTTP 400 Bad Request");
     }
 }
