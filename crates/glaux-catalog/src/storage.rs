@@ -31,20 +31,24 @@ pub struct ObjectSummary {
 
 /// S3-shaped storage operations used by the Athena and Firehose engines.
 ///
-/// All byte-returning methods return exactly the requested bytes or an
-/// explicit error — a missing object or failed range read never yields
-/// empty or truncated data.
+/// A missing object or failed read is always an explicit error, never
+/// empty data. Range reads are clamped to the object, as in S3: see
+/// [`get_object_range`](Self::get_object_range) and
+/// [`get_object_suffix`](Self::get_object_suffix).
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     /// Fetch an entire object.
     async fn get_object(&self, bucket: &str, key: &str) -> Result<Bytes>;
 
     /// Fetch the byte range `[range.start, range.end)` of an object
-    /// (half-open, as in `Range: bytes=start-(end-1)`).
+    /// (half-open, as in `Range: bytes=start-(end-1)`). If `range.end` is
+    /// past the object end, the remainder of the object is returned; a
+    /// `range.start` at or past the end is an error.
     async fn get_object_range(&self, bucket: &str, key: &str, range: Range<u64>) -> Result<Bytes>;
 
-    /// Fetch the final `length` bytes of an object (suffix range request,
-    /// `Range: bytes=-length`) — the access pattern Parquet footers need.
+    /// Fetch up to the final `length` bytes of an object (suffix range
+    /// request, `Range: bytes=-length`) — the access pattern Parquet footers
+    /// need. An object shorter than `length` is returned whole.
     async fn get_object_suffix(&self, bucket: &str, key: &str, length: u64) -> Result<Bytes>;
 
     /// Write an object, replacing any existing object at the key.
