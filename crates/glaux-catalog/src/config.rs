@@ -16,7 +16,10 @@ use serde::Deserialize;
 use crate::error::{CatalogError, Result};
 
 /// Static AWS credentials passed through to S3 and Glue clients.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` redacts the secret key and session token so a logged
+/// [`GlauxConfig`] never leaks them.
+#[derive(Clone, PartialEq, Eq)]
 pub struct AwsCredentials {
     /// AWS access key ID.
     pub access_key_id: String,
@@ -24,6 +27,19 @@ pub struct AwsCredentials {
     pub secret_access_key: String,
     /// Optional session token for temporary credentials.
     pub session_token: Option<String>,
+}
+
+impl std::fmt::Debug for AwsCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Athena service defaults.
@@ -446,6 +462,59 @@ mod tests {
         assert_eq!(config.firehose.max_record_kib, 1024);
         assert_eq!(config.firehose.max_batch_records, 500);
         assert_eq!(config.firehose.max_batch_mib, 4);
+    }
+
+    #[test]
+    fn debug_output_redacts_secrets() {
+        let config = GlauxConfig {
+            credentials: Some(AwsCredentials {
+                access_key_id: "AKIDTEST".to_string(),
+                secret_access_key: "hunter2".to_string(),
+                session_token: Some("tok3n".to_string()),
+            }),
+            ..Default::default()
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("AKIDTEST"), "got: {debug}");
+        assert!(!debug.contains("hunter2"), "got: {debug}");
+        assert!(!debug.contains("tok3n"), "got: {debug}");
+        assert!(debug.contains("<redacted>"), "got: {debug}");
+    }
+
+    #[test]
+    fn every_env_var_is_read_by_resolve() {
+        // ENV_VARS and the literals in `resolve` are kept in sync by this
+        // test rather than by shared constants: removing any one variable
+        // from a full environment must change the result (or error, for
+        // half of a credential pair).
+        let values: Vec<(&str, &str)> = ENV_VARS
+            .iter()
+            .map(|&name| {
+                let value = if name.ends_with("_ENDPOINT") {
+                    "http://env:1"
+                } else if name.starts_with("GLAUX_FIREHOSE_") {
+                    "7"
+                } else {
+                    "env-value"
+                };
+                (name, value)
+            })
+            .collect();
+        let full = GlauxConfig::resolve(None, &env_map(&values), &ConfigOverrides::default())
+            .expect("every env var set");
+        for &name in ENV_VARS {
+            let without: Vec<(&str, &str)> =
+                values.iter().copied().filter(|(n, _)| *n != name).collect();
+            let changed =
+                match GlauxConfig::resolve(None, &env_map(&without), &ConfigOverrides::default()) {
+                    Ok(config) => config != full,
+                    Err(_) => true,
+                };
+            assert!(
+                changed,
+                "{name} is listed in ENV_VARS but resolve ignores it"
+            );
+        }
     }
 
     #[test]

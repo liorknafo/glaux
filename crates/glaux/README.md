@@ -4,7 +4,7 @@ One process, one port (`4566` by default): an embedded
 [fakecloud](https://github.com/faiscadev/fakecloud) control plane plus glaux's
 **real** Athena (Apache DataFusion) and **real** Firehose delivery.
 
-```
+```text
 glaux --athena-output-location s3://results/
 # → http://0.0.0.0:4566 serves s3, glue, sqs, sns, iam, sts, ssm,
 #   secretsmanager, kms, logs (fakecloud) + athena, firehose (glaux)
@@ -18,7 +18,7 @@ S3/Glue (fakecloud over HTTP, MinIO, real AWS)? That is `glaux-server`.
 
 ## How it fits together
 
-```
+```text
                  ┌──────────────── glaux process ────────────────────────────┐
  AWS SDK / CLI   │  axum ── fakecloud_core::dispatch ── ServiceRegistry       │
  ───────────────▶│          │                             ├─ s3    (fakecloud)│
@@ -68,6 +68,10 @@ flags. Two differences from `glaux-server`:
 - `s3_endpoint` / `glue_endpoint` (`GLAUX_S3_ENDPOINT`, `GLAUX_GLUE_ENDPOINT`)
   are **rejected at startup**: this binary always serves S3 and Glue itself.
   Accepting and ignoring them would be silently wrong.
+- `credentials` (`[credentials]`, `GLAUX_ACCESS_KEY_ID`, ...) are accepted
+  but unused: they only sign outbound S3/Glue requests, and this binary makes
+  none. They change no observable behavior, so a config file shared with
+  `glaux-server` keeps working.
 
 Set `--athena-output-location s3://<bucket>/` (and create the bucket) so
 queries that omit `ResultConfiguration` have somewhere to write their CSV.

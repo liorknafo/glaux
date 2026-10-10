@@ -47,8 +47,15 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<Cli>, Str
     let mut cli = Cli::default();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
+        // `--flag=value` is the same as `--flag value`.
+        let (arg, mut inline) = match arg.split_once('=') {
+            Some((flag, v)) if flag.starts_with("--") => (flag.to_string(), Some(v.to_string())),
+            _ => (arg, None),
+        };
         let mut value = |flag: &str| {
-            args.next()
+            inline
+                .take()
+                .or_else(|| args.next())
                 .ok_or_else(|| format!("{flag} requires a value\n\n{USAGE}"))
         };
         match arg.as_str() {
@@ -115,22 +122,22 @@ async fn shutdown_signal() {
 async fn run(cli: Cli) -> Result<(), String> {
     let config = GlauxConfig::load(cli.config.as_deref(), &cli.overrides)
         .map_err(|e| format!("configuration error: {e}"))?;
-    let addr = cli
-        .addr
-        .or_else(|| std::env::var("GLAUX_ADDR").ok())
-        .unwrap_or_else(|| "0.0.0.0:4566".to_string());
-    let addr: SocketAddr = addr
-        .parse()
-        .map_err(|e| format!("invalid --addr {addr:?}: {e}"))?;
-    let options = ServeOptions { addr };
+    let addr = match cli.addr.or_else(|| std::env::var("GLAUX_ADDR").ok()) {
+        Some(addr) => addr
+            .parse::<SocketAddr>()
+            .map_err(|e| format!("invalid --addr {addr:?}: {e}"))?,
+        None => ServeOptions::default().addr,
+    };
 
-    let glaux = Glaux::build(&config, &options)?;
+    // Bind first: fakecloud embeds the endpoint URL in generated URLs (SQS
+    // queue URLs, ...), so it must carry the real port when `:0` was asked.
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("cannot bind {addr}: {e}"))?;
     let bound = listener
         .local_addr()
         .map_err(|e| format!("cannot read bound address: {e}"))?;
+    let glaux = Glaux::build(&config, &ServeOptions { addr: bound })?;
 
     tracing::info!(
         fakecloud = FAKECLOUD_VERSION,
@@ -221,6 +228,21 @@ mod tests {
             Some("s3://r/")
         );
         assert_eq!(cli.overrides.athena_workgroup.as_deref(), Some("wg"));
+    }
+
+    #[test]
+    fn flag_equals_value_is_accepted() {
+        let cli = parse_args(args(&[
+            "--addr=127.0.0.1:0",
+            "--athena-output-location=s3://r/",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(cli.addr.as_deref(), Some("127.0.0.1:0"));
+        assert_eq!(
+            cli.overrides.athena_output_location.as_deref(),
+            Some("s3://r/")
+        );
     }
 
     #[test]

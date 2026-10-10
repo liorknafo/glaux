@@ -2,8 +2,8 @@
 //! Athena on one port, and executes real SQL.
 
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -20,20 +20,13 @@ impl Drop for Server {
     }
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 fn start() -> Server {
-    let port = free_port();
+    // Port 0: glaux binds an ephemeral port and reports it, so no other
+    // process can take the port between choosing and binding it.
     let mut child = Command::new(env!("CARGO_BIN_EXE_glaux"))
         .args([
             "--addr",
-            &format!("127.0.0.1:{port}"),
+            "127.0.0.1:0",
             "--athena-output-location",
             "s3://results/",
         ])
@@ -43,23 +36,20 @@ fn start() -> Server {
         .spawn()
         .expect("spawn glaux");
     let stderr = child.stderr.take().unwrap();
-    // Wait for the listening line so the test never races the bind.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut lines = BufReader::new(stderr).lines();
-    loop {
-        assert!(Instant::now() < deadline, "glaux did not report listening");
-        match lines.next() {
-            Some(Ok(line)) if line.contains("listening on") => break,
-            Some(Ok(_)) => continue,
-            other => panic!("glaux exited before listening: {other:?}"),
+    // Scan stderr on a thread so the readiness wait is bounded by the
+    // deadline, and keep draining so the child never blocks on a full pipe.
+    let (ready_tx, ready_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if let Some(url) = line.split("listening on ").nth(1) {
+                let _ = ready_tx.send(url.trim().to_string());
+            }
         }
-    }
-    // Keep draining stderr so the child never blocks on a full pipe.
-    std::thread::spawn(move || for _ in lines {});
-    Server {
-        child,
-        base: format!("http://127.0.0.1:{port}"),
-    }
+    });
+    let base = ready_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("glaux did not report listening within 30s");
+    Server { child, base }
 }
 
 fn sigv4(service: &str) -> String {
@@ -146,6 +136,17 @@ fn binary_serves_embedded_s3_and_executes_real_sql_on_one_port() {
     assert_eq!(rows[0]["Data"][0]["VarCharValue"], "answer", "{results}");
     assert_eq!(rows[1]["Data"][0]["VarCharValue"], "42", "{results}");
     assert_eq!(rows[1]["Data"][1]["VarCharValue"], "GLAUX", "{results}");
+
+    // Generated URLs carry the real bound port, not the requested `:0`.
+    let (status, queue) = json_call(
+        &server.base,
+        "AmazonSQS.CreateQueue",
+        "sqs",
+        json!({ "QueueName": "pipeline" }),
+    );
+    assert_eq!(status, 200, "{queue}");
+    let queue_url = queue["QueueUrl"].as_str().unwrap();
+    assert!(queue_url.starts_with(&server.base), "{queue_url}");
 }
 
 #[test]
