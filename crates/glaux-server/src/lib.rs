@@ -35,8 +35,7 @@ pub mod startup;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use datafusion::prelude::SessionContext;
-use glaux_athena::{AthenaService, AthenaServiceConfig, TrinoEngine};
+use glaux_athena::{AthenaService, AthenaServiceConfig};
 use glaux_catalog::{GlauxConfig, GlueApi, NetworkGlueApi, NetworkStorageBackend, StorageBackend};
 use glaux_firehose::{DeliverySink, FirehoseService, FirehoseServiceConfig, S3DeliverySink};
 
@@ -119,12 +118,7 @@ pub fn build_services(config: &GlauxConfig) -> Result<Services, ServerError> {
             .map_err(|e| ServerError::Config(format!("cannot build the Glue client: {e}")))?,
     );
 
-    let engine = GlueBackedEngine::new(
-        TrinoEngine::new(SessionContext::new(), CATALOG_NAME),
-        Arc::clone(&glue),
-        Arc::clone(&storage),
-        CATALOG_NAME,
-    );
+    let engine = GlueBackedEngine::new(Arc::clone(&glue), Arc::clone(&storage), CATALOG_NAME);
     let athena = Arc::new(AthenaService::new(
         AthenaServiceConfig::from(&config.athena),
         Arc::new(engine),

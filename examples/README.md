@@ -49,8 +49,15 @@ aws --endpoint-url $FC s3 ls --recursive s3://lake/events/
 QID=$(aws --endpoint-url $GX athena start-query-execution \
   --query-string "SELECT name, sum(amount) AS total FROM analytics.events GROUP BY name ORDER BY total DESC" \
   --result-configuration OutputLocation=s3://lake/results/ --query 'QueryExecutionId' --output text)
-aws --endpoint-url $GX athena get-query-execution --query-execution-id $QID --query 'QueryExecution.Status.State'
-aws --endpoint-url $GX athena get-query-results --query-execution-id $QID
+# The query runs asynchronously: poll until it leaves QUEUED/RUNNING. A
+# failed status request ends the loop too, and results are only fetched
+# on SUCCEEDED (otherwise get-query-execution shows the error).
+while STATE=$(aws --endpoint-url $GX athena get-query-execution --query-execution-id $QID \
+    --query 'QueryExecution.Status.State' --output text); do
+  case "$STATE" in QUEUED|RUNNING) sleep 1 ;; *) break ;; esac
+done
+echo "query state: $STATE"
+[ "$STATE" = SUCCEEDED ] && aws --endpoint-url $GX athena get-query-results --query-execution-id $QID
 ```
 
 An unsupported construct fails the query with an explicit error naming it

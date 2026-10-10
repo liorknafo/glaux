@@ -26,6 +26,11 @@ The engine crates (`glaux-athena`, `glaux-firehose`, `glaux-catalog`) are Apache
 
 ## Quick start (standalone)
 
+`glaux-server` serves Athena and Firehose only; S3 and Glue must already be
+answering at the endpoints you give it. For a local pair, start fakecloud
+first (`docker compose -f examples/docker-compose.yml up -d fakecloud` serves
+both on port 4566):
+
 ```sh
 cargo run -p glaux-server -- --s3-endpoint http://127.0.0.1:4566 --glue-endpoint http://127.0.0.1:4566
 aws --endpoint-url http://127.0.0.1:4570 athena list-work-groups

@@ -33,3 +33,4 @@ aws-sdk-firehose = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
+sha2 = { workspace = true }

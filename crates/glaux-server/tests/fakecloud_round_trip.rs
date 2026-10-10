@@ -11,9 +11,11 @@
 //!    S3 when the server receives `SIGTERM`, and the process exits 0.
 //!
 //! The fakecloud binary is taken from `PATH` when available, otherwise
-//! downloaded once from GitHub releases into a cached temp location (the
-//! LIO-19 pattern). When neither works, the test **skips with a clear
-//! message** rather than failing — but it never fakes a result.
+//! downloaded once from GitHub releases, verified against a pinned SHA-256
+//! digest, and cached under the cargo target directory (the LIO-19
+//! pattern). When neither works, the test **skips with a clear message**
+//! rather than failing — unless `GLAUX_REQUIRE_FAKECLOUD` is set, as in CI —
+//! but it never fakes a result.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -35,6 +37,27 @@ use glaux_catalog::{
 use serde_json::json;
 
 const FAKECLOUD_VERSION: &str = "v0.44.10";
+/// SHA-256 digests of the release tarballs, per platform (from the
+/// `*.tar.gz.sha256` assets published alongside `FAKECLOUD_VERSION`).
+/// Bump together with the version.
+const FAKECLOUD_SHA256: &[(&str, &str)] = &[
+    (
+        "darwin-arm64",
+        "c36db4e58de2cdb2446801655805eedaa99007214d3f839382e410d03604de41",
+    ),
+    (
+        "darwin-amd64",
+        "34dfdd36e05711c1470ca032ee2a9d88d4283c5c6813afd272b2b6c5aa7bed8a",
+    ),
+    (
+        "linux-arm64",
+        "386c645e4ca4c380f9d69ea7cb581bfa5a503e88f81f40c40594e0d278fbc09d",
+    ),
+    (
+        "linux-amd64",
+        "90adeb986ae176fa80b39c0d49e88869405040975369941a49a7848e188a1275",
+    ),
+];
 const BUCKET: &str = "lake";
 const REGION: &str = "us-east-1";
 
@@ -65,20 +88,60 @@ fn fakecloud_on_path() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Per-user cache directory for the downloaded release: under the cargo
+/// target directory (never a world-writable shared temp dir), created with
+/// owner-only permissions on Unix.
+fn fakecloud_cache_dir() -> Option<PathBuf> {
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("target")
+        });
+    let cache_dir = target_dir.join(format!("glaux-fakecloud-{FAKECLOUD_VERSION}"));
+    std::fs::create_dir_all(&cache_dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    }
+    Some(cache_dir)
+}
+
+/// Hex-encoded SHA-256 of a file.
+fn sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut std::fs::File::open(path)?, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Download, verify, and extract the fakecloud release into the cache dir.
+/// Each run downloads and extracts into its own staging directory and
+/// renames the result into place, so concurrent runs never share an
+/// in-progress archive. A digest mismatch is a hard failure: a tampered
+/// archive must never be executed, and never silently skipped either.
 fn download_fakecloud() -> Option<PathBuf> {
     let platform = release_platform()?;
-    let cache_dir = std::env::temp_dir().join(format!("glaux-fakecloud-{FAKECLOUD_VERSION}"));
-    let binary = cache_dir
-        .join(format!("fakecloud-{FAKECLOUD_VERSION}-{platform}"))
-        .join("fakecloud");
+    let expected_digest = FAKECLOUD_SHA256
+        .iter()
+        .find(|(p, _)| *p == platform)
+        .map(|(_, digest)| *digest)?;
+    let cache_dir = fakecloud_cache_dir()?;
+    let release_dir = format!("fakecloud-{FAKECLOUD_VERSION}-{platform}");
+    let binary = cache_dir.join(&release_dir).join("fakecloud");
     if binary.is_file() {
         return Some(binary);
     }
-    std::fs::create_dir_all(&cache_dir).ok()?;
+
+    let staging = cache_dir.join(format!("staging-{}", std::process::id()));
+    std::fs::create_dir_all(&staging).ok()?;
     let url = format!(
-        "https://github.com/faiscadev/fakecloud/releases/download/{FAKECLOUD_VERSION}/fakecloud-{FAKECLOUD_VERSION}-{platform}.tar.gz"
+        "https://github.com/faiscadev/fakecloud/releases/download/{FAKECLOUD_VERSION}/{release_dir}.tar.gz"
     );
-    let archive = cache_dir.join("fakecloud.tar.gz");
+    let archive = staging.join("fakecloud.tar.gz");
     eprintln!("downloading fakecloud {FAKECLOUD_VERSION} ({platform}) from GitHub releases...");
     let curl = Command::new("curl")
         .args(["-sSL", "--fail", "--max-time", "300", "-o"])
@@ -89,20 +152,30 @@ fn download_fakecloud() -> Option<PathBuf> {
         Ok(status) if status.success() => {}
         Ok(status) => {
             eprintln!("curl exited with {status} downloading {url}");
+            let _ = std::fs::remove_dir_all(&staging);
             return None;
         }
         Err(e) => {
             eprintln!("could not run curl: {e}");
+            let _ = std::fs::remove_dir_all(&staging);
             return None;
         }
     }
+    let actual_digest = sha256_file(&archive).expect("read downloaded fakecloud archive");
+    assert_eq!(
+        actual_digest, expected_digest,
+        "fakecloud {FAKECLOUD_VERSION} ({platform}) archive digest mismatch; refusing to extract"
+    );
     let tar = Command::new("tar")
         .arg("-xzf")
         .arg(&archive)
         .arg("-C")
-        .arg(&cache_dir)
+        .arg(&staging)
         .status();
-    let _ = std::fs::remove_file(&archive);
+    // Losing the rename race to a concurrent run is fine: its copy is the
+    // same verified release.
+    let _ = std::fs::rename(staging.join(&release_dir), cache_dir.join(&release_dir));
+    let _ = std::fs::remove_dir_all(&staging);
     match tar {
         Ok(status) if status.success() && binary.is_file() => Some(binary),
         Ok(_) | Err(_) => {
@@ -307,6 +380,13 @@ async fn parquet_objects(storage: &NetworkStorageBackend, prefix: &str) -> Vec<S
 #[tokio::test]
 async fn firehose_put_flush_then_athena_query_round_trip() {
     let Some(fakecloud) = locate_fakecloud() else {
+        assert!(
+            std::env::var_os("GLAUX_REQUIRE_FAKECLOUD").is_none(),
+            "GLAUX_REQUIRE_FAKECLOUD is set but fakecloud is not on PATH and could not be \
+             downloaded ({}/{})",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
         eprintln!(
             "SKIPPED: glaux-server round-trip test — fakecloud is not on PATH and could not be \
              downloaded from GitHub releases (offline or unsupported platform {}/{}). Install \
@@ -323,7 +403,7 @@ async fn firehose_put_flush_then_athena_query_round_trip() {
     let fc = Command::new(&fakecloud)
         .args(["--addr", &fc_addr, "--log-level", "warn"])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn fakecloud");
     let _fc_guard = ProcessGuard(fc);
@@ -534,7 +614,17 @@ async fn firehose_put_flush_then_athena_query_round_trip() {
         .status()
         .expect("send SIGTERM");
     assert!(killed.success());
-    let status = server.0.wait().expect("wait for glaux-server");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = server.0.try_wait().expect("wait for glaux-server") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "glaux-server did not exit within 60s of SIGTERM"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert_eq!(status.code(), Some(0), "server must exit 0 after flushing");
 
     let late = parquet_objects(&storage, "late/").await;

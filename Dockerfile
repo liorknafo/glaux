@@ -18,6 +18,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/glaux-server /usr/local/bin/glaux-server
+# Unprivileged (distroless "nonroot" UID); the server writes no local files.
+USER 65532:65532
 EXPOSE 4570
 ENV GLAUX_LISTEN=0.0.0.0:4570
 HEALTHCHECK --interval=5s --timeout=3s --retries=12 \

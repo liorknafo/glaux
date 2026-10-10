@@ -2271,6 +2271,7 @@ dependencies = [
  "object_store",
  "reqwest",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tokio",
  "tracing",

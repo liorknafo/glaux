@@ -28,7 +28,7 @@ pub fn hive_type_to_arrow(column: &str, type_string: &str) -> Result<DataType> {
         type_string: type_string.to_string(),
         message,
     };
-    let data_type = parser.parse_type().map_err(&err)?;
+    let data_type = parser.parse_type().map_err(err)?;
     parser.skip_whitespace();
     if parser.pos != parser.input.len() {
         return Err(err(format!(
