@@ -93,7 +93,7 @@ pub(crate) fn file_format_for_table(
         }),
         Some(OPENX_JSON_SERDE) | Some(HIVE_JSON_SERDE) => {
             require_uncompressed(database, table, sd, "JSON")?;
-            let case_insensitive = json_case_insensitive(serde_params).map_err(&unsupported)?;
+            let case_insensitive = json_case_insensitive(serde_params).map_err(unsupported)?;
             Ok(TableFormat {
                 format: Arc::new(JsonFormat::default()),
                 kind: FormatKind::Json { case_insensitive },
@@ -193,11 +193,11 @@ fn csv_format(
     // (Hive stores the delimiter there as a decimal byte value, e.g. "1"
     // for Ctrl-A, or as a literal character); Hive's default is Ctrl-A.
     let delimiter = match serde_params.get("field.delim") {
-        Some(delim) => single_byte("field.delim", delim).map_err(&invalid)?,
+        Some(delim) => single_byte("field.delim", delim).map_err(invalid)?,
         None => match serde_params.get("serialization.format") {
             Some(fmt) => match fmt.parse::<u8>() {
                 Ok(byte) => byte,
-                Err(_) => single_byte("serialization.format", fmt).map_err(&invalid)?,
+                Err(_) => single_byte("serialization.format", fmt).map_err(invalid)?,
             },
             None => 0x01, // Hive's LazySimpleSerDe default: Ctrl-A
         },
@@ -207,7 +207,7 @@ fn csv_format(
         .get("escape.delim")
         .map(|e| single_byte("escape.delim", e))
         .transpose()
-        .map_err(&invalid)?;
+        .map_err(invalid)?;
 
     // Arrow's CSV reader always splits records on `\n`; a table declaring
     // any other record terminator would be read as one giant row, so it is
@@ -215,7 +215,7 @@ fn csv_format(
     // only matter for array/map/struct columns, which the CSV reader
     // already rejects by type.)
     if let Some(line_delim) = serde_params.get("line.delim") {
-        let byte = single_byte("line.delim", line_delim).map_err(&invalid)?;
+        let byte = single_byte("line.delim", line_delim).map_err(invalid)?;
         if byte != b'\n' {
             return Err(invalid(format!(
                 "line.delim = {line_delim:?} is not supported (the CSV reader splits records on \
