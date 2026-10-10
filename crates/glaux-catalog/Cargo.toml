@@ -10,10 +10,25 @@ rust-version.workspace = true
 [dependencies]
 arrow = { workspace = true }
 async-trait = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-sigv4 = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
+bytes = { workspace = true }
 datafusion = { workspace = true }
-object_store = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+object_store = { workspace = true, features = ["aws"] }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+parquet = { workspace = true, features = ["arrow", "async", "object_store"] }
+tempfile = { workspace = true }
