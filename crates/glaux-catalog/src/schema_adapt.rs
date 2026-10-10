@@ -645,6 +645,43 @@ mod tests {
         assert!(!parquet_type_fits(&physical, &reordered));
     }
 
+    /// The cast the adapter inserts for a unit-widening timestamp must fail
+    /// on an out-of-range value rather than wrap silently.
+    #[test]
+    fn widening_timestamp_overflow_is_a_cast_error() {
+        use arrow::array::{RecordBatch, TimestampSecondArray};
+        use datafusion::physical_expr::expressions::col;
+
+        let logical = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        let physical = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Second, None),
+            true,
+        )]));
+        let adapter = GlueExprAdapterFactory::new("db", "t")
+            .create(logical.clone(), physical.clone())
+            .unwrap();
+        let expr = adapter.rewrite(col("ts", &logical).unwrap()).unwrap();
+
+        // 1e10 s is representable as ns (year 2286); 1e10 s * 1e9 is not.
+        let in_range = RecordBatch::try_new(
+            physical.clone(),
+            vec![Arc::new(TimestampSecondArray::from(vec![1_000_000_000]))],
+        )
+        .unwrap();
+        assert!(expr.evaluate(&in_range).is_ok());
+        let out_of_range = RecordBatch::try_new(
+            physical,
+            vec![Arc::new(TimestampSecondArray::from(vec![10_000_000_000]))],
+        )
+        .unwrap();
+        assert!(expr.evaluate(&out_of_range).is_err());
+    }
+
     #[test]
     fn json_keys_are_renamed_recursively() {
         let schema = Arc::new(Schema::new(vec![
