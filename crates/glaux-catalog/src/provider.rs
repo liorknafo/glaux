@@ -250,7 +250,7 @@ impl GlueTableProvider {
             .location
             .clone()
             .ok_or_else(|| metadata_err("storage descriptor has no location".to_string()))?;
-        let (bucket, prefix) = parse_s3_location(&location).map_err(&metadata_err)?;
+        let (bucket, prefix) = parse_s3_location(&location).map_err(metadata_err)?;
 
         if sd.columns.is_empty() {
             return Err(metadata_err("table has no columns".to_string()));
