@@ -154,7 +154,7 @@ impl ProjectionConfig {
         let mut columns = Vec::with_capacity(table.partition_keys.len());
         for key in &table.partition_keys {
             let col = &key.name;
-            let projection = parse_column(params, col).map_err(&err)?;
+            let projection = parse_column(params, col).map_err(err)?;
             columns.push((col.clone(), projection));
         }
         let location_template = params.get("storage.location.template").cloned();
@@ -189,7 +189,7 @@ impl ProjectionConfig {
         let mut per_column: Vec<Vec<String>> = Vec::with_capacity(self.columns.len());
         let mut total: usize = 1;
         for (col, projection) in &self.columns {
-            let values = enumerate_column(col, projection, now).map_err(&err)?;
+            let values = enumerate_column(col, projection, now).map_err(err)?;
             total = total.saturating_mul(values.len());
             if total > MAX_PROJECTED_PARTITIONS {
                 return Err(err(format!(
