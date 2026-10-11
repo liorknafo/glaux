@@ -1,0 +1,2 @@
+-- error: IS NOT TRUE
+SELECT id FROM orders WHERE rush IS NOT TRUE ORDER BY id

@@ -1,0 +1,2 @@
+-- error: ROW / MAP
+SELECT CAST(ROW(1, 'a') AS ROW(x BIGINT, y VARCHAR))

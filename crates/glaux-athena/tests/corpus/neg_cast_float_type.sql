@@ -1,0 +1,2 @@
+-- error: CAST(... AS FLOAT)
+SELECT CAST(1 AS FLOAT)

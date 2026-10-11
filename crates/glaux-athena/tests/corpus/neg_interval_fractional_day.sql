@@ -1,0 +1,2 @@
+-- error: Invalid INTERVAL DAY value
+SELECT DATE '2024-01-05' + INTERVAL '1.5' DAY

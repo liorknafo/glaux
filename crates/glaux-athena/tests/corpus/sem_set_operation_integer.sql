@@ -1,0 +1,4 @@
+-- UNION / INTERSECT / EXCEPT of integer literals report integer, as on Trino.
+SELECT x FROM (SELECT 1 AS x UNION SELECT 2 UNION ALL SELECT 1) t
+INTERSECT SELECT x FROM (VALUES (1), (NULL)) v(x)
+ORDER BY 1

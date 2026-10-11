@@ -1,0 +1,2 @@
+-- error: has 39 digits; Trino decimals hold at most 38
+SELECT DECIMAL '999999999999999999999999999999999999999'

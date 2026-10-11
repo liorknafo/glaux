@@ -1,0 +1,8 @@
+types: double, boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean, varchar
++-----+---------+--------+---------+--------+---------+--------+-------------+----------+-------------+
+| f   | self_eq | eq_nan | neq_nan | lt_nan | lte_nan | gt_nan | in_nan_list | in_range | simple_case |
++-----+---------+--------+---------+--------+---------+--------+-------------+----------+-------------+
+| NaN | false   | false  | true    | false  | false   | false  | false       | false    | other       |
+| 1.0 | true    | false  | true    | false  | false   | false  | false       | true     | other       |
+| 2.0 | true    | false  | true    | false  | false   | false  | true        | true     | other       |
++-----+---------+--------+---------+--------+---------+--------+-------------+----------+-------------+

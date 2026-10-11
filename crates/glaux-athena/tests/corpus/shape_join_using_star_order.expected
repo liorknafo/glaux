@@ -1,0 +1,6 @@
+types: integer, varchar, integer, varchar
++---+---+---+---+
+| w | k | v | z |
++---+---+---+---+
+| 2 | x | 1 | z |
++---+---+---+---+

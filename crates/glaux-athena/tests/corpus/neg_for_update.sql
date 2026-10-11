@@ -1,0 +1,2 @@
+-- error: FOR UPDATE
+SELECT id FROM orders FOR UPDATE

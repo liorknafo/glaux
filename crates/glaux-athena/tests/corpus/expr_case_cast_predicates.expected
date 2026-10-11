@@ -1,0 +1,13 @@
+types: bigint, varchar, varchar, bigint, varchar, bigint, integer, boolean, boolean, boolean, boolean, varchar, varchar, varchar, double
++-----+-------------+--------+------------+---------------+-------------+--------+-------+--------+---------+-------------+----------+----------+----------------+-------+
+| id  | simple_case | size   | amount_int | label         | note_as_int | parsed | mid   | active | has_abc | not_shipped | priority | big_only | status_or_null | arith |
++-----+-------------+--------+------------+---------------+-------------+--------+-------+--------+---------+-------------+----------+----------+----------------+-------+
+| 101 | done        | large  | 121        | 101-shipped   |             |        | false | true   | true    | false       | rush     |          | shipped        | 3.5   |
+| 102 | done        | medium | 35         | 102-shipped   |             |        | true  | true   | false   | false       | standard |          | shipped        | 3.5   |
+| 103 | open        | medium | 80         | 103-pending   |             |        | true  | true   | false   | true        | rush     |          |                | 3.5   |
+| 104 | other       | small  | 15         | 104-cancelled |             |        | false | false  | false   | true        | standard |          | cancelled      | 3.5   |
+| 105 | done        | large  | 240        | 105-shipped   |             |        | false | true   | false   | false       | rush     | big      | shipped        | 3.5   |
+| 106 | open        | small  |            | 106-pending   |             |        |       | true   | false   | true        | standard |          |                | 3.5   |
+| 107 | done        | medium | 60         | 107-shipped   |             |        | true  | true   | false   | false       | standard |          | shipped        | 3.5   |
+| 108 | other       | small  | 10         | 108-none      |             |        | false |        |         | true        | standard |          |                | 3.5   |
++-----+-------------+--------+------------+---------------+-------------+--------+-------+--------+---------+-------------+----------+----------+----------------+-------+

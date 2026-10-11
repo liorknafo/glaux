@@ -1,0 +1,11 @@
+types: varchar, varchar
++------+------+
+| kind | text |
++------+------+
+| dbl  | 1.5  |
+| dbl  | 2.0  |
+| dec  | 1.0  |
+| dec  | 1.5  |
+| int  | 1    |
+| null |      |
++------+------+

@@ -1,0 +1,2 @@
+-- error: DIVISION_BY_ZERO
+SELECT 1.5 / 0
