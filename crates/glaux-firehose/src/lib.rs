@@ -1,23 +1,37 @@
 //! Firehose-compatible API and delivery engine for glaux.
 //!
-//! This crate will provide:
-//!
-//! - The Firehose API actions for v0.1: `CreateDeliveryStream`,
-//!   `DescribeDeliveryStream`, `ListDeliveryStreams`, `UpdateDestination`,
-//!   `DeleteDeliveryStream`, `PutRecord`, `PutRecordBatch` (Direct-PUT
-//!   sources only).
-//! - A real delivery engine: buffering that honors `BufferingHints`
-//!   (`SizeInMBs` / `IntervalInSeconds`, flush on first threshold, per-stream
-//!   tokio timers), S3 writes with real prefix semantics (default
-//!   `YYYY/MM/DD/HH/`, custom `!{timestamp:...}` expressions,
-//!   `ErrorOutputPrefix`, GZIP), and JSON -> Parquet record format conversion
-//!   driven by the Glue table schema configured on the stream.
+//! - [`FirehoseService`] — the delivery stream registry and action
+//!   dispatcher: `CreateDeliveryStream`, `DescribeDeliveryStream`,
+//!   `ListDeliveryStreams`, `UpdateDestination`, `DeleteDeliveryStream`,
+//!   `PutRecord`, `PutRecordBatch` (Direct-PUT sources, S3 destinations).
+//!   Real AWS limits are enforced: 1 MiB per record, 4 MiB and 500 records
+//!   per batch, stream name rules.
+//! - [`StreamBuffer`] — the per-stream buffering engine honoring
+//!   `BufferingHints`: flush on `SizeInMBs` **or** `IntervalInSeconds`,
+//!   whichever comes first, on per-stream tokio timers; graceful flush on
+//!   delete and [`FirehoseService::shutdown`].
+//! - [`DeliverySink`] — where flushed batches go. The S3 sink (prefix
+//!   semantics, compression, JSON → Parquet conversion) is its own module;
+//!   [`RecordingSink`] keeps batches in memory for tests and embedders.
+//! - [`http::router`] / [`http::dispatch`] — the AWS JSON 1.1 transport, as
+//!   a complete axum router or a request → response function.
 //!
 //! # Never silently wrong
 //!
-//! Records that cannot be converted are routed to the error prefix like real
-//! Firehose — never dropped, never written with fabricated contents.
-//!
-//! This crate is currently scaffolding (LIO-18): it deliberately exports no
-//! API yet. The real modules land in subsequent stories — glaux never stubs
-//! a data path with fake behavior in the meantime.
+//! Configuration glaux cannot honor (Kinesis sources, non-S3 destinations,
+//! Lambda transforms, dynamic partitioning, KMS, ORC output, ...) is
+//! rejected with an error naming the construct. Records are never dropped:
+//! a failed flush is reported to the producer or retried, and shutdown
+//! flushes every buffer.
+
+pub mod buffer;
+pub mod error;
+pub mod http;
+pub mod model;
+pub mod service;
+pub mod sink;
+
+pub use buffer::StreamBuffer;
+pub use error::FirehoseError;
+pub use service::{FirehoseService, FirehoseServiceConfig, validate_stream_name};
+pub use sink::{DeliverySink, FlushBatch, FlushReason, RecordingSink, SinkError};

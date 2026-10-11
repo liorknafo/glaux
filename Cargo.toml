@@ -49,6 +49,7 @@ http = "1"
 
 # Utilities
 async-trait = "0.1"
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 bytes = "1"
 futures = "0.3"
@@ -60,6 +61,7 @@ uuid = { version = "1", features = ["v4"] }
 parquet = "59.2"
 tempfile = "3"
 aws-sdk-athena = "1"
+aws-sdk-firehose = "1"
 csv = "1"
 sha2 = "0.10"
 hex = "0.4"

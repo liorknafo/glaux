@@ -440,6 +440,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-firehose"
+version = "1.116.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98ed9e75a6becca890316cd87b32562f6b81e0efce583f415acd31c5da27b3a4"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sigv4"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2110,14 +2136,19 @@ dependencies = [
 name = "glaux-firehose"
 version = "0.1.0"
 dependencies = [
- "arrow",
  "async-trait",
- "object_store",
+ "aws-credential-types",
+ "aws-sdk-firehose",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "glaux-catalog",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
