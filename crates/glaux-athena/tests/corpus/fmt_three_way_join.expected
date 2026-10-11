@@ -1,0 +1,8 @@
+types: varchar, varchar, varchar, double, bigint, bigint
++-------+---------------+---------------+-------+---+-------------------+
+| name  | country       | continent     | total | n | rank_in_continent |
++-------+---------------+---------------+-------+---+-------------------+
+| Bob   | Germany       | Europe        | 80.25 | 1 | 1                 |
+| Carol | United States | North America | 255.0 | 2 | 1                 |
+| Alice | United States | North America | 155.5 | 2 | 2                 |
++-------+---------------+---------------+-------+---+-------------------+

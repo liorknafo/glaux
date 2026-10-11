@@ -1,0 +1,7 @@
+types: varchar, varchar
++------+----------------+
+| code | name           |
++------+----------------+
+| GB   | United Kingdom |
+| JP   | Japan          |
++------+----------------+

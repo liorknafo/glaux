@@ -2,6 +2,8 @@
 name = "glaux"
 description = "All-in-one glaux binary: fakecloud control plane plus real Athena and Firehose data plane on one port"
 license = "AGPL-3.0-only"
+# The AGPL all-in-one binary is distributed as release tarballs and images only.
+publish = false
 version.workspace = true
 edition.workspace = true
 repository.workspace = true

@@ -1,0 +1,30 @@
+# Runtime-only image assembled from prebuilt release binaries, used by
+# .github/workflows/release.yml to publish multi-arch images without
+# compiling DataFusion under emulation. Expects the build context to contain
+#
+#   dist/linux-amd64/<bin>
+#   dist/linux-arm64/<bin>
+#
+# as produced by the release workflow's build matrix, and picks the one
+# matching the target platform.
+#
+#   docker buildx build -f Dockerfile.release --build-arg BIN=glaux \
+#     --build-arg PORT=4566 --build-arg HEALTH=/_glaux/health \
+#     --platform linux/amd64,linux/arm64 -t ghcr.io/liorknafo/glaux .
+#
+# For a from-source single-arch build, see ./Dockerfile (glaux-server).
+FROM debian:bookworm-slim
+ARG TARGETARCH
+ARG BIN=glaux-server
+ARG PORT=4570
+ARG HEALTH=/health
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY dist/linux-${TARGETARCH}/${BIN} /usr/local/bin/${BIN}
+RUN chmod 0755 /usr/local/bin/${BIN} && ln -s /usr/local/bin/${BIN} /usr/local/bin/entrypoint
+ENV GLAUX_BIN_PORT=${PORT} GLAUX_BIN_HEALTH=${HEALTH}
+EXPOSE ${PORT}
+HEALTHCHECK --interval=5s --timeout=3s --retries=12 \
+    CMD curl -fsS "http://127.0.0.1:${GLAUX_BIN_PORT}${GLAUX_BIN_HEALTH}" || exit 1
+ENTRYPOINT ["/usr/local/bin/entrypoint"]

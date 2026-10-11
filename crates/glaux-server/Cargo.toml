@@ -7,11 +7,29 @@ edition.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "glaux-server"
+path = "src/main.rs"
+
 [dependencies]
+async-trait = { workspace = true }
 axum = { workspace = true }
+clap = { workspace = true }
+datafusion = { workspace = true }
 glaux-athena = { workspace = true }
 glaux-catalog = { workspace = true }
 glaux-firehose = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+aws-credential-types = { workspace = true }
+aws-sdk-athena = { workspace = true }
+aws-sdk-firehose = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
