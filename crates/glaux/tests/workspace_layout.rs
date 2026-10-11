@@ -91,3 +91,17 @@ fn workspace_members_match_the_spec_table() {
         );
     }
 }
+
+#[test]
+fn every_fakecloud_pin_matches_fakecloud_version() {
+    let pin = format!("\"={}\"", glaux::FAKECLOUD_VERSION);
+    let manifest = manifest("glaux");
+    let pins: Vec<&str> = manifest
+        .lines()
+        .filter(|line| line.starts_with("fakecloud-"))
+        .collect();
+    assert!(!pins.is_empty());
+    for line in pins {
+        assert!(line.ends_with(&pin), "{line} is not pinned to {pin}");
+    }
+}

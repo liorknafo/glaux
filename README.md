@@ -26,4 +26,4 @@ The engine crates (`glaux-athena`, `glaux-firehose`, `glaux-catalog`) are Apache
 
 ## Status
 
-Pre-implementation. The v0.1 design spec lives in [`docs/specs/2026-08-15-glaux-v0.1-design.md`](docs/specs/2026-08-15-glaux-v0.1-design.md). Feasibility spikes (ranged S3 reads against fakecloud, embedding custom services on fakecloud's dispatcher) passed on 2026-08-15.
+v0.1 in progress. The all-in-one `glaux` binary runs: an embedded fakecloud control plane (S3, Glue, SQS, SNS, IAM/STS, SSM, Secrets Manager, KMS, Logs) plus glaux's Athena and Firehose on one port, with the engines reading fakecloud's S3/Glue state in-process — see [`crates/glaux/README.md`](crates/glaux/README.md). The v0.1 design spec lives in [`docs/specs/2026-08-15-glaux-v0.1-design.md`](docs/specs/2026-08-15-glaux-v0.1-design.md). Feasibility spikes (ranged S3 reads against fakecloud, embedding custom services on fakecloud's dispatcher) passed on 2026-08-15.
