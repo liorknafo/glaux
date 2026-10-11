@@ -10,10 +10,24 @@ rust-version.workspace = true
 [dependencies]
 arrow = { workspace = true }
 async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
 datafusion = { workspace = true }
+datafusion-datasource = { workspace = true }
+glaux-catalog = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sqlparser = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+aws-credential-types = { workspace = true }
+aws-sdk-athena = { workspace = true }
+futures = { workspace = true }
+object_store = { workspace = true }
+parquet = { workspace = true, features = ["arrow"] }
+tempfile = { workspace = true }

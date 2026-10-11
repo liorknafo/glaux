@@ -1,24 +1,36 @@
 //! Athena-compatible API surface and SQL execution engine for glaux.
 //!
-//! This crate will provide:
-//!
-//! - The Athena API actions for v0.1: `StartQueryExecution`,
-//!   `GetQueryExecution`, `GetQueryResults` (paginated),
+//! - [`AthenaService`] — the query lifecycle state machine and action
+//!   dispatcher: `StartQueryExecution`, `GetQueryExecution`,
+//!   `GetQueryResults` (paginated, Athena `Row`/`Datum` encoding),
 //!   `StopQueryExecution`, `ListQueryExecutions`, `BatchGetQueryExecution`,
-//!   and basic workgroup support, with the faithful async query lifecycle
-//!   (`QUEUED -> RUNNING -> SUCCEEDED/FAILED`).
-//! - Real SQL execution: Trino-dialect parsing via `sqlparser`, translation
-//!   through a function-shim layer, and execution on Apache DataFusion over
-//!   data in S3.
-//! - Results written as CSV + `.metadata` to the configured S3
-//!   `OutputLocation`, matching real Athena.
+//!   and basic workgroups. Queries move `QUEUED → RUNNING →
+//!   SUCCEEDED | FAILED | CANCELLED` on tokio tasks; cancellation aborts the
+//!   engine mid-flight. Results are also written as CSV to the
+//!   `OutputLocation`, as real Athena does.
+//! - [`QueryEngine`] — the execution seam. [`DataFusionEngine`] is the v0.1
+//!   passthrough (DataFusion's own dialect); the Trino-dialect translation
+//!   layer slots in behind the same trait.
+//! - [`http::router`] / [`http::dispatch`] — the AWS JSON 1.1 transport, as
+//!   a complete axum router or a request → response function.
 //!
 //! # Never silently wrong
 //!
 //! Any SQL construct this engine cannot execute faithfully produces an
-//! explicit error naming the construct. This crate never synthesizes query
-//! results.
-//!
-//! This crate is currently scaffolding (LIO-18): it deliberately exports no
-//! API yet. The real modules land in subsequent stories — glaux never stubs
-//! a data path with fake behavior in the meantime.
+//! explicit error naming the construct, surfaced as a `FAILED` query with
+//! `AthenaError` details. Unsupported actions, unmappable result types, and
+//! unwritable result locations all fail explicitly. This crate never
+//! synthesizes query results.
+
+pub mod engine;
+pub mod error;
+pub mod http;
+pub mod model;
+pub mod results;
+pub mod service;
+
+pub use engine::{DataFusionEngine, EngineError, QueryEngine, QueryOutput, QueryRequest};
+pub use error::AthenaError;
+pub use model::QueryState;
+pub use results::{EncodedResultSet, ResultError, encode_result_set};
+pub use service::{AthenaService, AthenaServiceConfig, ENGINE_VERSION};

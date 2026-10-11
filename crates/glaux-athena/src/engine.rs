@@ -1,0 +1,400 @@
+//! The execution seam between the Athena API lifecycle and the SQL engine.
+//!
+//! [`QueryEngine`] is the trait the service drives: it receives the SQL text
+//! plus the execution context and returns Arrow batches with scan
+//! statistics. [`DataFusionEngine`] is the v0.1 passthrough implementation
+//! that hands the SQL straight to DataFusion's planner; the Trino-dialect
+//! translation layer (LIO-22) slots in behind the same trait.
+//!
+//! # Never silently wrong
+//!
+//! - A query that fails to parse or plan fails with DataFusion's real
+//!   diagnostic — it is never rewritten or swallowed.
+//! - Only read statements run. DDL, DML writes, `COPY`, and session
+//!   statements are rejected by name: DataFusion *could* execute a
+//!   `CREATE EXTERNAL TABLE` against local state, but that would diverge
+//!   from Athena (no Glue registration, no S3 write), so the engine refuses.
+
+use std::any::Any;
+use std::sync::Arc;
+use std::time::Instant;
+
+use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
+use datafusion::datasource::source::DataSourceExec;
+use datafusion::error::DataFusionError;
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanVisitor, accept, collect};
+use datafusion::prelude::SessionContext;
+use datafusion_datasource::file_scan_config::FileScanConfig;
+
+/// What the service asks the engine to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryRequest {
+    /// The SQL text exactly as the client submitted it.
+    pub sql: String,
+    /// `QueryExecutionContext.Catalog`, if the client set one.
+    pub catalog: Option<String>,
+    /// `QueryExecutionContext.Database`, if the client set one.
+    pub database: Option<String>,
+}
+
+/// What the engine hands back on success.
+#[derive(Debug, Clone)]
+pub struct QueryOutput {
+    /// Result schema (authoritative even when there are zero batches).
+    pub schema: SchemaRef,
+    /// Result batches.
+    pub batches: Vec<RecordBatch>,
+    /// Bytes read from storage, when the engine can account for them.
+    pub data_scanned_bytes: Option<u64>,
+    /// Wall-clock time spent planning and executing on the engine.
+    pub engine_time_millis: u64,
+}
+
+/// Why a query failed on the engine. Each variant maps to an Athena error
+/// category (`1` system, `2` user) in the query's `AthenaError`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum EngineError {
+    /// The SQL could not be parsed or planned (a user error).
+    #[error("SYNTAX_ERROR: {0}")]
+    Plan(String),
+    /// The statement kind is valid SQL but not something glaux executes.
+    #[error("NOT_SUPPORTED: {construct} is not supported: {message}")]
+    Unsupported {
+        /// The construct, e.g. `CREATE TABLE`.
+        construct: String,
+        /// Why / what to do instead.
+        message: String,
+    },
+    /// Execution failed after planning (I/O, type errors at runtime, ...).
+    #[error("GENERIC_INTERNAL_ERROR: {0}")]
+    Execution(String),
+}
+
+impl EngineError {
+    /// Athena `ErrorCategory`: `2` for user errors, `1` for system errors.
+    pub fn category(&self) -> i32 {
+        match self {
+            Self::Plan(_) | Self::Unsupported { .. } => 2,
+            Self::Execution(_) => 1,
+        }
+    }
+
+    /// Athena `ErrorType` within the category. Athena documents `1001` as
+    /// the generic user/syntax error type and `1xxx` for the user
+    /// category; glaux uses `1001` for plan failures, `1003` for
+    /// unsupported constructs, and `1` for engine failures.
+    pub fn error_type(&self) -> i32 {
+        match self {
+            Self::Plan(_) => 1001,
+            Self::Unsupported { .. } => 1003,
+            Self::Execution(_) => 1,
+        }
+    }
+}
+
+/// A SQL engine the Athena service can drive.
+#[async_trait]
+pub trait QueryEngine: Send + Sync {
+    /// Plan and execute `request` to completion. Dropping the returned
+    /// future (which the service does on `StopQueryExecution`) must abort
+    /// the work.
+    async fn execute(&self, request: QueryRequest) -> Result<QueryOutput, EngineError>;
+}
+
+/// v0.1 passthrough engine: DataFusion's own SQL dialect, straight to the
+/// planner. Catalogs (e.g. a `GlueCatalogProvider`) are whatever the wrapped
+/// [`SessionContext`] has registered.
+pub struct DataFusionEngine {
+    ctx: SessionContext,
+    default_catalog: String,
+}
+
+impl std::fmt::Debug for DataFusionEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataFusionEngine")
+            .field("default_catalog", &self.default_catalog)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DataFusionEngine {
+    /// Wrap a context. `default_catalog` is the DataFusion catalog name that
+    /// Athena's `AwsDataCatalog` maps to (i.e. the name the Glue catalog
+    /// provider was registered under).
+    pub fn new(ctx: SessionContext, default_catalog: impl Into<String>) -> Self {
+        Self {
+            ctx,
+            default_catalog: default_catalog.into(),
+        }
+    }
+
+    /// The wrapped context.
+    pub fn context(&self) -> &SessionContext {
+        &self.ctx
+    }
+
+    /// A per-query context whose default catalog/schema follow the
+    /// request's `QueryExecutionContext`.
+    fn context_for(&self, request: &QueryRequest) -> Result<SessionContext, EngineError> {
+        let catalog = match request.catalog.as_deref() {
+            None => self.default_catalog.clone(),
+            // Athena's built-in catalog name is case-insensitive on the wire.
+            Some(c) if c.eq_ignore_ascii_case("awsdatacatalog") => self.default_catalog.clone(),
+            Some(other) => other.to_string(),
+        };
+        let mut state = self.ctx.state();
+        {
+            let options = state.config_mut().options_mut();
+            options.catalog.default_catalog = catalog.clone();
+            if let Some(database) = &request.database {
+                options.catalog.default_schema = database.clone();
+            }
+        }
+        let ctx = SessionContext::new_with_state(state);
+        if ctx.catalog(&catalog).is_none() {
+            return Err(EngineError::Plan(format!(
+                "catalog {catalog:?} does not exist"
+            )));
+        }
+        if let Some(database) = &request.database
+            && ctx
+                .catalog(&catalog)
+                .and_then(|c| c.schema(database))
+                .is_none()
+        {
+            return Err(EngineError::Plan(format!(
+                "SCHEMA_NOT_FOUND: Schema {database} does not exist in catalog {catalog}"
+            )));
+        }
+        Ok(ctx)
+    }
+}
+
+/// Reject every statement kind that is not a read. Returns the construct
+/// name for the error message.
+fn reject_non_read(plan: &LogicalPlan) -> Result<(), EngineError> {
+    let construct = match plan {
+        LogicalPlan::Ddl(ddl) => Some(ddl.name().to_string()),
+        LogicalPlan::Dml(dml) => Some(format!("{}", dml.op)),
+        LogicalPlan::Copy(_) => Some("COPY".to_string()),
+        LogicalPlan::Statement(statement) => Some(statement.name().to_string()),
+        _ => None,
+    };
+    match construct {
+        Some(construct) => Err(EngineError::Unsupported {
+            construct,
+            message: "glaux v0.1 executes read-only queries (SELECT / WITH / VALUES / EXPLAIN); \
+                      writes and DDL arrive in v0.2"
+                .to_string(),
+        }),
+        None => Ok(()),
+    }
+}
+
+fn plan_error(err: DataFusionError) -> EngineError {
+    // Planning errors arrive wrapped in `Context`/`Diagnostic` layers;
+    // classify on the root cause.
+    match err.find_root() {
+        DataFusionError::SQL(..)
+        | DataFusionError::Plan(..)
+        | DataFusionError::SchemaError(..)
+        | DataFusionError::NotImplemented(..) => EngineError::Plan(err.to_string()),
+        _ => EngineError::Execution(err.to_string()),
+    }
+}
+
+/// Sums the bytes a physical plan read from files: the Parquet reader's
+/// `bytes_scanned` metric where present (ranged reads), otherwise the full
+/// size of every file the scan covered (CSV/JSON read whole files, which is
+/// exactly how Athena bills them).
+#[derive(Default)]
+struct ScanAccountant {
+    bytes: u64,
+}
+
+impl ExecutionPlanVisitor for ScanAccountant {
+    type Error = DataFusionError;
+
+    fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
+        if let Some(exec) = (plan as &dyn Any).downcast_ref::<DataSourceExec>() {
+            let source: &dyn Any = exec.data_source().as_ref();
+            if let Some(config) = source.downcast_ref::<FileScanConfig>() {
+                let metered = plan
+                    .metrics()
+                    .and_then(|m| m.sum_by_name("bytes_scanned"))
+                    .map(|v| v.as_usize() as u64);
+                self.bytes += metered.unwrap_or_else(|| {
+                    config
+                        .file_groups
+                        .iter()
+                        .flat_map(|group| group.iter())
+                        .map(|file| file.object_meta.size)
+                        .sum()
+                });
+            }
+        }
+        Ok(true)
+    }
+}
+
+#[async_trait]
+impl QueryEngine for DataFusionEngine {
+    async fn execute(&self, request: QueryRequest) -> Result<QueryOutput, EngineError> {
+        let started = Instant::now();
+        let ctx = self.context_for(&request)?;
+        // Plan first, then gate: `SessionContext::sql` would *execute* DDL
+        // and SET statements eagerly, so the gate must sit between planning
+        // and execution.
+        let logical_plan = ctx
+            .state()
+            .create_logical_plan(&request.sql)
+            .await
+            .map_err(plan_error)?;
+        reject_non_read(&logical_plan)?;
+        let df = ctx
+            .execute_logical_plan(logical_plan)
+            .await
+            .map_err(plan_error)?;
+        let task_ctx = Arc::new(df.task_ctx());
+        let plan = df.create_physical_plan().await.map_err(plan_error)?;
+        let schema = plan.schema();
+        let batches = collect(Arc::clone(&plan), task_ctx)
+            .await
+            .map_err(|e| EngineError::Execution(e.to_string()))?;
+        let mut accountant = ScanAccountant::default();
+        accept(plan.as_ref(), &mut accountant)
+            .map_err(|e| EngineError::Execution(e.to_string()))?;
+        Ok(QueryOutput {
+            schema,
+            batches,
+            data_scanned_bytes: Some(accountant.bytes),
+            engine_time_millis: started.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::catalog::MemTable;
+
+    use super::*;
+
+    fn engine() -> DataFusionEngine {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+        ctx.register_table(
+            "people",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+        )
+        .unwrap();
+        DataFusionEngine::new(ctx, "datafusion")
+    }
+
+    fn request(sql: &str) -> QueryRequest {
+        QueryRequest {
+            sql: sql.to_string(),
+            catalog: None,
+            database: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn select_runs_and_reports_zero_scanned_bytes_for_memory_tables() {
+        let out = engine()
+            .execute(request("SELECT count(*) AS n FROM people"))
+            .await
+            .unwrap();
+        assert_eq!(out.schema.field(0).name(), "n");
+        assert_eq!(out.batches[0].num_rows(), 1);
+        assert_eq!(out.data_scanned_bytes, Some(0));
+    }
+
+    #[tokio::test]
+    async fn awsdatacatalog_and_database_context_resolve() {
+        let out = engine()
+            .execute(QueryRequest {
+                sql: "SELECT name FROM people WHERE id = 2".into(),
+                catalog: Some("AwsDataCatalog".into()),
+                database: Some("public".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.batches[0].num_rows(), 1);
+
+        let err = engine()
+            .execute(QueryRequest {
+                sql: "SELECT 1".into(),
+                catalog: None,
+                database: Some("nope".into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Plan(m) if m.contains("Schema nope does not exist")));
+    }
+
+    #[tokio::test]
+    async fn parse_and_plan_failures_surface_the_real_diagnostic() {
+        let err = engine().execute(request("SELEC 1")).await.unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Plan(m) if m.contains("SELEC")),
+            "{err}"
+        );
+        assert_eq!(err.category(), 2);
+
+        let err = engine()
+            .execute(request("SELECT nope FROM people"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Plan(m) if m.contains("nope")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_and_ddl_are_rejected_by_name() {
+        for (sql, construct) in [
+            ("CREATE TABLE t AS SELECT 1", "CreateMemoryTable"),
+            ("INSERT INTO people VALUES (9, 'z')", "Insert Into"),
+            ("DROP TABLE people", "DropTable"),
+            ("SET datafusion.execution.batch_size = 1", "SetVariable"),
+        ] {
+            let err = engine().execute(request(sql)).await.unwrap_err();
+            match err {
+                EngineError::Unsupported { construct: c, .. } => {
+                    assert_eq!(c, construct, "{sql}")
+                }
+                other => panic!("{sql}: expected Unsupported, got {other:?}"),
+            }
+        }
+        // The rejected INSERT must not have touched the table.
+        let out = engine()
+            .execute(request("SELECT count(*) FROM people"))
+            .await
+            .unwrap();
+        let n = out.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(n, 3);
+    }
+}
