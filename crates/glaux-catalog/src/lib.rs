@@ -18,9 +18,14 @@
 //! by the AGPL all-in-one binary from its side of the dependency boundary;
 //! this crate stays free of fakecloud dependencies.
 //!
-//! Still to come in later stories: the DataFusion `GlueCatalogProvider`
-//! (databases/tables/partitions as DataFusion catalog traits, partition
-//! pruning and projection) and SerDe → reader mapping.
+//! On top of that access layer sits the DataFusion catalog surface:
+//!
+//! - [`GlueCatalogProvider`] / [`GlueSchemaProvider`] / [`GlueTableProvider`]
+//!   — Glue databases as DataFusion schemas, tables as listing-style table
+//!   providers over [`StorageBackend`], with Hive/Glue type mapping, SerDe →
+//!   reader mapping (Parquet, OpenX JSON → NDJSON, LazySimpleSerDe → CSV),
+//!   partition pruning from Glue partition metadata, and Athena-style
+//!   partition projection computed locally with zero `GetPartitions` calls.
 //!
 //! # Never silently wrong
 //!
@@ -30,8 +35,13 @@
 
 pub mod config;
 pub mod error;
+mod format;
 pub mod glue;
+mod projection;
+pub mod provider;
+mod schema_adapt;
 pub mod storage;
+pub mod types;
 
 pub use config::{AthenaConfig, AwsCredentials, ConfigOverrides, FirehoseLimits, GlauxConfig};
 pub use error::{CatalogError, Result};
@@ -39,4 +49,6 @@ pub use glue::{
     GlueApi, GlueColumn, GlueDatabase, GluePartition, GlueSerDeInfo, GlueStorageDescriptor,
     GlueTable, NetworkGlueApi,
 };
+pub use provider::{GlueCatalogProvider, GlueSchemaProvider, GlueTableProvider};
 pub use storage::{NetworkStorageBackend, ObjectSummary, StorageBackend};
+pub use types::hive_type_to_arrow;
