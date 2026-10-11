@@ -2058,6 +2058,7 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
+ "csv",
  "datafusion",
  "datafusion-datasource",
  "futures",

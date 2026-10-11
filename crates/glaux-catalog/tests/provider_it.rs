@@ -224,6 +224,13 @@ impl StorageBackend for MemoryStorage {
         Ok(())
     }
 
+    async fn delete_object(&self, _bucket: &str, key: &str) -> glaux_catalog::Result<()> {
+        match self.store.delete(&ObjectPath::from(key)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(storage_error("delete", key)(e)),
+        }
+    }
+
     async fn list_objects(
         &self,
         _bucket: &str,

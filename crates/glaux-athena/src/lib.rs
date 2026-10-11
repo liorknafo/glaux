@@ -6,8 +6,9 @@
 //!   `StopQueryExecution`, `ListQueryExecutions`, `BatchGetQueryExecution`,
 //!   and basic workgroups. Queries move `QUEUED → RUNNING →
 //!   SUCCEEDED | FAILED | CANCELLED` on tokio tasks; cancellation aborts the
-//!   engine mid-flight. Results are also written as CSV to the
-//!   `OutputLocation`, as real Athena does.
+//!   engine mid-flight. Results are also written to the `OutputLocation`
+//!   as `<id>.csv` plus the `<id>.csv.metadata` companion, as real Athena
+//!   does (see [`metadata`] for the file format).
 //! - [`QueryEngine`] — the execution seam. [`TrinoEngine`] is the engine
 //!   Athena clients should get: Trino-dialect parse → shim rewrite →
 //!   DataFusion plan (see [`dialect`]). [`DataFusionEngine`] underneath it
@@ -27,6 +28,7 @@ pub mod dialect;
 pub mod engine;
 pub mod error;
 pub mod http;
+pub mod metadata;
 pub mod model;
 pub mod results;
 pub mod service;
@@ -34,6 +36,7 @@ pub mod service;
 pub use dialect::{GlauxSqlError, TrinoEngine};
 pub use engine::{DataFusionEngine, EngineError, QueryEngine, QueryOutput, QueryRequest};
 pub use error::AthenaError;
+pub use metadata::{MetadataError, decode_metadata, encode_metadata};
 pub use model::QueryState;
 pub use results::{EncodedResultSet, ResultError, encode_result_set};
 pub use service::{AthenaService, AthenaServiceConfig, ENGINE_VERSION};
